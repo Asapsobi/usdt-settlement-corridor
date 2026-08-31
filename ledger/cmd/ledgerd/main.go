@@ -1,0 +1,118 @@
+// Command ledgerd serves C1, the ledger core, over HTTP.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"ledger/internal/db"
+)
+
+func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	if err := run(); err != nil {
+		slog.Error("ledgerd exited with error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := db.ConfigFromEnv()
+	if err != nil {
+		return err
+	}
+
+	pool, err := db.Open(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	router := chi.NewRouter()
+	router.Get("/healthz", healthzHandler)
+
+	srv := &http.Server{
+		Addr:    listenAddr(),
+		Handler: router,
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		slog.Info("ledgerd listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("shutdown signal received")
+	case err := <-serveErr:
+		return err
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	slog.Info("ledgerd shut down cleanly")
+	return nil
+}
+
+func listenAddr() string {
+	if addr := os.Getenv("LEDGER_LISTEN_ADDR"); addr != "" {
+		return addr
+	}
+	return ":8080"
+}
+
+type healthzResponse struct {
+	Status  string `json:"status"`
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+}
+
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	version, commit := buildInfo()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(healthzResponse{
+		Status:  "ok",
+		Version: version,
+		Commit:  commit,
+	})
+}
+
+// buildInfo reads module version and VCS revision from the binary's own
+// embedded build metadata rather than requiring -ldflags at build time.
+func buildInfo() (version, commit string) {
+	version, commit = "unknown", "unknown"
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	if info.Main.Version != "" {
+		version = info.Main.Version
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			commit = s.Value
+		}
+	}
+	return
+}
