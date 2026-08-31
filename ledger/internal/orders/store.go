@@ -144,9 +144,16 @@ type TransitionParams struct {
 	OccurredAt time.Time
 	// Entry is posted via journal.Post in the same transaction as the
 	// state change, atomically, when the transition rule requires one.
-	// It is an error to supply it when the rule does not require one, and
-	// an error to omit it when the rule does.
+	// Use this when the transition itself is what should cause the entry
+	// to exist.
 	Entry *journal.EntryRequest
+	// EntryID names an entry ALREADY posted earlier in the same
+	// transaction -- for example by journal.Reverse, called directly by
+	// C1.6's reorg handling before it calls Transition -- to be recorded
+	// as this transition's cause without posting anything new. At most
+	// one of Entry / EntryID may be set, and exactly one must be set
+	// when the transition rule requires an entry.
+	EntryID *int64
 }
 
 func (p TransitionParams) validate() error {
@@ -158,6 +165,9 @@ func (p TransitionParams) validate() error {
 	}
 	if p.OccurredAt.IsZero() {
 		return fmt.Errorf("%w: zero occurred_at", ErrInvalidParams)
+	}
+	if p.Entry != nil && p.EntryID != nil {
+		return fmt.Errorf("%w: both Entry and EntryID set", ErrInvalidParams)
 	}
 	return nil
 }
@@ -201,14 +211,14 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 	}
 
 	switch {
-	case r.RequiresEntry && p.Entry == nil:
+	case r.RequiresEntry && p.Entry == nil && p.EntryID == nil:
 		return Order{}, fmt.Errorf("%w: %s -> %s", ErrEntryRequired, current.State, toState)
-	case !r.RequiresEntry && p.Entry != nil:
+	case !r.RequiresEntry && (p.Entry != nil || p.EntryID != nil):
 		return Order{}, fmt.Errorf("%w: %s -> %s", ErrEntryNotAllowed, current.State, toState)
 	}
 
-	var entryID *int64
-	if r.RequiresEntry {
+	entryID := p.EntryID
+	if p.Entry != nil {
 		entry, err := journal.Post(ctx, tx, *p.Entry)
 		if err != nil {
 			return Order{}, fmt.Errorf("orders: posting entry for %s -> %s: %w", current.State, toState, err)

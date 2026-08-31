@@ -91,44 +91,70 @@ func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (Entry, error) {
 // and reporting Outcome=Created.
 func postLines(ctx context.Context, tx pgx.Tx, entry Entry, resolved []resolvedLine) (Entry, error) {
 	entry.Outcome = Created
-	entry.Lines = make([]PostedLine, len(resolved))
+	lines := make([]lineToApply, len(resolved))
 	for i, rl := range resolved {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO journal_lines (entry_id, seq, account_id, asset, amount_units)
-			VALUES ($1, $2, $3, $4, $5)
-		`, entry.ID, rl.seq, rl.account.ID, string(rl.amount.Asset), rl.amount.Units)
-		if err != nil {
-			return Entry{}, fmt.Errorf("journal: insert line %d: %w", i, err)
-		}
-		entry.Lines[i] = PostedLine{
-			Seq:         rl.seq,
-			AccountID:   rl.account.ID,
-			AccountCode: rl.account.Code,
-			Amount:      rl.amount,
+		lines[i] = lineToApply{
+			seq:         rl.seq,
+			accountID:   rl.account.ID,
+			accountCode: rl.account.Code,
+			asset:       rl.amount.Asset,
+			units:       rl.amount.Units,
 		}
 	}
 
-	if err := applyBalances(ctx, tx, entry.ID, resolved); err != nil {
+	posted, err := insertLinesAndApplyBalances(ctx, tx, entry.ID, lines)
+	if err != nil {
 		return Entry{}, err
 	}
-
+	entry.Lines = posted
 	return entry, nil
 }
 
-// applyBalances updates account_balances for every account this entry
-// touched. It processes accounts in ascending account_id order -- not the
-// order lines were submitted or stored -- which is what makes concurrent
-// entries touching overlapping account sets deadlock-proof: every
-// transaction that ever locks two of the same rows locks them in the same
-// relative order, so a circular wait can never form.
-func applyBalances(ctx context.Context, tx pgx.Tx, entryID int64, resolved []resolvedLine) error {
-	sorted := make([]resolvedLine, len(resolved))
-	copy(sorted, resolved)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].account.ID < sorted[j].account.ID
-	})
+// lineToApply is the minimal shape insertLinesAndApplyBalances needs,
+// decoupled from where the caller got it: Post builds it from
+// resolvedLine (a freshly validated request), Reverse builds it from an
+// already-stored entry's lines (negated). Both end up doing the exact
+// same two writes -- journal_lines, then account_balances -- so both
+// funnel through this one function rather than duplicating it.
+type lineToApply struct {
+	seq         int16
+	accountID   int64
+	accountCode string
+	asset       money.Asset
+	units       int64
+}
 
-	for _, rl := range sorted {
+// insertLinesAndApplyBalances inserts every line for entryID and applies
+// each to the account_balances cache, in the same transaction. Balances
+// are applied in ascending account_id order -- not submission order --
+// which is what makes concurrent entries touching overlapping account
+// sets deadlock-proof: every transaction that ever locks two of the same
+// rows locks them in the same relative order, so a circular wait can
+// never form.
+func insertLinesAndApplyBalances(ctx context.Context, tx pgx.Tx, entryID int64, lines []lineToApply) ([]PostedLine, error) {
+	posted := make([]PostedLine, len(lines))
+	for i, l := range lines {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO journal_lines (entry_id, seq, account_id, asset, amount_units)
+			VALUES ($1, $2, $3, $4, $5)
+		`, entryID, l.seq, l.accountID, string(l.asset), l.units)
+		if err != nil {
+			return nil, fmt.Errorf("journal: insert line %d: %w", i, err)
+		}
+		posted[i] = PostedLine{
+			Seq:         l.seq,
+			AccountID:   l.accountID,
+			AccountCode: l.accountCode,
+			Amount:      money.Amount{Asset: l.asset, Units: l.units},
+		}
+	}
+
+	sorted := make([]lineToApply, len(lines))
+	copy(sorted, lines)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].accountID < sorted[j].accountID
+	})
+	for _, l := range sorted {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO account_balances (account_id, asset, balance_units, last_entry_id)
 			VALUES ($1, $2, $3, $4)
@@ -136,19 +162,19 @@ func applyBalances(ctx context.Context, tx pgx.Tx, entryID int64, resolved []res
 			SET balance_units = account_balances.balance_units + EXCLUDED.balance_units,
 				last_entry_id = EXCLUDED.last_entry_id,
 				updated_at = now()
-		`, rl.account.ID, string(rl.amount.Asset), rl.amount.Units, entryID)
+		`, l.accountID, string(l.asset), l.units, entryID)
 		if err != nil {
-			return fmt.Errorf("journal: apply balance for account %d: %w", rl.account.ID, err)
+			return nil, fmt.Errorf("journal: apply balance for account %d: %w", l.accountID, err)
 		}
 	}
-	return nil
+	return posted, nil
 }
 
 // resolveExisting is reached when ON CONFLICT DO NOTHING found IdempotencyKey
 // already in use. It decides Replayed vs ErrIdempotencyConflict by comparing
 // payload hashes, and writes nothing either way.
 func resolveExisting(ctx context.Context, tx pgx.Tx, req EntryRequest, newHash []byte) (Entry, error) {
-	existing, err := getEntryByKey(ctx, tx, req.IdempotencyKey)
+	existing, err := GetEntryByIdempotencyKey(ctx, tx, req.IdempotencyKey)
 	if err != nil {
 		return Entry{}, fmt.Errorf("journal: idempotency lookup for %q: %w", req.IdempotencyKey, err)
 	}
@@ -167,7 +193,12 @@ func resolveExisting(ctx context.Context, tx pgx.Tx, req EntryRequest, newHash [
 	return existing, nil
 }
 
-func getEntryByKey(ctx context.Context, tx pgx.Tx, key string) (Entry, error) {
+// GetEntryByIdempotencyKey looks up an entry by its idempotency key.
+// Exported for callers that need to locate an earlier entry to act on it
+// further -- for example C1.6's reorg handling, which is given the
+// original deposit_final entry's idempotency key (not its numeric id) by
+// whichever caller detected the reorg, and needs the id to call Reverse.
+func GetEntryByIdempotencyKey(ctx context.Context, tx pgx.Tx, key string) (Entry, error) {
 	row := tx.QueryRow(ctx, `
 		SELECT id, idempotency_key, payload_hash, entry_type, order_id, actor,
 			occurred_at, recorded_at, reversal_of, metadata
