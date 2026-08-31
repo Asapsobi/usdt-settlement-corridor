@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -38,10 +39,15 @@ var ErrIdempotencyConflict = errors.New("journal: idempotency key reused with a 
 // returns zero rows only once the winner has actually committed, so the
 // SELECT that follows is guaranteed to see it.
 //
+// A successful Post also applies every line to the account_balances cache
+// (C1.4) in the same tx, so the cache can never be observed out of step
+// with the journal -- there is no window where the entry exists but the
+// balance it implies does not, or vice versa.
+//
 // tx is a transaction the caller already opened -- Post never begins or
-// commits one itself, so a balance update (C1.4) or an order state
-// transition (C1.5) can be made to commit atomically with the entry by
-// running all three against the same tx.
+// commits one itself, so an order state transition (C1.5) can be made to
+// commit atomically with the entry and its balance updates by running all
+// of it against the same tx.
 func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (Entry, error) {
 	resolved, err := validate(ctx, tx, req)
 	if err != nil {
@@ -81,7 +87,8 @@ func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (Entry, error) {
 }
 
 // postLines is reached only when this call's own INSERT won the race: it
-// owns writing every line and reporting Outcome=Created.
+// owns writing every line, applying each to the account_balances cache,
+// and reporting Outcome=Created.
 func postLines(ctx context.Context, tx pgx.Tx, entry Entry, resolved []resolvedLine) (Entry, error) {
 	entry.Outcome = Created
 	entry.Lines = make([]PostedLine, len(resolved))
@@ -100,7 +107,41 @@ func postLines(ctx context.Context, tx pgx.Tx, entry Entry, resolved []resolvedL
 			Amount:      rl.amount,
 		}
 	}
+
+	if err := applyBalances(ctx, tx, entry.ID, resolved); err != nil {
+		return Entry{}, err
+	}
+
 	return entry, nil
+}
+
+// applyBalances updates account_balances for every account this entry
+// touched. It processes accounts in ascending account_id order -- not the
+// order lines were submitted or stored -- which is what makes concurrent
+// entries touching overlapping account sets deadlock-proof: every
+// transaction that ever locks two of the same rows locks them in the same
+// relative order, so a circular wait can never form.
+func applyBalances(ctx context.Context, tx pgx.Tx, entryID int64, resolved []resolvedLine) error {
+	sorted := make([]resolvedLine, len(resolved))
+	copy(sorted, resolved)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].account.ID < sorted[j].account.ID
+	})
+
+	for _, rl := range sorted {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO account_balances (account_id, asset, balance_units, last_entry_id)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (account_id) DO UPDATE
+			SET balance_units = account_balances.balance_units + EXCLUDED.balance_units,
+				last_entry_id = EXCLUDED.last_entry_id,
+				updated_at = now()
+		`, rl.account.ID, string(rl.amount.Asset), rl.amount.Units, entryID)
+		if err != nil {
+			return fmt.Errorf("journal: apply balance for account %d: %w", rl.account.ID, err)
+		}
+	}
+	return nil
 }
 
 // resolveExisting is reached when ON CONFLICT DO NOTHING found IdempotencyKey

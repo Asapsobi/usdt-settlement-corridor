@@ -13,9 +13,11 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,12 +110,29 @@ func withTx(t *testing.T, pool *pgxpool.Pool, fn func(ctx context.Context, tx pg
 	return tx.Commit(ctx)
 }
 
+// customerAccountSeq gives every customerAccount call a distinct code even
+// when called multiple times in one test with the same asset. Without it,
+// two calls with the same (t, asset) produce the identical code string,
+// and since accounts.Create is idempotent on code, the second call
+// silently returns the FIRST call's account -- two variables that look
+// like two accounts collapsing into one. Atomic because a handful of
+// tests call this from concurrent goroutines.
+//
+// The code also includes runID (defined below), not just this counter:
+// the counter alone always starts at 1 in a fresh `go test` process, so
+// without runID, re-running the suite against the same persistent test
+// database would generate the SAME code on the next run, silently
+// accumulating balance onto an account from a previous run instead of
+// starting fresh.
+var customerAccountSeq int64
+
 // customerAccount creates a fresh liability:customer account for asset,
-// unique to the running test, since customer accounts have a variable code
-// segment and are never part of the fixed seed chart.
+// unique to the running test and this call, since customer accounts have
+// a variable code segment and are never part of the fixed seed chart.
 func customerAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, asset money.Asset) string {
 	t.Helper()
-	code := "liability:customer:" + t.Name() + ":" + string(asset)
+	n := atomic.AddInt64(&customerAccountSeq, 1)
+	code := fmt.Sprintf("liability:customer:%s:%s:%s:%d", t.Name(), asset, runID, n)
 	_, err := accounts.Create(ctx, pool, code, accounts.Liability, asset)
 	require.NoError(t, err)
 	return code
