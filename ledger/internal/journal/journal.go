@@ -21,10 +21,16 @@ type Line struct {
 	Amount      money.Amount
 }
 
-// EntryRequest is everything a caller supplies to Post. IdempotencyKey
-// uniqueness is enforced by the database (journal_entries.idempotency_key
-// is UNIQUE); full replay/conflict semantics on top of that arrive in
-// C1.3, not here.
+// EntryRequest is everything a caller supplies to Post.
+//
+// IdempotencyKey convention: "<producer>:<domain>:<natural-id>", e.g.
+// "watcher:deposit_final:0xabc...:12" (tx hash + log index) or
+// "dispatcher:payout_settled:<tron_txid>". The natural id must come from
+// the external world the caller is reacting to, never a UUID minted at
+// call time -- a retried call has to generate the exact same key, and only
+// a fact about the outside world is guaranteed to reproduce identically.
+// Max 255 bytes, enforced both here (validateIdempotencyKey) and by a
+// CHECK constraint in migrations/0004_idempotency_key_length.sql.
 type EntryRequest struct {
 	IdempotencyKey string
 	EntryType      string
@@ -44,6 +50,32 @@ type PostedLine struct {
 	Amount      money.Amount
 }
 
+// Outcome distinguishes a fresh write from a replay of one that already
+// happened, so a caller retrying after a timeout can tell whether it just
+// caused the side effect or merely rediscovered it.
+type Outcome int
+
+const (
+	// Created means this call's INSERT is the one that won: no entry
+	// existed for this idempotency key before this call.
+	Created Outcome = iota
+	// Replayed means an entry with this idempotency key and an identical
+	// payload already existed; nothing new was written, and Entry is the
+	// original row.
+	Replayed
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case Created:
+		return "created"
+	case Replayed:
+		return "replayed"
+	default:
+		return "unknown"
+	}
+}
+
 // Entry is a journal_entries row together with the lines that were posted
 // with it.
 type Entry struct {
@@ -58,6 +90,7 @@ type Entry struct {
 	ReversalOf     *int64
 	Metadata       map[string]any
 	Lines          []PostedLine
+	Outcome        Outcome
 }
 
 // resolvedLine is a Line after account lookup, immediately before insert.

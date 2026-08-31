@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	ErrTooFewLines    = errors.New("journal: entry must have at least two lines")
-	ErrTooManyLines   = errors.New("journal: entry has more lines than a journal entry may ever hold")
-	ErrZeroAmountLine = errors.New("journal: line amount must be nonzero")
-	ErrAssetMismatch  = errors.New("journal: line asset does not match its account's asset")
-	ErrUnbalanced     = errors.New("journal: entry does not balance to zero for at least one asset")
+	ErrTooFewLines           = errors.New("journal: entry must have at least two lines")
+	ErrTooManyLines          = errors.New("journal: entry has more lines than a journal entry may ever hold")
+	ErrZeroAmountLine        = errors.New("journal: line amount must be nonzero")
+	ErrAssetMismatch         = errors.New("journal: line asset does not match its account's asset")
+	ErrUnbalanced            = errors.New("journal: entry does not balance to zero for at least one asset")
+	ErrInvalidIdempotencyKey = errors.New("journal: invalid idempotency key")
 )
 
 // maxLines guards the int-to-int16 cast when assigning Seq. It is nowhere
@@ -24,11 +25,30 @@ var (
 // rejected explicitly rather than left to overflow quietly.
 const maxLines = 32767
 
+// maxIdempotencyKeyLen matches migrations/0004_idempotency_key_length.sql's
+// CHECK constraint -- enforced here too so a bad key is rejected before
+// ever reaching the database, not just when it gets there.
+const maxIdempotencyKeyLen = 255
+
+func validateIdempotencyKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidIdempotencyKey)
+	}
+	if len(key) > maxIdempotencyKeyLen {
+		return fmt.Errorf("%w: %d bytes, max %d", ErrInvalidIdempotencyKey, len(key), maxIdempotencyKeyLen)
+	}
+	return nil
+}
+
 // validate checks an EntryRequest against every Go-layer rule from C1.2
-// and resolves each line's account. It is the first of the three
-// enforcement layers described in migrations/0003_journal.sql; the other
-// two run in Postgres regardless of what this function does.
+// and C1.3, and resolves each line's account. It is the first of the
+// enforcement layers described in migrations/0003_journal.sql and
+// migrations/0004_idempotency_key_length.sql; the others run in Postgres
+// regardless of what this function does.
 func validate(ctx context.Context, q accounts.Queryer, req EntryRequest) ([]resolvedLine, error) {
+	if err := validateIdempotencyKey(req.IdempotencyKey); err != nil {
+		return nil, err
+	}
 	if len(req.Lines) < 2 {
 		return nil, fmt.Errorf("%w: got %d", ErrTooFewLines, len(req.Lines))
 	}

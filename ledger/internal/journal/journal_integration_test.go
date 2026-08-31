@@ -54,12 +54,18 @@ func idemKey(t *testing.T, prefix string) string {
 	return prefix + ":" + t.Name() + ":" + runID
 }
 
-func testPool(t *testing.T) *pgxpool.Pool {
+func testDatabaseURL(t *testing.T) string {
 	t.Helper()
 	url := os.Getenv("LEDGER_TEST_DATABASE_URL")
 	if url == "" {
 		t.Skip("LEDGER_TEST_DATABASE_URL not set; skipping integration test")
 	}
+	return url
+}
+
+func testPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	url := testDatabaseURL(t)
 	applyMigrations(t, url)
 
 	ctx := context.Background()
