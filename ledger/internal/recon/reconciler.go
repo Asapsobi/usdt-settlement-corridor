@@ -3,6 +3,7 @@ package recon
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,10 +18,29 @@ import (
 type Reconciler struct {
 	pool *pgxpool.Pool
 	cfg  Config
+
+	// lastTick is a Unix-nanosecond timestamp of the start of the most
+	// recent RunOnce call, for the recon_lag_seconds metric (C1.8). It
+	// updates at the START of every cycle, including ones that skip all
+	// checks because the ledger is already halted -- lag measures whether
+	// the reconciler is alive and ticking, not whether it found anything
+	// to do, so a halted system correctly shows near-zero lag rather than
+	// an ever-climbing value that would look like the process had died.
+	lastTick atomic.Int64
 }
 
 func NewReconciler(pool *pgxpool.Pool, cfg Config) *Reconciler {
 	return &Reconciler{pool: pool, cfg: cfg}
+}
+
+// LastTick returns the start time of the most recent RunOnce call, or
+// the zero Time if RunOnce has never run.
+func (r *Reconciler) LastTick() time.Time {
+	nanos := r.lastTick.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // Run ticks every cfg.Interval until ctx is cancelled. Intended to be
@@ -55,6 +75,8 @@ func (r *Reconciler) Run(ctx context.Context) {
 // ACCEPTANCE sections, which describe what triggers a halt but not what
 // a *repeat* trigger while already halted should do.
 func (r *Reconciler) RunOnce(ctx context.Context) {
+	r.lastTick.Store(time.Now().UnixNano())
+
 	halted, err := halt.IsHalted(ctx, r.pool)
 	if err != nil {
 		slog.Error("recon: checking halt state", "error", err)

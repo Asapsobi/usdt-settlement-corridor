@@ -155,13 +155,14 @@ func TestIngestSnapshotHaltsOnUSDTDriftAndNamesAccount(t *testing.T) {
 
 	cfg := recon.Config{}
 	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
-		return recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
+		_, err := recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
 			AccountCode:   acc1,
 			ObservedUnits: ledgerBal.Units + 1, // 1 minor unit of drift
 			ChainRef:      "test-block-1",
 			Watermark:     entry.ID,
 			ObservedAt:    time.Now(),
 		})
+		return err
 	})
 	require.NoError(t, err)
 
@@ -190,13 +191,14 @@ func TestIngestSnapshotRecordsSnapshotEvenWhenNoDrift(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, "SELECT count(*) FROM recon_snapshots WHERE account_id = (SELECT id FROM accounts WHERE code = $1)", acc1).Scan(&countBefore))
 
 	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
-		return recon.IngestSnapshot(ctx, tx, recon.Config{}, recon.SnapshotParams{
+		_, err := recon.IngestSnapshot(ctx, tx, recon.Config{}, recon.SnapshotParams{
 			AccountCode:   acc1,
 			ObservedUnits: ledgerBal.Units,
 			ChainRef:      "test-block-2",
 			Watermark:     entry.ID,
 			ObservedAt:    time.Now(),
 		})
+		return err
 	})
 	require.NoError(t, err)
 
@@ -220,13 +222,14 @@ func TestIngestSnapshotTRXWithinToleranceDoesNotHalt(t *testing.T) {
 
 	cfg := recon.Config{TRXToleranceUnits: 5}
 	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
-		return recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
+		_, err := recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
 			AccountCode:   acc1,
 			ObservedUnits: ledgerBal.Units + 5, // exactly at tolerance
 			ChainRef:      "test-block-3",
 			Watermark:     entry.ID,
 			ObservedAt:    time.Now(),
 		})
+		return err
 	})
 	require.NoError(t, err)
 
@@ -246,13 +249,14 @@ func TestIngestSnapshotTRXExceedingToleranceHalts(t *testing.T) {
 
 	cfg := recon.Config{TRXToleranceUnits: 5}
 	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
-		return recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
+		_, err := recon.IngestSnapshot(ctx, tx, cfg, recon.SnapshotParams{
 			AccountCode:   acc1,
 			ObservedUnits: ledgerBal.Units + 6, // one past tolerance
 			ChainRef:      "test-block-4",
 			Watermark:     entry.ID,
 			ObservedAt:    time.Now(),
 		})
+		return err
 	})
 	require.NoError(t, err)
 

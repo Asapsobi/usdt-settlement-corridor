@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -13,10 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"ledger/internal/db"
 	"ledger/internal/halt"
+	"ledger/internal/httpapi"
 	"ledger/internal/orders"
 	"ledger/internal/recon"
 )
@@ -55,8 +53,18 @@ func run() error {
 	go reconciler.Run(ctx)
 	slog.Info("reconciler self-check loop started", "interval", reconCfg.Interval)
 
-	router := chi.NewRouter()
-	router.Get("/healthz", healthzHandler)
+	auth, err := httpapi.AuthConfigFromEnv()
+	if err != nil {
+		return err
+	}
+
+	router := httpapi.NewRouter(&httpapi.Server{
+		Pool:       pool,
+		Auth:       auth,
+		ReconCfg:   reconCfg,
+		Reconciler: reconciler,
+		BuildInfo:  buildInfo,
+	})
 
 	srv := &http.Server{
 		Addr:    listenAddr(),
@@ -92,23 +100,6 @@ func listenAddr() string {
 		return addr
 	}
 	return ":8080"
-}
-
-type healthzResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version"`
-	Commit  string `json:"commit"`
-}
-
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	version, commit := buildInfo()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(healthzResponse{
-		Status:  "ok",
-		Version: version,
-		Commit:  commit,
-	})
 }
 
 // buildInfo reads module version and VCS revision from the binary's own

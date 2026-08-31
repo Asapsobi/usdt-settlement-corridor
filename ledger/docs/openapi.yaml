@@ -1,0 +1,465 @@
+openapi: 3.1.0
+info:
+  title: C1 Ledger Core API
+  version: "1.0.0"
+  description: >
+    Service-to-service HTTP boundary for C1, the ledger core. No
+    customer-facing auth and no per-customer scoping -- C6 owns that.
+    Every write handler requires an Idempotency-Key header. Every amount
+    is a decimal string, never a JSON number.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Process is up.
+
+  /readyz:
+    get:
+      summary: Readiness check (process up AND database reachable)
+      security: []
+      responses:
+        "200":
+          description: Ready to serve.
+        "503":
+          description: Not ready (database unreachable).
+
+  /metrics:
+    get:
+      summary: Prometheus exposition format
+      security: []
+      responses:
+        "200":
+          description: >
+            entries_total, entry_errors_total{code}, halt_state,
+            orders_by_state{state}, recon_drift_units, recon_lag_seconds,
+            plus standard Go/process metrics.
+
+  /v1/entries:
+    post:
+      summary: Post a journal entry
+      description: >
+        Idempotent on the Idempotency-Key header: replaying an identical
+        request returns 200 with the original entry and
+        outcome=replayed, not a second row. A different payload under the
+        same key is a 409 idempotency_conflict.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostEntryRequest"
+      responses:
+        "201":
+          description: Created a new entry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entry" }
+        "200":
+          description: Replayed an identical prior request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "423": { $ref: "#/components/responses/Halted" }
+
+  /v1/orders:
+    post:
+      summary: Create an order (always starts in state quoted)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostOrderRequest" }
+      responses:
+        "201":
+          description: Order created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/orders/{external_id}:
+    get:
+      summary: Fetch an order by its external id
+      parameters:
+        - $ref: "#/components/parameters/ExternalID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/orders/{external_id}/transitions:
+    post:
+      summary: Transition an order's state
+      description: >
+        The one static transition table (internal/orders) is the only
+        source of truth for which (from, to) pairs are legal.
+        expected_version implements optimistic concurrency: a mismatch is
+        409 version_conflict, never retried automatically.
+      parameters:
+        - $ref: "#/components/parameters/ExternalID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostTransitionRequest" }
+      responses:
+        "200":
+          description: Transition applied.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "423": { $ref: "#/components/responses/Halted" }
+
+  /v1/accounts/{code}/balance:
+    get:
+      summary: An account's balance
+      description: >
+        Reads the account_balances cache by default. ?as_of_entry_id=N
+        instead sums journal_lines up to that entry id -- what the
+        account looked like at that point in history, for reconciling
+        against a chain snapshot taken at a moment in time.
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string }
+        - name: as_of_entry_id
+          in: query
+          required: false
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balance" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/balances:
+    get:
+      summary: Every account balance matching a code prefix
+      description: e.g. ?prefix=asset:tron:slot: for slot-cap checks.
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balances:
+                    type: array
+                    items: { $ref: "#/components/schemas/Balance" }
+
+  /v1/trial-balance:
+    get:
+      summary: Per-asset sum across every journal_lines row
+      description: >
+        Independent of the account_balances cache -- the strongest health
+        signal in the system, per internal/journal.TrialBalance. Every
+        asset present should be exactly "0.000000" (or the TRX/BNB
+        equivalent) on a healthy ledger.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: string }
+
+  /v1/reconciliation/snapshots:
+    post:
+      summary: Report what a chain actually holds for an account
+      description: >
+        C1 never fetches anything itself; this is the only way a
+        reconciliation snapshot enters the ledger. Drift beyond the
+        configured tolerance (zero for every USDT asset, always) halts
+        the ledger with reason BALANCE_DRIFT.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostSnapshotRequest" }
+      responses:
+        "201":
+          description: Snapshot recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/system/halt:
+    get:
+      summary: Current halt state
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HaltState" }
+    post:
+      summary: Set or clear the halt
+      description: >
+        action=set requires reason; action=clear requires note. The actor
+        recorded is always the authenticated caller, never a request body
+        field. There is no auto-clear anywhere in this system.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostHaltRequest" }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HaltState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/system/invariants:
+    get:
+      summary: Live results of every self-check
+      description: >
+        Shaped so its numbers are the ones a customer's engineer would
+        eventually see on the public status page and diff against
+        GET /v1/settlement-stats (not built in this chunk).
+      responses:
+        "200":
+          description: OK.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Service-to-service only. One token per service identity; the
+        token maps to the actor recorded on every write. Designed so mTLS
+        could replace this without touching any handler.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    ExternalID:
+      name: external_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: invalid_request or invalid_amount.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: account_not_found or order_not_found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: idempotency_conflict, illegal_transition, or version_conflict.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unprocessable:
+      description: unbalanced_entry, asset_mismatch, or invalid_entry.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Halted:
+      description: system_halted.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    EntryLine:
+      type: object
+      required: [account_code, asset, amount]
+      properties:
+        account_code: { type: string }
+        asset: { type: string, enum: [USDT_BEP20, USDT_TRC20, TRX, BNB] }
+        amount:
+          type: string
+          description: Decimal string, e.g. "2990.700000". Never a JSON number.
+
+    PostEntryRequest:
+      type: object
+      required: [entry_type, occurred_at, lines]
+      properties:
+        entry_type: { type: string }
+        order_id: { type: integer, nullable: true }
+        occurred_at: { type: string, format: date-time }
+        lines:
+          type: array
+          minItems: 2
+          items: { $ref: "#/components/schemas/EntryLine" }
+        metadata: { type: object }
+
+    Entry:
+      type: object
+      properties:
+        id: { type: integer }
+        idempotency_key: { type: string }
+        entry_type: { type: string }
+        order_id: { type: integer, nullable: true }
+        actor: { type: string }
+        occurred_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+        reversal_of: { type: integer, nullable: true }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: { type: integer }
+              account_code: { type: string }
+              asset: { type: string }
+              amount: { type: string }
+        outcome: { type: string, enum: [created, replayed] }
+
+    PostOrderRequest:
+      type: object
+      required:
+        [external_id, customer_id, tier, amount_in, amount_out, fee_units,
+         network_fee_units, recipient_address, quoted_at, quote_expires_at]
+      properties:
+        external_id: { type: string }
+        customer_id: { type: string }
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string, description: "USDT_BEP20, decimal string" }
+        amount_out: { type: string, description: "USDT_TRC20, decimal string" }
+        fee_units: { type: string, description: "USDT_TRC20, decimal string" }
+        network_fee_units: { type: string, description: "USDT_TRC20, decimal string" }
+        recipient_address: { type: string }
+        quoted_at: { type: string, format: date-time }
+        quote_expires_at: { type: string, format: date-time }
+
+    Order:
+      type: object
+      properties:
+        id: { type: integer }
+        external_id: { type: string }
+        customer_id: { type: string }
+        tier: { type: string }
+        state:
+          type: string
+          enum: [quoted, funded, screened, dispatching, settled, held, refunded, expired]
+        amount_in: { type: string }
+        amount_out: { type: string }
+        fee_units: { type: string }
+        network_fee_units: { type: string }
+        recipient_address: { type: string }
+        quoted_at: { type: string, format: date-time }
+        quote_expires_at: { type: string, format: date-time }
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PostTransitionRequest:
+      type: object
+      required: [to_state, expected_version, reason, occurred_at]
+      properties:
+        to_state: { type: string }
+        expected_version: { type: integer }
+        reason: { type: string }
+        occurred_at: { type: string, format: date-time }
+        entry:
+          type: object
+          nullable: true
+          description: Required exactly when the transition rule requires one.
+          properties:
+            entry_type: { type: string }
+            occurred_at: { type: string, format: date-time }
+            lines:
+              type: array
+              items: { $ref: "#/components/schemas/EntryLine" }
+            metadata: { type: object }
+
+    Balance:
+      type: object
+      properties:
+        account_code: { type: string }
+        asset: { type: string }
+        balance: { type: string }
+
+    PostSnapshotRequest:
+      type: object
+      required: [account_code, observed_amount, chain_ref, watermark, observed_at]
+      properties:
+        account_code: { type: string }
+        observed_amount:
+          type: string
+          description: Decimal string, in the account's own asset.
+        chain_ref: { type: string, description: Opaque to C1. }
+        watermark: { type: integer, description: Ledger entry id the observation corresponds to. }
+        observed_at: { type: string, format: date-time }
+
+    SnapshotResult:
+      type: object
+      properties:
+        drift_amount: { type: string }
+        halted: { type: boolean }
+
+    HaltState:
+      type: object
+      properties:
+        halted: { type: boolean }
+        reason: { type: string }
+
+    PostHaltRequest:
+      type: object
+      required: [action]
+      properties:
+        action: { type: string, enum: [set, clear] }
+        reason: { type: string, description: Required when action=set. }
+        detail: { type: object }
+        note: { type: string, description: Required when action=clear. }
