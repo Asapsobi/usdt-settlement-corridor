@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"ledger/internal/accounts"
+	"ledger/internal/halt"
 	"ledger/internal/journal"
 	"ledger/internal/money"
 	"ledger/internal/orders"
@@ -77,6 +78,28 @@ func applyMigrations(t *testing.T, url string) {
 	require.NoError(t, goose.Up(sqlDB, migrationsDir(t)))
 }
 
+// prepareTestPool does the setup every orders test needs regardless of
+// how its pool was constructed: seed the fixed chart of accounts, wire up
+// the halt cache Transition now requires (SetHaltCache is a package-level
+// call, so every test process needs it, not just ones that touch halt
+// directly), and reset system_state to unhalted. That last part matters
+// even for tests that never mention halting: system_state is a single
+// shared row in the persistent test database, so without resetting it, a
+// halt left behind by an earlier reorg-scenario-B test (in this run or an
+// earlier one) would make every halt-blocked transition in an unrelated
+// test fail with ErrSystemHalted for reasons that test never caused.
+func prepareTestPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	require.NoError(t, accounts.Seed(ctx, pool))
+	orders.SetHaltCache(halt.NewCache(pool))
+	_, err := pool.Exec(ctx, `
+		UPDATE system_state
+		SET halted = false, halt_reason = NULL, halt_detail = NULL, halted_at = NULL, halted_by = NULL
+		WHERE id = 1
+	`)
+	require.NoError(t, err)
+}
+
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := testDatabaseURL(t)
@@ -87,7 +110,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	require.NoError(t, accounts.Seed(ctx, pool))
+	prepareTestPool(t, ctx, pool)
 	return pool
 }
 
@@ -105,7 +128,7 @@ func testPoolWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	require.NoError(t, accounts.Seed(ctx, pool))
+	prepareTestPool(t, ctx, pool)
 	return pool
 }
 

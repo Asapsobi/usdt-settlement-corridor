@@ -16,6 +16,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"ledger/internal/db"
+	"ledger/internal/halt"
+	"ledger/internal/orders"
+	"ledger/internal/recon"
 )
 
 func main() {
@@ -41,6 +44,16 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+
+	orders.SetHaltCache(halt.NewCache(pool.Pool))
+
+	reconCfg, err := recon.ConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	reconciler := recon.NewReconciler(pool.Pool, reconCfg)
+	go reconciler.Run(ctx)
+	slog.Info("reconciler self-check loop started", "interval", reconCfg.Interval)
 
 	router := chi.NewRouter()
 	router.Get("/healthz", healthzHandler)

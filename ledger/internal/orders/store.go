@@ -9,9 +9,36 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"ledger/internal/accounts"
+	"ledger/internal/halt"
 	"ledger/internal/journal"
 	"ledger/internal/money"
 )
+
+// haltCache is package-level rather than a Transition parameter because
+// Transition's signature is fixed by C1.5 and every existing caller
+// already matches it. SetHaltCache must be called once, at process
+// startup (cmd/ledgerd) or in a test's setup, before any halt-blocked
+// transition runs -- see the ErrHaltCacheNotConfigured check in
+// Transition for what happens if it hasn't been.
+var haltCache *halt.Cache
+
+// SetHaltCache wires up the in-memory halt cache Transition consults for
+// halt-blocked transitions (see transitionTable's HaltBlocked field).
+// Call once per process.
+func SetHaltCache(c *halt.Cache) {
+	haltCache = c
+}
+
+// ErrHaltCacheNotConfigured means SetHaltCache was never called. Treated
+// as a hard error for any halt-blocked transition rather than silently
+// treating "no cache configured" as "not halted": failing closed here is
+// deliberate -- letting money-moving transitions through because of a
+// missing setup call is a worse failure mode than refusing them.
+var ErrHaltCacheNotConfigured = errors.New("orders: halt cache not configured; call SetHaltCache at startup")
+
+// ErrSystemHalted is returned by Transition for a halt-blocked pair while
+// the ledger is halted.
+var ErrSystemHalted = errors.New("orders: system is halted")
 
 // CreateParams is everything Create needs. The new order always starts in
 // Quoted with Version 0 -- callers never choose the initial state.
@@ -182,6 +209,16 @@ func (p TransitionParams) validate() error {
 // performs the transition. A CAS miss there is ErrVersionConflict; this
 // function never retries on the caller's behalf.
 //
+// For a HaltBlocked pair (see transitionTable), halt state is checked
+// twice: first the in-memory Cache (haltCache), for fast rejection with
+// up to 1 second of staleness; then, only if that says "not halted," the
+// authoritative transactional read against system_state using this same
+// tx -- because a fast-but-stale "not halted" is not good enough to
+// actually let money leave. A pair that is not HaltBlocked never checks
+// either: quoted->funded (deposit recording) must keep working while
+// halted, and neither read-only calls nor journal.Reverse ever reach
+// this function at all.
+//
 // tx is a transaction the caller already opened. If Transition returns a
 // non-nil error, the caller must roll back rather than commit -- that is
 // what makes a losing attempt in a concurrent-transition race (which may
@@ -208,6 +245,27 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 	r, legal := transitionTable[pair{From: current.State, To: toState}]
 	if !legal {
 		return Order{}, fmt.Errorf("%w: %s -> %s", ErrIllegalTransition, current.State, toState)
+	}
+
+	if r.HaltBlocked {
+		if haltCache == nil {
+			return Order{}, ErrHaltCacheNotConfigured
+		}
+		fastHalted, err := haltCache.IsHalted(ctx)
+		if err != nil {
+			return Order{}, fmt.Errorf("orders: checking cached halt state: %w", err)
+		}
+		if fastHalted {
+			return Order{}, fmt.Errorf("%w: %s -> %s", ErrSystemHalted, current.State, toState)
+		}
+
+		authHalted, err := halt.IsHalted(ctx, tx)
+		if err != nil {
+			return Order{}, fmt.Errorf("orders: checking authoritative halt state: %w", err)
+		}
+		if authHalted {
+			return Order{}, fmt.Errorf("%w: %s -> %s", ErrSystemHalted, current.State, toState)
+		}
 	}
 
 	switch {
