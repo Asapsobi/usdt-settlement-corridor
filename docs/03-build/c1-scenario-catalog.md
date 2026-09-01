@@ -18,6 +18,8 @@ The short answer to "is this enough for our product": Part 1 is enough to trust 
 
 These are the scenarios the C1.9 replay harness already injects, plus the acceptance-test scenarios from C1.2–C1.8 that aren't part of the harness mix but are equally load-bearing. Every row has a home in the codebase; none of these should be open questions by the time C1.8 is frozen.
 
+**Update, 1 Sep 2026 — audited against the real test suite.** C1.0–C1.10 are now actually built (`ledger/` in the repository), so this part stopped being a spec claim and got checked against real code, row by row, commit `c93dfb9`. 31 of 34 rows checked out exactly as written — including the specific numbers (1,000 concurrent Posts, 200 goroutines, 50 concurrent transitions, 53 of 64 illegal pairs, 1 minor unit of drift) all matching real, accurately-named tests. Three rows had no test behind them despite being listed as proven, and now do — marked **[closed 1 Sep]** below, with the test that closed them. The audit also surfaced one thing this catalog had missed entirely: a real HTTP-boundary bug, found by building and driving a manual test console rather than by test code. It's now §1.8.
+
 ### 1.1 — Core money-movement path
 
 | Scenario | Where it's handled | Proof it worked |
@@ -25,7 +27,7 @@ These are the scenarios the C1.9 replay harness already injects, plus the accept
 | Clean happy path, full lifecycle | C1.5 transition table, §B worked entries E1–E5 | Order reaches `settled`, trial balance 0 |
 | Conversion entry (BEP20 in, TRC20 out, one entry, two assets) | C1.2, §B | Each asset's lines sum to zero independently |
 | Fee and network-fee split at settlement | §B entry E2 | `revenue:fee` and `revenue:network_fee` credited exactly |
-| Treasury rebalance closing the corridor position | §B entry E5 | `position:corridor` returns toward zero per asset |
+| Treasury rebalance closing the corridor position | §B entry E5 | **[closed 1 Sep]** Had zero test coverage until the audit. `TestTreasuryRebalanceClosesCorridorPosition` now posts §B's exact E2 then E5 entries and confirms both corridor accounts return to exactly zero |
 
 ### 1.2 — Idempotency and concurrency
 
@@ -86,8 +88,24 @@ These are the scenarios the C1.9 replay harness already injects, plus the accept
 | `position:corridor` exceeds its configured ceiling | C1.7 | Alert, explicitly **not** a halt — a slow rebalance isn't an error |
 | Halt clear attempted without an operator identity | C1.7 acceptance | Rejected — no auto-clear exists |
 | Reconciliation snapshot with non-zero drift on a USDT asset | C1.7 | Halts — tolerance is zero for USDT by design, non-zero tolerance only ever considered for TRX rounding |
+| All four halt-blocked pairs individually verified (`funded→refunded`, `held→refunded`, `screened→dispatching`, `dispatching→settled`), plus every non-blocked pair confirmed to keep working while halted | C1.5's transition table | **[closed 1 Sep]** Only `screened→dispatching` had ever been behaviorally checked. `TestHaltBlocksExactlyTheDocumentedPairs` now drives all 11 legal pairs through a live halt and checks each against the spec's own table |
 
-**Coverage note:** every row above already has a named acceptance test or harness bucket in `c1-ledger-build-prompts.md`. There is no scenario in this part that is merely "planned" — if any of these isn't green before C1.8 freezes, that's the blocker, not a gap in this catalog.
+### 1.8 — Input validation
+
+| Scenario | Where it's handled | Proof it worked |
+|---|---|---|
+| Order creation rejected on each of its 10 invalid-input branches (empty actor, wrong asset, `quote_expires_at` before `quoted_at`, and so on) | `orders.CreateParams.validate()` | **[added 1 Sep]** Table-driven test added during the audit — previously every existing test only ever exercised the accept path |
+| Order transition rejected on each of its 4 invalid-input branches | `orders.TransitionParams.validate()` | **[added 1 Sep]** Same audit, same pattern, mirroring `journal.Reverse`'s existing validation tests |
+
+### 1.9 — HTTP boundary correctness under real client encoding
+
+Not in the original catalog at all — found by building and driving `ledger/docs/console.html`, a manual test console, rather than by any written scenario. Worth calling out on its own because it's a class of bug neither the spec nor the automated harness would have caught: every existing integration test built its URLs by plain string concatenation and never encoded anything, so the gap was invisible until a real client (a browser, using `encodeURIComponent` like any well-behaved HTTP client) hit it.
+
+| Scenario | Where it's handled | Proof it worked |
+|---|---|---|
+| Account code containing `:` (this system's separator throughout) sent through normal URL-encoding | chi's router matches the *raw* encoded path when the request has any escaping, so `chi.URLParam` returned the still-encoded segment on `GET /accounts/{code}/balance` and both order routes, producing false `404`/`order_not_found` | **[fixed 1 Sep]** A `urlParam()` decode helper at all three call sites, plus a regression test that deliberately encodes a real account code the way a browser does. Commit `7faa738` |
+
+**Coverage note:** every row above now has a named test behind it, not just a spec reference — the 1 Sep audit is what makes that true rather than assumed. There is no scenario in this part that is merely "planned." If any of these ever goes red, that's the blocker, not a gap in this catalog.
 
 ---
 
