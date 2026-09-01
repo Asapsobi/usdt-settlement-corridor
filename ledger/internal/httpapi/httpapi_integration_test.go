@@ -17,9 +17,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,11 +78,63 @@ func applyMigrations(t *testing.T, dbURL string) {
 // as cmd/ledgerd wires them.
 // testServer spins up a router with the default recon.Config -- an
 // Interval far longer than any test runs, so the background ticker never
-// actually fires and interferes. Pass opts to override fields (e.g.
-// CorridorCeilings) for tests that need specific reconciler behavior.
+// actually fires and interferes -- against the shared ledger_test
+// database. Pass opts to override fields (e.g. CorridorCeilings) for
+// tests that need specific reconciler behavior.
+//
+// Not safe for a test that asserts an exact value for a globally shared
+// account (position:corridor:*, an asset total, ...): ledger_test is
+// shared across this whole suite, go test parallelizes across packages
+// by default, and another package's test can write to that same account
+// in the window between this test's own reads. Use testServerIsolated
+// instead for those.
 func testServer(t *testing.T, opts ...func(*recon.Config)) (baseURL string, pool *pgxpool.Pool) {
 	t.Helper()
-	dbURL := testDatabaseURL(t)
+	return testServerAt(t, testDatabaseURL(t), opts...)
+}
+
+// testServerIsolated is testServer against a freshly created throwaway
+// database instead of the shared one, for tests that need it.
+func testServerIsolated(t *testing.T, opts ...func(*recon.Config)) (baseURL string, pool *pgxpool.Pool) {
+	t.Helper()
+	return testServerAt(t, freshIsolatedDatabaseURL(t), opts...)
+}
+
+// freshIsolatedDatabaseURL creates a throwaway database on the same
+// cluster as LEDGER_TEST_DATABASE_URL and returns its connection URL,
+// with cleanup registered.
+func freshIsolatedDatabaseURL(t *testing.T) string {
+	t.Helper()
+	baseURL := testDatabaseURL(t)
+	u, err := url.Parse(baseURL)
+	require.NoError(t, err)
+	adminURL := *u
+	adminURL.Path = "/postgres"
+	ctx := context.Background()
+
+	adminPool, err := pgxpool.New(ctx, adminURL.String())
+	require.NoError(t, err)
+	dbName := fmt.Sprintf("httpapi_isolated_%d", time.Now().UnixNano())
+	_, err = adminPool.Exec(ctx, "CREATE DATABASE "+dbName)
+	require.NoError(t, err)
+	adminPool.Close()
+
+	t.Cleanup(func() {
+		cleanupPool, err := pgxpool.New(context.Background(), adminURL.String())
+		if err != nil {
+			return
+		}
+		defer cleanupPool.Close()
+		_, _ = cleanupPool.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
+	})
+
+	freshURL := *u
+	freshURL.Path = "/" + dbName
+	return freshURL.String()
+}
+
+func testServerAt(t *testing.T, dbURL string, opts ...func(*recon.Config)) (baseURL string, pool *pgxpool.Pool) {
+	t.Helper()
 	applyMigrations(t, dbURL)
 
 	ctx := context.Background()
@@ -618,7 +672,16 @@ func TestGetInvariantsAndTrialBalance(t *testing.T) {
 // "the endpoint returns 200."
 func TestInvariantsCorridorCeiling(t *testing.T) {
 	ceiling := int64(500_000000) // 500.000000 USDT_BEP20
-	baseURL, pool := testServer(t, func(c *recon.Config) {
+	// Isolated: this test asserts an exact balance for
+	// position:corridor:USDT_BEP20, a globally shared account. Against
+	// the shared ledger_test database, another package's concurrently
+	// running test can write to that same account between this test's
+	// own "before" and "after" reads -- see testServerIsolated's doc
+	// comment. That's exactly what happened the first time this ran as
+	// part of the full suite rather than in isolation: off by exactly
+	// one other, concurrently running test's 1.000000 USDT_BEP20 write
+	// landing in that window.
+	baseURL, pool := testServerIsolated(t, func(c *recon.Config) {
 		c.CorridorCeilings = map[money.Asset]int64{money.USDT_BEP20: ceiling}
 	})
 
@@ -675,6 +738,39 @@ func TestInvariantsCorridorCeiling(t *testing.T) {
 	assert.Equal(t, want, got.PositionUnits)
 	assert.Equal(t, ceiling, got.CeilingUnits)
 	assert.True(t, got.OverCeiling)
+}
+
+// TestGetAccountBalancePercentEncodedCode is a regression test for a real
+// bug: chi's router matches against the request's raw, still-percent-
+// encoded path whenever the request line contains any escaping at all
+// (it prefers r.URL.RawPath over the already-decoded r.URL.Path), so
+// chi.URLParam returns the RAW segment, not the decoded one. Every
+// account code in this system uses colons as a separator, and colon is a
+// character url.PathEscape and JavaScript's encodeURIComponent both
+// percent-encode by default -- so any client that encodes its path
+// segments properly (this system's own future callers very possibly
+// included) got a 404 for an account that plainly exists. Found by
+// actually driving a real browser-based client against this exact
+// endpoint, not by unit tests alone, since every existing test built its
+// URL by direct string concatenation and never exercised an encoded path.
+func TestGetAccountBalancePercentEncodedCode(t *testing.T) {
+	baseURL, _ := testServer(t)
+
+	const code = "position:corridor:USDT_BEP20" // seeded, always exists
+	// url.PathEscape deliberately leaves colons alone -- RFC 3986 allows
+	// them unencoded in a path segment -- so it can't reproduce this bug.
+	// JavaScript's encodeURIComponent (what the console.html client and
+	// this system's real future callers might well use) encodes them
+	// anyway, since it's a general-purpose component encoder, not a
+	// path-segment-aware one. Replicate that exactly, rather than reaching
+	// for a stdlib encoder whose specific choices might not match.
+	encoded := strings.ReplaceAll(code, ":", "%3A")
+
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/accounts/"+encoded+"/balance", "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "a percent-encoded account code must resolve exactly like the unencoded one")
+	var result map[string]any
+	decodeInto(t, resp, &result)
+	assert.Equal(t, code, result["account_code"])
 }
 
 func TestGetBalancesPrefix(t *testing.T) {

@@ -5,7 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // decodeJSON decodes r's body into v, rejecting unknown fields and, most
@@ -52,6 +55,29 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 
 	writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "malformed JSON: "+err.Error()))
 	return false
+}
+
+// urlParam returns the URL path parameter named key, percent-decoded.
+// chi's router matches -- and populates URLParam from -- the request's
+// raw, still-percent-encoded path whenever the request line contains any
+// escaping at all (see routeHTTP in go-chi/chi's mux.go: it prefers
+// r.URL.RawPath over the already-decoded r.URL.Path precisely because
+// decoding at the routing layer would be unsafe in general -- a %2F could
+// collapse into a literal path separator and change which route or
+// wildcard boundary matches). Decoding is therefore this application's
+// job, once, right where a path parameter is read. Skipping it means a
+// well-behaved client that percent-encodes a reserved character in a
+// path segment -- a colon in an account code, say, which url.PathEscape
+// and JavaScript's encodeURIComponent both do by default -- gets a 404
+// for an account that plainly exists, for a request that never reaches
+// this handler with the value the client actually sent.
+func urlParam(w http.ResponseWriter, r *http.Request, key string) (string, bool) {
+	decoded, err := url.PathUnescape(chi.URLParam(r, key))
+	if err != nil {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "malformed "+key+" in URL path"))
+		return "", false
+	}
+	return decoded, true
 }
 
 // looksLikeAmountField reports whether a JSON field path (e.g.

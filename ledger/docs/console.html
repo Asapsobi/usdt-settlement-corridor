@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C1 Ledger Console</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea; --text: #1a1d23; --muted: #6b7280;
+    --accent: #2563eb; --accent-text: #ffffff; --ok: #059669; --warn: #d97706; --err: #dc2626;
+    --code-bg: #0f172a; --code-text: #d6e2ff; --pill-bg: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f26; --border: #2b2f38; --text: #e7e9ee; --muted: #9aa1ad;
+      --accent: #5b8def; --accent-text: #0b1220; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+      --code-bg: #0b0e14; --code-text: #cfe0ff; --pill-bg: #262b34;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap; position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+  header .conn { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex: 1; }
+  header input { width: 200px; }
+  .status-pill { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .status-pill.up { background: var(--ok); color: #06281c; }
+  .status-pill.down { background: var(--err); color: #2b0a0a; }
+  .status-pill.unknown { background: var(--pill-bg); color: var(--muted); }
+
+  main {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 20px 60px;
+    max-width: 1400px; margin: 0 auto;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .col.wide { grid-column: 1 / -1; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+  .panel h3 { font-size: 13px; margin: 14px 0 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  label, .field-label { font-size: 12px; color: var(--muted); }
+  .field { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 120px; }
+
+  input, select, textarea, button {
+    font: inherit; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  button { cursor: pointer; border-color: var(--border); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.danger { background: transparent; color: var(--err); border-color: var(--err); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+
+  .pipeline { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin: 4px 0 14px; }
+  .pipeline .step {
+    padding: 5px 10px; border-radius: 999px; background: var(--pill-bg); color: var(--muted); font-size: 12px; font-weight: 600;
+  }
+  .pipeline .step.active { background: var(--accent); color: var(--accent-text); }
+  .pipeline .arrow { color: var(--muted); font-size: 12px; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12.5px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { word-break: break-all; }
+
+  pre.json {
+    background: var(--code-bg); color: var(--code-text); padding: 10px 12px; border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px;
+    overflow-x: auto; margin: 0; max-height: 260px; overflow-y: auto;
+  }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .badge.ok { background: var(--ok); color: #06281c; }
+  .badge.err { background: var(--err); color: #2b0a0a; }
+  .badge.muted { background: var(--pill-bg); color: var(--muted); }
+
+  .log-entry { border-bottom: 1px solid var(--border); padding: 8px 0; }
+  .log-entry:last-child { border-bottom: none; }
+  .log-entry summary { cursor: pointer; font-size: 12.5px; display: flex; gap: 8px; align-items: center; }
+  .log-entry summary .path { color: var(--text); font-weight: 600; }
+  .log-entry summary .time { color: var(--muted); margin-left: auto; font-size: 11px; }
+  .log-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  @media (max-width: 700px) { .log-body { grid-template-columns: 1fr; } }
+
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  .order-list { display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto; }
+  .order-list button { text-align: left; font-size: 12px; }
+  .order-list button.selected { border-color: var(--accent); }
+  hr.sep { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>C1 Ledger Console</h1>
+  <div class="conn">
+    <div class="field"><label for="baseUrl">Base URL</label><input id="baseUrl" value="http://localhost:8080"></div>
+    <div class="field"><label for="token">Bearer token</label><input id="token" placeholder="LEDGER_API_TOKENS value"></div>
+    <div class="field"><label for="actorDisplay">Actor (shown, not sent)</label><input id="actorDisplay" disabled></div>
+    <button id="btnCheck">Check connection</button>
+    <span id="statusPill" class="status-pill unknown">unknown</span>
+  </div>
+</header>
+
+<main>
+
+  <div class="col">
+    <div class="panel" id="systemPanel">
+      <h2>System</h2>
+      <div class="row">
+        <button id="btnRefreshSystem">Refresh</button>
+        <span id="haltBadge" class="badge muted">?</span>
+      </div>
+      <div class="kv" id="invariantsKv" style="margin-top:10px;"></div>
+      <hr class="sep">
+      <h3>Halt control</h3>
+      <div class="row">
+        <div class="field"><label for="haltReason">Reason (set)</label><input id="haltReason" placeholder="manual investigation"></div>
+      </div>
+      <div class="row">
+        <button id="btnHaltSet" class="danger">Set halt</button>
+      </div>
+      <div class="row">
+        <div class="field"><label for="haltNote">Note (required to clear)</label><input id="haltNote" placeholder="what you checked"></div>
+      </div>
+      <div class="row">
+        <button id="btnHaltClear">Clear halt</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Balance lookup</h2>
+      <div class="row">
+        <div class="field"><label for="balanceAccountPreset">Account code</label>
+          <select id="balanceAccountPreset">
+            <option value="">-- pick a common account --</option>
+            <option value="position:corridor:USDT_BEP20">position:corridor:USDT_BEP20</option>
+            <option value="position:corridor:USDT_TRC20">position:corridor:USDT_TRC20</option>
+            <option value="revenue:fee">revenue:fee</option>
+            <option value="revenue:network_fee">revenue:network_fee</option>
+            <option value="expense:loss:reorg">expense:loss:reorg</option>
+            <option value="asset:bsc:deposit:console-demo">asset:bsc:deposit:console-demo</option>
+            <option value="liability:customer:console-demo:USDT_BEP20">liability:customer:console-demo:USDT_BEP20</option>
+            <option value="liability:customer:console-demo:USDT_TRC20">liability:customer:console-demo:USDT_TRC20</option>
+            <option value="asset:tron:slot:console-demo">asset:tron:slot:console-demo</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field"><label for="balanceAccount">Or type any code</label><input id="balanceAccount" placeholder="or type any account code"></div>
+        <button id="btnCheckBalance">Check</button>
+      </div>
+      <div id="balanceResult" class="hint"></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="panel">
+      <h2>Order lifecycle</h2>
+      <p class="hint">
+        Uses four fixed demo accounts seeded by <code>go run ./cmd/seed-console</code> --
+        this is a testing convenience (a real deposit account is per-order), not how C2 will do it.
+      </p>
+      <details>
+        <summary style="cursor:pointer; font-size:12.5px;">New order (worked-example amounts, editable)</summary>
+        <div class="row" style="margin-top:8px;">
+          <div class="field"><label for="newAmountIn">amount_in (USDT_BEP20)</label><input id="newAmountIn" value="3000.000000"></div>
+          <div class="field"><label for="newAmountOut">amount_out (USDT_TRC20)</label><input id="newAmountOut" value="2990.700000"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label for="newFee">fee_units</label><input id="newFee" value="7.500000"></div>
+          <div class="field"><label for="newNetworkFee">network_fee_units</label><input id="newNetworkFee" value="1.800000"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label for="newTier">tier</label>
+            <select id="newTier"><option>STANDARD</option><option>SWEEP</option><option>DIRECT</option></select>
+          </div>
+        </div>
+        <div class="row"><button id="btnCreateOrder" class="primary">Create order</button></div>
+      </details>
+
+      <hr class="sep">
+
+      <div class="row"><span class="field-label">Orders created this session</span></div>
+      <div id="orderList" class="order-list"><span class="hint">none yet</span></div>
+
+      <div id="orderDetail" style="margin-top:12px;"></div>
+    </div>
+  </div>
+
+  <div class="col wide">
+    <div class="panel">
+      <h2>Raw entry (POST /v1/entries)</h2>
+      <p class="hint">Every asset within an entry must sum to zero. Amounts are decimal strings.</p>
+      <div class="row">
+        <div class="field"><label for="rawEntryType">entry_type</label><input id="rawEntryType" value="manual_test"></div>
+        <div class="field"><label for="rawOrderId">order_id (optional)</label><input id="rawOrderId" placeholder="leave blank"></div>
+      </div>
+      <textarea id="rawLines" rows="5" style="width:100%; margin-top:8px;">[
+  {"account_code": "equity:opening:USDT_BEP20", "asset": "USDT_BEP20", "amount": "1.000000"},
+  {"account_code": "position:corridor:USDT_BEP20", "asset": "USDT_BEP20", "amount": "-1.000000"}
+]</textarea>
+      <div class="row" style="margin-top:8px;">
+        <button id="btnPostEntry" class="primary">Post entry</button>
+      </div>
+      <div id="rawEntryResult"></div>
+    </div>
+  </div>
+
+  <div class="col wide">
+    <div class="panel">
+      <h2>Activity log</h2>
+      <div class="row"><button id="btnClearLog">Clear log</button></div>
+      <div id="activityLog" style="margin-top:8px;"><span class="hint">Nothing yet -- try "Check connection".</span></div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+'use strict';
+
+// ---- fixed demo accounts (see cmd/seed-console) ----
+const DEPOSIT_ACCOUNT = 'asset:bsc:deposit:console-demo';
+const CUSTOMER_BEP = 'liability:customer:console-demo:USDT_BEP20';
+const CUSTOMER_TRC = 'liability:customer:console-demo:USDT_TRC20';
+const SLOT_ACCOUNT = 'asset:tron:slot:console-demo';
+
+const STATES = ['quoted', 'funded', 'screened', 'dispatching', 'settled'];
+const TERMINAL_SIDE = ['held', 'refunded', 'expired'];
+
+let orders = []; // {external_id, key, ...latest order response}
+let selected = null; // external_id of the order shown in orderDetail
+let logSeq = 0;
+
+// ---------- persistence ----------
+// localStorage throws in some contexts this file can end up opened from
+// (a sandboxed preview, a data: URL, private browsing with storage
+// blocked) -- degrade to "just don't persist" rather than letting that
+// exception take down the rest of this script's initialization.
+function loadConn() {
+  let savedUrl = null, savedToken = null;
+  try { savedUrl = localStorage.getItem('c1_base_url'); savedToken = localStorage.getItem('c1_token'); } catch {}
+  document.getElementById('baseUrl').value = savedUrl || 'http://localhost:8080';
+  document.getElementById('token').value = savedToken || '';
+}
+function saveConn() {
+  try {
+    localStorage.setItem('c1_base_url', document.getElementById('baseUrl').value.trim());
+    localStorage.setItem('c1_token', document.getElementById('token').value.trim());
+  } catch {}
+}
+
+// ---------- small helpers ----------
+function negate(decimalStr) {
+  const s = (decimalStr || '0').trim();
+  const isZero = /^-?0(\.0+)?$/.test(s);
+  if (isZero) return s.replace(/^-/, '');
+  return s.startsWith('-') ? s.slice(1) : '-' + s;
+}
+function negateLines(lines) {
+  return lines.map(l => ({ ...l, amount: negate(l.amount) }));
+}
+function nowIso() { return new Date().toISOString(); }
+function randTag() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- API layer ----------
+async function api(method, path, body, idemKey) {
+  const base = document.getElementById('baseUrl').value.trim().replace(/\/+$/, '');
+  const token = document.getElementById('token').value.trim();
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  if (idemKey) headers['Idempotency-Key'] = idemKey;
+
+  const t0 = performance.now();
+  let status = 0, data = null, networkError = null;
+  try {
+    const resp = await fetch(base + path, {
+      method, headers, body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    status = resp.status;
+    const text = await resp.text();
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  } catch (e) {
+    networkError = e.message || String(e);
+  }
+  const ms = Math.round(performance.now() - t0);
+  logRequest({ method, path, idemKey, body, status, data, networkError, ms });
+  return { ok: status >= 200 && status < 300 && !networkError, status, data, networkError };
+}
+
+// ---------- activity log ----------
+function logRequest(entry) {
+  logSeq++;
+  const container = document.getElementById('activityLog');
+  if (logSeq === 1) container.innerHTML = '';
+  const el = document.createElement('details');
+  el.className = 'log-entry';
+  const ok = entry.status >= 200 && entry.status < 300 && !entry.networkError;
+  const statusLabel = entry.networkError ? 'network error' : entry.status;
+  el.innerHTML = `
+    <summary>
+      <span class="badge ${ok ? 'ok' : 'err'}">${statusLabel}</span>
+      <span class="path">${entry.method} ${escapeHtml(entry.path)}</span>
+      <span class="time">${entry.ms}ms</span>
+    </summary>
+    <div class="log-body">
+      <div>
+        <div class="hint">Request${entry.idemKey ? ' -- Idempotency-Key: ' + escapeHtml(entry.idemKey) : ''}</div>
+        <pre class="json">${escapeHtml(entry.body ? JSON.stringify(entry.body, null, 2) : '(no body)')}</pre>
+      </div>
+      <div>
+        <div class="hint">Response</div>
+        <pre class="json">${escapeHtml(entry.networkError ? entry.networkError : JSON.stringify(entry.data, null, 2))}</pre>
+      </div>
+    </div>`;
+  container.prepend(el);
+  while (container.children.length > 50) container.removeChild(container.lastChild);
+}
+
+// ---------- connection check ----------
+async function checkConnection() {
+  saveConn();
+  const pill = document.getElementById('statusPill');
+  pill.textContent = 'checking...'; pill.className = 'status-pill unknown';
+  const r = await api('GET', '/healthz');
+  if (r.ok) {
+    pill.textContent = 'up (' + (r.data.version || '?') + ')'; pill.className = 'status-pill up';
+    refreshSystem();
+  } else {
+    pill.textContent = 'unreachable'; pill.className = 'status-pill down';
+  }
+}
+
+// ---------- system panel ----------
+async function refreshSystem() {
+  const halt = await api('GET', '/v1/system/halt');
+  const badge = document.getElementById('haltBadge');
+  if (halt.ok) {
+    badge.textContent = halt.data.halted ? 'HALTED: ' + halt.data.reason : 'not halted';
+    badge.className = 'badge ' + (halt.data.halted ? 'err' : 'ok');
+  } else {
+    badge.textContent = '?'; badge.className = 'badge muted';
+  }
+
+  const inv = await api('GET', '/v1/system/invariants');
+  const kv = document.getElementById('invariantsKv');
+  if (!inv.ok) { kv.innerHTML = '<div class="hint">could not load invariants</div>'; return; }
+  const d = inv.data;
+  let rows = [
+    ['trial_balance_ok', d.trial_balance_ok],
+    ['cache_ok', d.cache_ok],
+    ['recon_lag_seconds', d.recon_lag_seconds],
+  ];
+  kv.innerHTML = rows.map(([k, v]) => `<div class="k">${k}</div><div class="v">${escapeHtml(JSON.stringify(v))}</div>`).join('');
+  if (d.trial_balance && Object.keys(d.trial_balance).length) {
+    kv.innerHTML += `<div class="k">trial_balance</div><div class="v">${escapeHtml(JSON.stringify(d.trial_balance))}</div>`;
+  }
+  if (d.corridor_position && d.corridor_position.length) {
+    kv.innerHTML += `<div class="k">corridor_position</div><div class="v">${escapeHtml(JSON.stringify(d.corridor_position))}</div>`;
+  }
+}
+
+async function haltSet() {
+  const reason = document.getElementById('haltReason').value.trim() || 'manual (console)';
+  await api('POST', '/v1/system/halt', { action: 'set', reason }, 'console:halt-set:' + randTag());
+  refreshSystem();
+}
+async function haltClear() {
+  const note = document.getElementById('haltNote').value.trim();
+  if (!note) { alert('Clearing a halt requires a note.'); return; }
+  await api('POST', '/v1/system/halt', { action: 'clear', note }, 'console:halt-clear:' + randTag());
+  refreshSystem();
+}
+
+// ---------- balance lookup ----------
+async function checkBalance() {
+  const code = document.getElementById('balanceAccount').value.trim();
+  const result = document.getElementById('balanceResult');
+  if (!code) { result.textContent = 'enter an account code'; return; }
+  const r = await api('GET', '/v1/accounts/' + encodeURIComponent(code) + '/balance');
+  result.innerHTML = r.ok
+    ? `<span class="badge ok">${escapeHtml(r.data.balance)}</span> ${escapeHtml(r.data.asset)}`
+    : `<span class="badge err">${escapeHtml(r.data && r.data.error ? r.data.error.code : r.status)}</span>`;
+}
+
+// ---------- order lifecycle ----------
+function entryLinesFor(action, o) {
+  const dep = () => ([
+    { account_code: DEPOSIT_ACCOUNT, asset: 'USDT_BEP20', amount: o.amount_in },
+    { account_code: CUSTOMER_BEP, asset: 'USDT_BEP20', amount: negate(o.amount_in) },
+  ]);
+  const conv = () => ([
+    { account_code: CUSTOMER_BEP, asset: 'USDT_BEP20', amount: o.amount_in },
+    { account_code: 'position:corridor:USDT_BEP20', asset: 'USDT_BEP20', amount: negate(o.amount_in) },
+    { account_code: 'position:corridor:USDT_TRC20', asset: 'USDT_TRC20', amount: o.amount_in },
+    { account_code: CUSTOMER_TRC, asset: 'USDT_TRC20', amount: negate(o.amount_out) },
+    { account_code: 'revenue:fee', asset: 'USDT_TRC20', amount: negate(o.fee_units) },
+    { account_code: 'revenue:network_fee', asset: 'USDT_TRC20', amount: negate(o.network_fee_units) },
+  ]);
+  switch (action) {
+    case 'fund': return dep();
+    case 'refund': return negateLines(dep());
+    case 'dispatch': return conv();
+    case 'fail_dispatch': return negateLines(conv());
+    case 'settle': return [
+      { account_code: CUSTOMER_TRC, asset: 'USDT_TRC20', amount: o.amount_out },
+      { account_code: SLOT_ACCOUNT, asset: 'USDT_TRC20', amount: negate(o.amount_out) },
+    ];
+    default: return null;
+  }
+}
+
+// action definitions per current state: {label, to, reason, entryType, entryAction, primary}
+const ACTIONS_BY_STATE = {
+  quoted: [
+    { label: 'Fund deposit → funded', to: 'funded', reason: 'deposit reached 15 confirmations', entryType: 'deposit_final', entryAction: 'fund', primary: true },
+    { label: 'Let quote expire → expired', to: 'expired', reason: 'quote_expires_at passed, nothing received' },
+  ],
+  funded: [
+    { label: 'Screening pass → screened', to: 'screened', reason: 'screening verdict pass', primary: true },
+    { label: 'Screening hold → held', to: 'held', reason: 'screening verdict hold' },
+    { label: 'Refund customer → refunded', to: 'refunded', reason: 'customer cancel pre-conversion', entryType: 'reversal_manual', entryAction: 'refund' },
+  ],
+  held: [
+    { label: 'Release hold → screened', to: 'screened', reason: 'manual release', primary: true },
+    { label: 'Reject / refund → refunded', to: 'refunded', reason: 'manual reject', entryType: 'reversal_manual', entryAction: 'refund' },
+  ],
+  screened: [
+    { label: 'Dispatch: post conversion → dispatching', to: 'dispatching', reason: 'posting the conversion entry', entryType: 'conversion', entryAction: 'dispatch', primary: true },
+  ],
+  dispatching: [
+    { label: 'Settle: payout confirmed → settled', to: 'settled', reason: 'payout SR-final', entryType: 'payout_settled', entryAction: 'settle', primary: true },
+    { label: 'Non-retryable failure → held', to: 'held', reason: 'non-retryable dispatch failure', entryType: 'reversal_manual', entryAction: 'fail_dispatch' },
+  ],
+  settled: [], refunded: [], expired: [],
+};
+
+async function createOrder() {
+  const key = 'console-' + randTag();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour -- plenty of time to click through
+  const body = {
+    external_id: key,
+    customer_id: 'console-demo',
+    tier: document.getElementById('newTier').value,
+    amount_in: document.getElementById('newAmountIn').value.trim(),
+    amount_out: document.getElementById('newAmountOut').value.trim(),
+    fee_units: document.getElementById('newFee').value.trim(),
+    network_fee_units: document.getElementById('newNetworkFee').value.trim(),
+    recipient_address: 'T-console-' + key,
+    quoted_at: now.toISOString(),
+    quote_expires_at: expires.toISOString(),
+  };
+  const r = await api('POST', '/v1/orders', body, 'console:' + key + ':create');
+  if (!r.ok) { alert('Create failed: ' + (r.data && r.data.error ? r.data.error.message : r.status)); return; }
+  orders.unshift(r.data);
+  selected = r.data.external_id;
+  renderOrderList();
+  renderOrderDetail();
+}
+
+async function runAction(action) {
+  const o = orders.find(x => x.external_id === selected);
+  if (!o) return;
+  const entryLines = action.entryAction ? entryLinesFor(action.entryAction, o) : null;
+  const body = {
+    to_state: action.to,
+    expected_version: o.version,
+    reason: action.reason,
+    occurred_at: nowIso(),
+  };
+  if (entryLines) {
+    body.entry = { entry_type: action.entryType, occurred_at: nowIso(), lines: entryLines };
+  }
+  const idemKey = 'console:' + o.external_id + ':' + action.to;
+  const r = await api('POST', '/v1/orders/' + encodeURIComponent(o.external_id) + '/transitions', body, idemKey);
+  if (!r.ok) { alert('Transition failed: ' + (r.data && r.data.error ? r.data.error.code + ' -- ' + r.data.error.message : r.status)); return; }
+  const idx = orders.findIndex(x => x.external_id === o.external_id);
+  orders[idx] = r.data;
+  renderOrderList();
+  renderOrderDetail();
+  refreshSystem();
+}
+
+async function refreshOrder(externalId) {
+  const r = await api('GET', '/v1/orders/' + encodeURIComponent(externalId));
+  if (!r.ok) return;
+  const idx = orders.findIndex(x => x.external_id === externalId);
+  if (idx >= 0) orders[idx] = r.data;
+  renderOrderList();
+  renderOrderDetail();
+}
+
+function renderOrderList() {
+  const el = document.getElementById('orderList');
+  if (!orders.length) { el.innerHTML = '<span class="hint">none yet</span>'; return; }
+  el.innerHTML = '';
+  for (const o of orders) {
+    const btn = document.createElement('button');
+    btn.className = o.external_id === selected ? 'selected' : '';
+    btn.textContent = `${o.external_id}  ·  ${o.state}`;
+    btn.onclick = () => { selected = o.external_id; renderOrderList(); renderOrderDetail(); };
+    el.appendChild(btn);
+  }
+}
+
+function renderOrderDetail() {
+  const el = document.getElementById('orderDetail');
+  const o = orders.find(x => x.external_id === selected);
+  if (!o) { el.innerHTML = ''; return; }
+
+  const onHappyPath = STATES.includes(o.state);
+  const pipeline = STATES.map(s => {
+    const cls = s === o.state ? 'step active' : 'step';
+    return `<span class="${cls}">${s}</span>`;
+  }).join('<span class="arrow">→</span>');
+  const sideNote = onHappyPath ? '' : `<div class="hint">side state: <b>${escapeHtml(o.state)}</b> (terminal)</div>`;
+
+  const actions = ACTIONS_BY_STATE[o.state] || [];
+  const actionButtons = actions.map(a => {
+    const cls = a.primary ? 'primary' : '';
+    return `<button class="${cls}" data-to="${escapeHtml(a.to)}">${escapeHtml(a.label)}</button>`;
+  }).join(' ');
+
+  el.innerHTML = `
+    <div class="pipeline">${pipeline}</div>
+    ${sideNote}
+    <div class="kv">
+      <div class="k">external_id</div><div class="v">${escapeHtml(o.external_id)}</div>
+      <div class="k">version</div><div class="v">${o.version}</div>
+      <div class="k">amount_in</div><div class="v">${escapeHtml(o.amount_in)} USDT_BEP20</div>
+      <div class="k">amount_out</div><div class="v">${escapeHtml(o.amount_out)} USDT_TRC20</div>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      ${actionButtons || '<span class="hint">terminal state -- nothing left to do</span>'}
+      <button id="btnRefreshOrder">Refresh</button>
+    </div>
+    <pre class="json" style="margin-top:10px;">${escapeHtml(JSON.stringify(o, null, 2))}</pre>
+  `;
+
+  el.querySelectorAll('button[data-to]').forEach(btn => {
+    const action = actions.find(a => a.to === btn.getAttribute('data-to'));
+    btn.onclick = () => runAction(action);
+  });
+  const refreshBtn = document.getElementById('btnRefreshOrder');
+  if (refreshBtn) refreshBtn.onclick = () => refreshOrder(o.external_id);
+}
+
+// ---------- raw entry poster ----------
+async function postRawEntry() {
+  const result = document.getElementById('rawEntryResult');
+  let lines;
+  try { lines = JSON.parse(document.getElementById('rawLines').value); }
+  catch (e) { result.innerHTML = `<span class="badge err">invalid JSON: ${escapeHtml(e.message)}</span>`; return; }
+
+  const body = {
+    entry_type: document.getElementById('rawEntryType').value.trim() || 'manual_test',
+    occurred_at: nowIso(),
+    lines,
+  };
+  const orderIdRaw = document.getElementById('rawOrderId').value.trim();
+  if (orderIdRaw) body.order_id = Number(orderIdRaw);
+
+  const r = await api('POST', '/v1/entries', body, 'console:raw-entry:' + randTag());
+  result.innerHTML = r.ok
+    ? `<span class="badge ok">${escapeHtml(r.data.outcome)}</span> entry id ${r.data.id}`
+    : `<span class="badge err">${escapeHtml(r.data && r.data.error ? r.data.error.code : r.status)}</span> ${escapeHtml(r.data && r.data.error ? r.data.error.message : '')}`;
+  refreshSystem();
+}
+
+// ---------- wiring ----------
+document.getElementById('btnCheck').onclick = checkConnection;
+document.getElementById('btnRefreshSystem').onclick = refreshSystem;
+document.getElementById('btnHaltSet').onclick = haltSet;
+document.getElementById('btnHaltClear').onclick = haltClear;
+document.getElementById('btnCheckBalance').onclick = checkBalance;
+document.getElementById('balanceAccountPreset').onchange = (e) => {
+  if (e.target.value) document.getElementById('balanceAccount').value = e.target.value;
+};
+document.getElementById('btnCreateOrder').onclick = createOrder;
+document.getElementById('btnPostEntry').onclick = postRawEntry;
+document.getElementById('btnClearLog').onclick = () => {
+  logSeq = 0;
+  document.getElementById('activityLog').innerHTML = '<span class="hint">cleared.</span>';
+};
+
+loadConn();
+document.getElementById('actorDisplay').value = '(set by the server from your token)';
+checkConnection();
+</script>
+
+</body>
+</html>

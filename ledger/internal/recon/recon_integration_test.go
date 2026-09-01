@@ -145,7 +145,7 @@ func haltDetail(t *testing.T, ctx context.Context, pool *pgxpool.Pool) map[strin
 }
 
 func TestIngestSnapshotHaltsOnUSDTDriftAndNamesAccount(t *testing.T) {
-	pool := testPool(t)
+	pool := freshIsolatedPool(t)
 	ctx := context.Background()
 	acc1, acc2 := twoAccounts(t, ctx, pool, money.USDT_TRC20)
 	entry := postEntry(t, ctx, pool, acc1, acc2, money.USDT_TRC20, 5_000000)
@@ -179,7 +179,7 @@ func TestIngestSnapshotHaltsOnUSDTDriftAndNamesAccount(t *testing.T) {
 }
 
 func TestIngestSnapshotRecordsSnapshotEvenWhenNoDrift(t *testing.T) {
-	pool := testPool(t)
+	pool := freshIsolatedPool(t)
 	ctx := context.Background()
 	acc1, acc2 := twoAccounts(t, ctx, pool, money.USDT_TRC20)
 	entry := postEntry(t, ctx, pool, acc1, acc2, money.USDT_TRC20, 5_000000)
@@ -212,7 +212,7 @@ func TestIngestSnapshotRecordsSnapshotEvenWhenNoDrift(t *testing.T) {
 }
 
 func TestIngestSnapshotTRXWithinToleranceDoesNotHalt(t *testing.T) {
-	pool := testPool(t)
+	pool := freshIsolatedPool(t)
 	ctx := context.Background()
 	acc1, acc2 := twoAccounts(t, ctx, pool, money.TRX)
 	entry := postEntry(t, ctx, pool, acc1, acc2, money.TRX, 10_000000)
@@ -239,7 +239,7 @@ func TestIngestSnapshotTRXWithinToleranceDoesNotHalt(t *testing.T) {
 }
 
 func TestIngestSnapshotTRXExceedingToleranceHalts(t *testing.T) {
-	pool := testPool(t)
+	pool := freshIsolatedPool(t)
 	ctx := context.Background()
 	acc1, acc2 := twoAccounts(t, ctx, pool, money.TRX)
 	entry := postEntry(t, ctx, pool, acc1, acc2, money.TRX, 10_000000)
@@ -292,6 +292,15 @@ func waitForHalt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, timeout 
 // almost immediately, before whatever the test actually wants to trigger
 // ever gets a chance to run -- isolation here isn't about the risky
 // trigger-disabling case alone, it's required by VerifyBalances' scope.
+//
+// The IngestSnapshot tests below need it for a related but distinct
+// reason: system_state (what halt.IsHalted reads) is a single singleton
+// row too, and go test parallelizes across packages by default, so
+// another package's test halting or clearing mid-run can flip what this
+// test observes regardless of anything this test itself does. Confirmed
+// by TestIngestSnapshotRecordsSnapshotEvenWhenNoDrift actually failing
+// this way once it ran as part of the full `go test ./...` suite rather
+// than in isolation.
 func freshIsolatedPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	baseURL := testDatabaseURL(t)

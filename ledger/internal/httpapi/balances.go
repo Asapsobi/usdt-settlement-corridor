@@ -4,8 +4,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/go-chi/chi/v5"
-
 	"ledger/internal/accounts"
 	"ledger/internal/journal"
 	"ledger/internal/money"
@@ -28,7 +26,10 @@ func toBalanceResponse(code string, amt money.Amount) (balanceResponse, error) {
 // getAccountBalance is GET /v1/accounts/{code}/balance, optionally
 // ?as_of_entry_id=N for BalanceAsOf instead of the current cached value.
 func (s *Server) getAccountBalance(w http.ResponseWriter, r *http.Request) {
-	code := chi.URLParam(r, "code")
+	code, ok := urlParam(w, r, "code")
+	if !ok {
+		return
+	}
 
 	var amt money.Amount
 	var err error

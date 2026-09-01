@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 
 	"ledger/internal/db"
@@ -110,7 +109,10 @@ func (s *Server) postOrder(w http.ResponseWriter, r *http.Request) {
 
 // getOrder is GET /v1/orders/{external_id}.
 func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
-	externalID := chi.URLParam(r, "external_id")
+	externalID, ok := urlParam(w, r, "external_id")
+	if !ok {
+		return
+	}
 	order, err := orders.GetByExternalID(r.Context(), s.Pool, externalID)
 	if err != nil {
 		writeErr(w, err)
@@ -141,7 +143,10 @@ type postTransitionRequest struct {
 // replays the identical journal entry too, the same idempotent-retry
 // guarantee POST /entries gives standalone callers.
 func (s *Server) postTransition(w http.ResponseWriter, r *http.Request) {
-	externalID := chi.URLParam(r, "external_id")
+	externalID, ok := urlParam(w, r, "external_id")
+	if !ok {
+		return
+	}
 
 	var req postTransitionRequest
 	if !decodeJSON(w, r, &req) {

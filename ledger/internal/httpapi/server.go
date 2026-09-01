@@ -41,6 +41,7 @@ func NewRouter(s *Server) http.Handler {
 	}
 
 	router := chi.NewRouter()
+	router.Use(corsMiddleware)
 
 	router.Get("/healthz", s.healthzHandler)
 	router.Get("/readyz", s.readyzHandler)
