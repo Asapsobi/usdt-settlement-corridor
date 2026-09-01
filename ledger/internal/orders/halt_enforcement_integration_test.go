@@ -24,7 +24,7 @@ import (
 )
 
 func TestHaltBlocksOnlyHaltBlockedTransitions(t *testing.T) {
-	pool := testPool(t)
+	pool := freshIsolatedPool(t)
 	ctx := context.Background()
 
 	// screened -> dispatching is HaltBlocked=true.

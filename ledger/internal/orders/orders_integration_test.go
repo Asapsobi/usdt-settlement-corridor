@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -134,6 +135,53 @@ func testPoolWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
 	return pool
 }
 
+// freshIsolatedPool creates a throwaway database on the same cluster as
+// LEDGER_TEST_DATABASE_URL and returns a pool for it, with cleanup
+// registered. Needed by any test that manipulates system_state's halted
+// flag more than transiently: go test parallelizes across packages by
+// default, so a halt this test sets (or clears) against the shared
+// ledger_test database can be observed -- or clobbered -- by another
+// package's concurrently running test. prepareTestPool's own reset-at-
+// start only protects against a halt left over from an EARLIER test; it
+// can't protect against one set by a test running RIGHT NOW in a
+// different process.
+func freshIsolatedPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	baseURL := testDatabaseURL(t)
+	u, err := url.Parse(baseURL)
+	require.NoError(t, err)
+	adminURL := *u
+	adminURL.Path = "/postgres"
+	ctx := context.Background()
+
+	adminPool, err := pgxpool.New(ctx, adminURL.String())
+	require.NoError(t, err)
+	dbName := fmt.Sprintf("orders_isolated_%d", time.Now().UnixNano())
+	_, err = adminPool.Exec(ctx, "CREATE DATABASE "+dbName)
+	require.NoError(t, err)
+	adminPool.Close()
+
+	t.Cleanup(func() {
+		cleanupPool, err := pgxpool.New(context.Background(), adminURL.String())
+		if err != nil {
+			return
+		}
+		defer cleanupPool.Close()
+		_, _ = cleanupPool.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
+	})
+
+	freshURL := *u
+	freshURL.Path = "/" + dbName
+	applyMigrations(t, freshURL.String())
+
+	pool, err := pgxpool.New(ctx, freshURL.String())
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	prepareTestPool(t, ctx, pool)
+	return pool
+}
+
 func withTx(t *testing.T, pool *pgxpool.Pool, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	t.Helper()
 	ctx := context.Background()
@@ -217,34 +265,36 @@ func transitionRowCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, o
 }
 
 // expectedRule and expectedTransitions are the independent, hand-copied
-// version of the build spec's transition table (11 pairs). allStates and
-// pathToState derive the walk needed to place a fresh order at any given
-// state, purely from this same independent table.
+// version of the build spec's transition table (11 pairs, including
+// which are halt-blocked). allStates and pathToState derive the walk
+// needed to place a fresh order at any given state, purely from this
+// same independent table.
 type expectedRule struct {
 	RequiresEntry bool
+	HaltBlocked   bool
 }
 
 var expectedTransitions = map[orders.State]map[orders.State]expectedRule{
 	orders.Quoted: {
-		orders.Funded:  {RequiresEntry: true},
-		orders.Expired: {RequiresEntry: false},
+		orders.Funded:  {RequiresEntry: true, HaltBlocked: false},
+		orders.Expired: {RequiresEntry: false, HaltBlocked: false},
 	},
 	orders.Funded: {
-		orders.Screened: {RequiresEntry: false},
-		orders.Held:     {RequiresEntry: false},
-		orders.Refunded: {RequiresEntry: true},
-		orders.Quoted:   {RequiresEntry: true},
+		orders.Screened: {RequiresEntry: false, HaltBlocked: false},
+		orders.Held:     {RequiresEntry: false, HaltBlocked: false},
+		orders.Refunded: {RequiresEntry: true, HaltBlocked: true},
+		orders.Quoted:   {RequiresEntry: true, HaltBlocked: false},
 	},
 	orders.Held: {
-		orders.Screened: {RequiresEntry: false},
-		orders.Refunded: {RequiresEntry: true},
+		orders.Screened: {RequiresEntry: false, HaltBlocked: false},
+		orders.Refunded: {RequiresEntry: true, HaltBlocked: true},
 	},
 	orders.Screened: {
-		orders.Dispatching: {RequiresEntry: true},
+		orders.Dispatching: {RequiresEntry: true, HaltBlocked: true},
 	},
 	orders.Dispatching: {
-		orders.Settled: {RequiresEntry: true},
-		orders.Held:    {RequiresEntry: true},
+		orders.Settled: {RequiresEntry: true, HaltBlocked: true},
+		orders.Held:    {RequiresEntry: true, HaltBlocked: false},
 	},
 }
 
@@ -371,6 +421,83 @@ func TestFullStateCrossProduct(t *testing.T) {
 			require.NoErrorf(t, err, "%s -> %s should be legal", from, to)
 			require.Equal(t, to, updated.State)
 			require.Equal(t, order.Version+1, updated.Version)
+		}
+	}
+}
+
+// TestHaltBlocksExactlyTheDocumentedPairs closes a gap
+// TestHaltBlocksOnlyHaltBlockedTransitions (halt_enforcement_integration_test.go)
+// leaves open: that test proves the halt-check mechanism works for
+// exactly one halt-blocked pair (screened -> dispatching) and one
+// non-blocked pair (quoted -> funded). Nothing previously verified the
+// other three documented halt-blocked pairs -- funded -> refunded,
+// held -> refunded, dispatching -> settled -- are actually rejected
+// while halted, nor that the remaining non-blocked pairs actually keep
+// working. This drives all 11, against expectedTransitions' independent
+// HaltBlocked bit (hand-copied from the build spec's table, not read
+// back from transitionTable), so a wrong HaltBlocked flag in production
+// code -- letting money leave while halted, or blocking something that
+// must keep working while halted -- would fail here even if it agreed
+// with itself everywhere else.
+func TestHaltBlocksExactlyTheDocumentedPairs(t *testing.T) {
+	pool := freshIsolatedPool(t)
+	ctx := context.Background()
+
+	// Every order is advanced to its `from` state, and every required
+	// entry's accounts prepared, BEFORE the halt is ever set: reaching
+	// Dispatching, for example, must itself cross screened ->
+	// dispatching, which is halt-blocked, and doing that walk while
+	// already halted would fail for a reason unrelated to what this
+	// test checks. All 11 attempts then run against ONE halted window,
+	// since halting only blocks the 4 documented pairs -- the other 7
+	// are expected to keep working while halted, not just once it clears.
+	type prepared struct {
+		from, to orders.State
+		rule     expectedRule
+		order    orders.Order
+		entry    *journal.EntryRequest
+	}
+	var cases []prepared
+	for from, targets := range expectedTransitions {
+		for to, rule := range targets {
+			order := advanceToState(t, ctx, pool, from)
+
+			var entry *journal.EntryRequest
+			if rule.RequiresEntry {
+				acc1, acc2 := twoTRXAccounts(t, ctx, pool)
+				e := simpleEntry(t, acc1, acc2)
+				entry = &e
+			}
+			cases = append(cases, prepared{from: from, to: to, rule: rule, order: order, entry: entry})
+		}
+	}
+
+	require.NoError(t, halt.Set(ctx, pool, halt.SetParams{Reason: "TEST_HALT", Actor: "test"}))
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `UPDATE system_state SET halted = false WHERE id = 1`)
+	})
+	// The in-memory halt cache (C1.7) is deliberately at most 1 second
+	// stale -- a fast rejection is only correct if a caller can tolerate
+	// exactly this. Every order above was advanced (and, for Dispatching,
+	// had the cache read at least once) before Set ran, so without this
+	// wait the very first halt-blocked check below could still observe
+	// a cached "not halted" read from moments earlier and wrongly succeed.
+	time.Sleep(1100 * time.Millisecond)
+
+	for _, c := range cases {
+		err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+			_, err := orders.Transition(ctx, tx, c.order.ID, c.to, c.order.Version, orders.TransitionParams{
+				Actor: "test", Reason: "halt-blocking exhaustive check", OccurredAt: time.Now(), Entry: c.entry,
+			})
+			return err
+		})
+
+		if c.rule.HaltBlocked {
+			require.ErrorIsf(t, err, orders.ErrSystemHalted,
+				"%s -> %s is documented halt-blocked but was not rejected while halted", c.from, c.to)
+		} else {
+			require.NoErrorf(t, err,
+				"%s -> %s is documented NOT halt-blocked but was rejected while halted: %v", c.from, c.to, err)
 		}
 	}
 }
