@@ -34,6 +34,34 @@ lint:
 		go vet ./...; \
 	fi
 
-# The C1 ship gate (added in C1.9); not yet implemented in C1.0.
+# The C1 ship gate. Provisions its own throwaway database (ledger_gate,
+# derived from LEDGER_TEST_DATABASE_URL's connection details) rather than
+# running against ledger_dev or ledger_test, because several FINAL
+# ASSERTIONS (exact journal_entries count, whole-database
+# VerifyBalances/TrialBalance) are only meaningful against a database this
+# run had entirely to itself -- see internal/replay's package doc. The
+# throwaway database is dropped whether the gate passes or fails, but left
+# in place if provisioning itself fails, so it's inspectable.
+#
+# Override scale for a quick smoke run, e.g.:
+#   make gate GATE_ARGS="-orders=200 -workers=4"
+GATE_ARGS ?=
 gate:
-	go run ./cmd/replay
+	@set -e; \
+	if [ -z "$$LEDGER_TEST_DATABASE_URL" ]; then \
+		echo "LEDGER_TEST_DATABASE_URL is not set (used to derive the throwaway gate database's connection details)" >&2; \
+		exit 1; \
+	fi; \
+	MAINT_URL=$$(echo "$$LEDGER_TEST_DATABASE_URL" | sed 's#/ledger_test#/postgres#'); \
+	GATE_URL=$$(echo "$$LEDGER_TEST_DATABASE_URL" | sed 's#/ledger_test#/ledger_gate#'); \
+	echo "==> provisioning throwaway database ledger_gate"; \
+	psql "$$MAINT_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ledger_gate WITH (FORCE)"; \
+	psql "$$MAINT_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE ledger_gate"; \
+	echo "==> running migrations"; \
+	LEDGER_DATABASE_URL="$$GATE_URL" go run ./cmd/migrate up; \
+	echo "==> running replay harness"; \
+	STATUS=0; \
+	LEDGER_DATABASE_URL="$$GATE_URL" go run ./cmd/replay $(GATE_ARGS) || STATUS=$$?; \
+	echo "==> dropping throwaway database ledger_gate"; \
+	psql "$$MAINT_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ledger_gate WITH (FORCE)"; \
+	exit $$STATUS

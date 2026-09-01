@@ -91,7 +91,11 @@ func TestHaltCacheNotConfiguredFailsClosed(t *testing.T) {
 	order := advanceToState(t, ctx, pool, orders.Screened)
 
 	orders.SetHaltCache(nil)
-	t.Cleanup(func() { orders.SetHaltCache(halt.NewCache(pool)) })
+	t.Cleanup(func() {
+		cache, err := halt.NewCache(ctx, pool)
+		require.NoError(t, err)
+		orders.SetHaltCache(cache)
+	})
 
 	acc1, acc2 := twoTRXAccounts(t, ctx, pool)
 	entry := simpleEntry(t, acc1, acc2)

@@ -189,7 +189,8 @@ func freshIsolatedPool(t *testing.T) *pgxpool.Pool {
 func TestCacheHoldsForUpToOneSecond(t *testing.T) {
 	pool := freshIsolatedPool(t)
 	ctx := context.Background()
-	cache := halt.NewCache(pool)
+	cache, err := halt.NewCache(ctx, pool)
+	require.NoError(t, err)
 
 	halted, err := cache.IsHalted(ctx)
 	require.NoError(t, err)

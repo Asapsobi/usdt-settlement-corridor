@@ -141,13 +141,38 @@ type Cache struct {
 
 const maxCacheAge = time.Second
 
-// NewCache creates a Cache backed by pool. Every process that calls
-// orders.Transition needs exactly one of these; internal/orders holds it
-// via SetCache below rather than taking it as a parameter on every
-// Transition call, since that signature is already fixed by C1.5 and
-// every existing caller.
-func NewCache(pool *pgxpool.Pool) *Cache {
-	return &Cache{pool: pool}
+// NewCache creates a Cache backed by its own small, dedicated connection
+// pool derived from txPool's connection settings, rather than sharing
+// txPool itself.
+//
+// Sharing txPool is a deadlock waiting to happen: internal/orders.Transition
+// calls Cache.IsHalted from inside a transaction it already holds open on
+// txPool, for every HaltBlocked pair. If IsHalted's refresh queried txPool
+// directly, that refresh would need to acquire a second txPool connection
+// without releasing the first. Under enough concurrent HaltBlocked
+// transitions -- exactly what internal/replay's harness does at scale --
+// every one of txPool's connections can end up held open by a caller
+// blocked waiting for one more connection to do its refresh, which
+// deadlocks the entire pool permanently the moment concurrency reaches
+// txPool's MaxConns; this was caught by that harness hanging outright at
+// 24 workers on a 10-core machine (MaxConns defaults to
+// runtime.NumCPU()). A tiny dedicated pool sidesteps the problem instead
+// of just raising the threshold at which it recurs -- the cache only
+// ever needs one refresh in flight at a time, so it has nothing to
+// contend with.
+//
+// Every process that calls orders.Transition needs exactly one of these;
+// internal/orders holds it via SetCache below rather than taking it as a
+// parameter on every Transition call, since that signature is already
+// fixed by C1.5 and every existing caller.
+func NewCache(ctx context.Context, txPool *pgxpool.Pool) (*Cache, error) {
+	cfg := txPool.Config().Copy()
+	cfg.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("halt: creating cache's dedicated pool: %w", err)
+	}
+	return &Cache{pool: pool}, nil
 }
 
 // IsHalted returns the cached value if it is less than 1 second old,

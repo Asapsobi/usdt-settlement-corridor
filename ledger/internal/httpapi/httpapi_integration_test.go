@@ -90,7 +90,9 @@ func testServer(t *testing.T) (baseURL string, pool *pgxpool.Pool) {
 	`)
 	require.NoError(t, err)
 
-	orders.SetHaltCache(halt.NewCache(rawPool))
+	haltCache, err := halt.NewCache(ctx, rawPool)
+	require.NoError(t, err)
+	orders.SetHaltCache(haltCache)
 
 	reconCfg := recon.Config{Interval: time.Hour}
 	reconciler := recon.NewReconciler(rawPool, reconCfg)

@@ -91,8 +91,10 @@ func applyMigrations(t *testing.T, url string) {
 func prepareTestPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	require.NoError(t, accounts.Seed(ctx, pool))
-	orders.SetHaltCache(halt.NewCache(pool))
-	_, err := pool.Exec(ctx, `
+	cache, err := halt.NewCache(ctx, pool)
+	require.NoError(t, err)
+	orders.SetHaltCache(cache)
+	_, err = pool.Exec(ctx, `
 		UPDATE system_state
 		SET halted = false, halt_reason = NULL, halt_detail = NULL, halted_at = NULL, halted_by = NULL
 		WHERE id = 1

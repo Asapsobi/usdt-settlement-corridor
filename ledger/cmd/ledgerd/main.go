@@ -43,7 +43,11 @@ func run() error {
 	}
 	defer pool.Close()
 
-	orders.SetHaltCache(halt.NewCache(pool.Pool))
+	haltCache, err := halt.NewCache(ctx, pool.Pool)
+	if err != nil {
+		return err
+	}
+	orders.SetHaltCache(haltCache)
 
 	reconCfg, err := recon.ConfigFromEnv()
 	if err != nil {
