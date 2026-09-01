@@ -52,7 +52,20 @@ type negatedLine struct {
 // non-null reversal_of" is a cross-row check a CHECK constraint cannot
 // make; it would need its own trigger, which nothing in this chunk's
 // acceptance criteria calls for.
-func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reason string, occurredAt time.Time) (Entry, error) {
+func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reason string, occurredAt time.Time) (entry Entry, err error) {
+	var original Entry
+	var idempotencyKey string
+	var accounts []string
+	var amounts []auditAmount
+
+	defer func() {
+		if err != nil {
+			auditFailure(actor, idempotencyKey, "reversal", original.OrderID, accounts, amounts, err)
+			return
+		}
+		auditSuccess(ctx, entry)
+	}()
+
 	if actor == "" {
 		return Entry{}, fmt.Errorf("%w: empty actor", ErrInvalidReverseParams)
 	}
@@ -63,7 +76,7 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 		return Entry{}, fmt.Errorf("%w: zero occurred_at", ErrInvalidReverseParams)
 	}
 
-	original, err := getEntryByID(ctx, tx, originalEntryID)
+	original, err = getEntryByID(ctx, tx, originalEntryID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Entry{}, fmt.Errorf("%w: id %d", ErrEntryNotFound, originalEntryID)
 	}
@@ -99,8 +112,8 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 		negated[i] = negatedLine{seq: pl.Seq, accountID: pl.AccountID, accountCode: pl.AccountCode, amount: neg}
 	}
 
-	idempotencyKey := "ledger:reverse:" + original.IdempotencyKey
-	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+	idempotencyKey = "ledger:reverse:" + original.IdempotencyKey
+	if err = validateIdempotencyKey(idempotencyKey); err != nil {
 		return Entry{}, err
 	}
 
@@ -108,6 +121,8 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 	for i, n := range negated {
 		hashLines[i] = Line{AccountCode: n.accountCode, Amount: n.amount}
 	}
+	accounts, amounts = requestedLinesToAudit(hashLines)
+
 	hash, err := canonicalHash(EntryRequest{
 		IdempotencyKey: idempotencyKey,
 		EntryType:      "reversal",
@@ -133,7 +148,7 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 			occurred_at, recorded_at, reversal_of, metadata
 	`, idempotencyKey, hash, original.OrderID, actor, occurredAt, originalEntryID, metadata)
 
-	entry, err := scanEntry(row)
+	entry, err = scanEntry(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

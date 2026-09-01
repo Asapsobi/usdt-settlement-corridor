@@ -108,7 +108,7 @@ func IngestSnapshot(ctx context.Context, tx pgx.Tx, cfg Config, p SnapshotParams
 	result.Halted = true
 
 	return result, halt.Set(ctx, tx, halt.SetParams{
-		Reason: "BALANCE_DRIFT",
+		Reason: halt.ReasonBalanceDrift,
 		Detail: map[string]any{
 			"account_code":   p.AccountCode,
 			"asset":          string(acc.Asset),

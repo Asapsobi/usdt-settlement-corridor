@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -78,12 +79,14 @@ func (s *Server) postHalt(w http.ResponseWriter, r *http.Request) {
 // (S3) and diff against GET /v1/settlement-stats -- not built in this
 // chunk, but this endpoint's shape is chosen with that in mind.
 type invariantsResponse struct {
-	Halted         bool              `json:"halted"`
-	HaltReason     string            `json:"halt_reason,omitempty"`
-	TrialBalance   map[string]string `json:"trial_balance"`
-	TrialBalanceOK bool              `json:"trial_balance_ok"`
-	Discrepancies  []discrepancyDTO  `json:"discrepancies"`
-	CacheOK        bool              `json:"cache_ok"`
+	Halted           bool                  `json:"halted"`
+	HaltReason       string                `json:"halt_reason,omitempty"`
+	TrialBalance     map[string]string     `json:"trial_balance"`
+	TrialBalanceOK   bool                  `json:"trial_balance_ok"`
+	Discrepancies    []discrepancyDTO      `json:"discrepancies"`
+	CacheOK          bool                  `json:"cache_ok"`
+	CorridorPosition []corridorPositionDTO `json:"corridor_position"`
+	ReconLagSeconds  float64               `json:"recon_lag_seconds"`
 }
 
 type discrepancyDTO struct {
@@ -91,6 +94,20 @@ type discrepancyDTO struct {
 	Asset         string `json:"asset"`
 	CachedUnits   int64  `json:"cached_units"`
 	ComputedUnits int64  `json:"computed_units"`
+}
+
+// corridorPositionDTO reports position:corridor for one asset against its
+// configured ceiling (see internal/recon.Config.CorridorCeilings). An
+// asset with no ceiling configured has nothing meaningful to compare
+// against, so it's simply absent from CorridorPosition rather than shown
+// with a zero ceiling that would read as "at capacity."
+type corridorPositionDTO struct {
+	Asset         string `json:"asset"`
+	AccountCode   string `json:"account_code"`
+	Position      string `json:"position"`
+	PositionUnits int64  `json:"position_units"`
+	CeilingUnits  int64  `json:"ceiling_units"`
+	OverCeiling   bool   `json:"over_ceiling"`
 }
 
 // getInvariants is GET /v1/system/invariants: the live results of every
@@ -140,11 +157,61 @@ func (s *Server) getInvariants(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	corridor, err := s.corridorPositions(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	var reconLag float64
+	if s.Reconciler != nil {
+		reconLag = s.Reconciler.LagSeconds()
+	}
+
 	respondJSON(w, http.StatusOK, invariantsResponse{
 		Halted: halted, HaltReason: reason,
 		TrialBalance: trialFormatted, TrialBalanceOK: trialOK,
 		Discrepancies: dtos, CacheOK: len(dtos) == 0,
+		CorridorPosition: corridor, ReconLagSeconds: reconLag,
 	})
+}
+
+// corridorPositions reads position:corridor for every asset with a
+// configured ceiling (see ReconCfg.CorridorCeilings), sorted by asset for
+// a deterministic response. This mirrors internal/recon's own
+// checkCorridorCeiling exactly -- same accounts, same magnitude
+// comparison -- so this endpoint's "over ceiling" can never disagree with
+// what actually triggers the reconciler's alert log line.
+func (s *Server) corridorPositions(ctx context.Context) ([]corridorPositionDTO, error) {
+	assets := make([]money.Asset, 0, len(s.ReconCfg.CorridorCeilings))
+	for asset := range s.ReconCfg.CorridorCeilings {
+		assets = append(assets, asset)
+	}
+	sort.Slice(assets, func(i, j int) bool { return assets[i] < assets[j] })
+
+	out := make([]corridorPositionDTO, 0, len(assets))
+	for _, asset := range assets {
+		ceiling := s.ReconCfg.CorridorCeilings[asset]
+		code := "position:corridor:" + string(asset)
+		bal, err := journal.Balance(ctx, s.Pool, code)
+		if err != nil {
+			return nil, err
+		}
+		formatted, err := money.Format(bal)
+		if err != nil {
+			return nil, err
+		}
+		magnitude := bal.Units
+		if magnitude < 0 {
+			magnitude = -magnitude
+		}
+		out = append(out, corridorPositionDTO{
+			Asset: string(asset), AccountCode: code,
+			Position: formatted, PositionUnits: bal.Units,
+			CeilingUnits: ceiling, OverCeiling: magnitude > ceiling,
+		})
+	}
+	return out, nil
 }
 
 type healthzResponse struct {

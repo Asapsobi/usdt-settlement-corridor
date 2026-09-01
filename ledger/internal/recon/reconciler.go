@@ -43,6 +43,18 @@ func (r *Reconciler) LastTick() time.Time {
 	return time.Unix(0, nanos)
 }
 
+// LagSeconds returns seconds since the last self-check tick, or 0 if
+// RunOnce has never run. Shared by the recon_lag_seconds metric (C1.8)
+// and GET /v1/system/invariants (C1.10) so the two can never disagree
+// about what "lag" means.
+func (r *Reconciler) LagSeconds() float64 {
+	last := r.LastTick()
+	if last.IsZero() {
+		return 0
+	}
+	return time.Since(last).Seconds()
+}
+
 // Run ticks every cfg.Interval until ctx is cancelled. Intended to be
 // started with `go reconciler.Run(ctx)` alongside the HTTP server, using
 // the same context cmd/ledgerd cancels on shutdown.
@@ -109,7 +121,7 @@ func (r *Reconciler) checkTrialBalance(ctx context.Context) (halted bool) {
 	for asset, total := range trial {
 		if total != 0 {
 			if err := halt.Set(ctx, r.pool, halt.SetParams{
-				Reason: "TRIAL_BALANCE_BROKEN",
+				Reason: halt.ReasonTrialBalanceBroken,
 				Detail: map[string]any{"asset": string(asset), "total_units": total},
 				Actor:  "recon:self_check",
 			}); err != nil {
@@ -131,7 +143,7 @@ func (r *Reconciler) checkCacheDivergence(ctx context.Context) (halted bool) {
 		return false
 	}
 	if err := halt.Set(ctx, r.pool, halt.SetParams{
-		Reason: "CACHE_DIVERGENCE",
+		Reason: halt.ReasonCacheDivergence,
 		Detail: map[string]any{"discrepancies": discrepancies},
 		Actor:  "recon:self_check",
 	}); err != nil {

@@ -27,12 +27,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"ledger/internal/accounts"
 	"ledger/internal/db"
 	"ledger/internal/halt"
 	"ledger/internal/httpapi"
+	"ledger/internal/journal"
 	"ledger/internal/money"
 	"ledger/internal/orders"
 	"ledger/internal/recon"
@@ -72,7 +74,11 @@ func applyMigrations(t *testing.T, dbURL string) {
 // a loopback socket, not an in-process ResponseRecorder) against a real
 // Postgres database, with the halt cache and reconciler wired up exactly
 // as cmd/ledgerd wires them.
-func testServer(t *testing.T) (baseURL string, pool *pgxpool.Pool) {
+// testServer spins up a router with the default recon.Config -- an
+// Interval far longer than any test runs, so the background ticker never
+// actually fires and interferes. Pass opts to override fields (e.g.
+// CorridorCeilings) for tests that need specific reconciler behavior.
+func testServer(t *testing.T, opts ...func(*recon.Config)) (baseURL string, pool *pgxpool.Pool) {
 	t.Helper()
 	dbURL := testDatabaseURL(t)
 	applyMigrations(t, dbURL)
@@ -95,6 +101,9 @@ func testServer(t *testing.T) (baseURL string, pool *pgxpool.Pool) {
 	orders.SetHaltCache(haltCache)
 
 	reconCfg := recon.Config{Interval: time.Hour}
+	for _, opt := range opts {
+		opt(&reconCfg)
+	}
 	reconciler := recon.NewReconciler(rawPool, reconCfg)
 
 	server := &httpapi.Server{
@@ -588,9 +597,84 @@ func TestGetInvariantsAndTrialBalance(t *testing.T) {
 	var invariants map[string]any
 	decodeInto(t, resp, &invariants)
 	require.Contains(t, invariants, "trial_balance")
+	require.Contains(t, invariants, "corridor_position")
+	require.Contains(t, invariants, "recon_lag_seconds")
+	// testServer configures no CorridorCeilings and never ticks the
+	// reconciler, so both are present but empty/zero -- covered
+	// separately by TestInvariantsCorridorCeiling below.
+	assert.Empty(t, invariants["corridor_position"])
+	assert.Zero(t, invariants["recon_lag_seconds"])
 
 	resp2 := doRequest(t, http.MethodGet, baseURL+"/v1/trial-balance", "", nil)
 	require.Equal(t, http.StatusOK, resp2.StatusCode)
+}
+
+// TestInvariantsCorridorCeiling exercises the field C1.10 adds to
+// GET /v1/system/invariants: position:corridor reported against its
+// configured ceiling. Pushes the corridor position past a deliberately
+// low ceiling and confirms the endpoint reports it as over -- this is
+// meant to become the public status page's data source (S3, later), so
+// the shape and correctness of this specific field matters beyond just
+// "the endpoint returns 200."
+func TestInvariantsCorridorCeiling(t *testing.T) {
+	ceiling := int64(500_000000) // 500.000000 USDT_BEP20
+	baseURL, pool := testServer(t, func(c *recon.Config) {
+		c.CorridorCeilings = map[money.Asset]int64{money.USDT_BEP20: ceiling}
+	})
+
+	ctx := context.Background()
+	before, err := journal.Balance(ctx, pool, "position:corridor:USDT_BEP20")
+	require.NoError(t, err)
+
+	liability := "liability:customer:" + uniqueSuffix(t)
+	_, err = accounts.Create(ctx, pool, liability, accounts.Liability, money.USDT_BEP20)
+	require.NoError(t, err)
+
+	// ledger_test is a shared database across this whole suite, so
+	// position:corridor:USDT_BEP20 may already carry balance left by
+	// other tests. Push further in whatever direction it's already
+	// leaning, by an amount large enough that the final magnitude clears
+	// ceiling regardless of where it started.
+	delta := int64(50_000_000000) // 50,000.000000 USDT_BEP20
+	if before.Units < 0 {
+		delta = -delta
+	}
+	deltaStr, err := money.Format(money.Amount{Asset: money.USDT_BEP20, Units: delta})
+	require.NoError(t, err)
+	negDeltaStr, err := money.Format(money.Amount{Asset: money.USDT_BEP20, Units: -delta})
+	require.NoError(t, err)
+
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/entries", idemKey(t), map[string]any{
+		"entry_type":  "http_test_corridor",
+		"occurred_at": time.Now().Format(time.RFC3339),
+		"lines": []map[string]any{
+			{"account_code": "position:corridor:USDT_BEP20", "asset": "USDT_BEP20", "amount": deltaStr},
+			{"account_code": liability, "asset": "USDT_BEP20", "amount": negDeltaStr},
+		},
+	})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	want := before.Units + delta
+
+	resp2 := doRequest(t, http.MethodGet, baseURL+"/v1/system/invariants", "", nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	var invariants struct {
+		CorridorPosition []struct {
+			Asset         string `json:"asset"`
+			AccountCode   string `json:"account_code"`
+			PositionUnits int64  `json:"position_units"`
+			CeilingUnits  int64  `json:"ceiling_units"`
+			OverCeiling   bool   `json:"over_ceiling"`
+		} `json:"corridor_position"`
+	}
+	decodeInto(t, resp2, &invariants)
+
+	require.Len(t, invariants.CorridorPosition, 1)
+	got := invariants.CorridorPosition[0]
+	assert.Equal(t, "USDT_BEP20", got.Asset)
+	assert.Equal(t, "position:corridor:USDT_BEP20", got.AccountCode)
+	assert.Equal(t, want, got.PositionUnits)
+	assert.Equal(t, ceiling, got.CeilingUnits)
+	assert.True(t, got.OverCeiling)
 }
 
 func TestGetBalancesPrefix(t *testing.T) {

@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -74,11 +73,7 @@ func NewMetrics(reg prometheus.Registerer, pool *pgxpool.Pool, reconciler *recon
 			if reconciler == nil {
 				return 0
 			}
-			last := reconciler.LastTick()
-			if last.IsZero() {
-				return 0
-			}
-			return time.Since(last).Seconds()
+			return reconciler.LagSeconds()
 		}),
 	)
 

@@ -48,7 +48,16 @@ var ErrIdempotencyConflict = errors.New("journal: idempotency key reused with a 
 // commits one itself, so an order state transition (C1.5) can be made to
 // commit atomically with the entry and its balance updates by running all
 // of it against the same tx.
-func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (Entry, error) {
+func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (entry Entry, err error) {
+	defer func() {
+		if err != nil {
+			accounts, amounts := requestedLinesToAudit(req.Lines)
+			auditFailure(req.Actor, req.IdempotencyKey, req.EntryType, req.OrderID, accounts, amounts, err)
+			return
+		}
+		auditSuccess(ctx, entry)
+	}()
+
 	resolved, err := validate(ctx, tx, req)
 	if err != nil {
 		return Entry{}, err
@@ -73,7 +82,7 @@ func Post(ctx context.Context, tx pgx.Tx, req EntryRequest) (Entry, error) {
 			occurred_at, recorded_at, reversal_of, metadata
 	`, req.IdempotencyKey, hash, req.EntryType, req.OrderID, req.Actor, req.OccurredAt, metadata)
 
-	entry, err := scanEntry(row)
+	entry, err = scanEntry(row)
 	switch {
 	case err == nil:
 		return postLines(ctx, tx, entry, resolved)

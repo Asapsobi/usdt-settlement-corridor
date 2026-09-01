@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"ledger/internal/accounts"
 	"ledger/internal/db"
 	"ledger/internal/halt"
 	"ledger/internal/httpapi"
@@ -42,6 +43,15 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+
+	// Seed is safe to call on every boot: Create is idempotent on code,
+	// so this is a no-op against an already-seeded database and exactly
+	// what makes a freshly migrated one (schema only, nothing accounts.Seed
+	// hasn't put there) immediately usable without a separate manual step
+	// -- migrations/cmd/migrate only ever creates the schema, never rows.
+	if err := accounts.Seed(ctx, pool.Pool); err != nil {
+		return err
+	}
 
 	haltCache, err := halt.NewCache(ctx, pool.Pool)
 	if err != nil {

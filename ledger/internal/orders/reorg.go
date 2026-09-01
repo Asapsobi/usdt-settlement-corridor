@@ -133,7 +133,7 @@ func reorgScenarioB(ctx context.Context, tx pgx.Tx, order Order, originalEntryKe
 	}
 
 	err = halt.Set(ctx, tx, halt.SetParams{
-		Reason: "POST_SETTLEMENT_REORG",
+		Reason: halt.ReasonPostSettlementReorg,
 		Detail: map[string]any{
 			"order_id":           order.ID,
 			"order_external_id":  order.ExternalID,

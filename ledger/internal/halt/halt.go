@@ -23,6 +23,29 @@ import (
 
 var ErrClearRequiresOperator = errors.New("halt: clearing requires both an operator identity and a note")
 
+// Reason values the system sets automatically, as opposed to the free
+// text an operator supplies via POST /system/halt. These four are
+// specifically what docs/runbook.md must have a section for -- C1.10's
+// acceptance criterion enforces that with a test (TestRunbookCoversEveryReason)
+// that greps the runbook for each one, so documentation drift is a build
+// failure rather than something an operator discovers at 3am.
+const (
+	ReasonPostSettlementReorg = "POST_SETTLEMENT_REORG"
+	ReasonTrialBalanceBroken  = "TRIAL_BALANCE_BROKEN"
+	ReasonCacheDivergence     = "CACHE_DIVERGENCE"
+	ReasonBalanceDrift        = "BALANCE_DRIFT"
+)
+
+// KnownReasons lists every Reason constant above, so the runbook-drift
+// test (and anything else that needs "every reason defined in code") has
+// something to range over without resorting to reflection.
+var KnownReasons = []string{
+	ReasonPostSettlementReorg,
+	ReasonTrialBalanceBroken,
+	ReasonCacheDivergence,
+	ReasonBalanceDrift,
+}
+
 // Executor is satisfied by both *pgxpool.Pool and pgx.Tx. Set and Clear
 // accept this rather than pgx.Tx specifically because they have two
 // genuinely different callers: C1.6's reorg handling, which must commit
