@@ -19,7 +19,7 @@ and, as of 1 Sep 2026, the ledger core itself.
 | Contribution margin | 87.1% at a $3,000 ticket |
 | MVP scope | 6 services, one ledger, no smart contracts · ≈9–10 eng-weeks |
 | Build status | **C1 (ledger core) built and tested** — all chunks C1.0–C1.10 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers. Scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). See `docs/03-build/c1-scenario-catalog.md`. |
-| Next action | **C2 — deposit watcher (BSC)**, next in the build order per `component-map.md`'s dependency graph. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc — not confirmed done as of this write-up. |
+| Next action | **C2 — deposit watcher (BSC)** is now specified (`docs/03-build/c2-deposit-watcher-build-prompts.md`), not yet built. Spec flags 4 prerequisites to resolve first, including 2 small additions C1 needs (a reorg-report endpoint, a deposit-sweep entry type) and a re-measurement of BSC finality timing (block time is now ~0.45s post-Fermi hard fork, materially faster than the assumption behind the published custody-window figure). On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc — not confirmed done as of this write-up. |
 
 ## Documents
 
@@ -57,6 +57,14 @@ and, as of 1 Sep 2026, the ledger core itself.
   C1 today, what cross-component failure modes are still open (C2–C6, not yet built),
   and what's irreducible risk that has to be priced or insured rather than fixed.
   Audited against the real test suite on 1 Sep 2026.
+- **[c2-deposit-watcher-build-prompts.md](docs/03-build/c2-deposit-watcher-build-prompts.md)** —
+  the deposit watcher, specified the same way C1 was: sequenced build chunks
+  (C2.0 → C2.10) with acceptance criteria, written for an AI coding agent. Opens
+  with four prerequisite gaps between this spec and the already-built C1 — two
+  small endpoint/schema additions C1 needs, one product decision (deposits
+  arriving after quote expiry), and a re-derivation of BSC's current finality
+  timing, which has changed materially since the original assessment. Not yet
+  built.
 
 ### `ledger/`
 
