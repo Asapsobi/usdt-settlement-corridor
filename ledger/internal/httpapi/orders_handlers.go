@@ -134,6 +134,25 @@ type postTransitionRequest struct {
 	Reason          string                  `json:"reason"`
 	OccurredAt      time.Time               `json:"occurred_at"`
 	Entry           *transitionEntryRequest `json:"entry,omitempty"`
+	// EntryID names an entry already posted -- in practice a reversal
+	// created via POST /v1/entries/{id}/reversal -- to be recorded as
+	// this transition's cause without posting anything new.
+	//
+	// orders.TransitionParams has had this field since C1.5, but until
+	// C1.11 nothing exposed it, so the only way to drive the two
+	// reversal-shaped transitions (funded->quoted, dispatching->held)
+	// over HTTP was to hand-build a negating entry and post it through
+	// `entry`. That produces an ordinary entry with reversal_of NULL: it
+	// balances, so nothing rejects it, but it is not linked to what it
+	// undoes and it is not covered by the UNIQUE constraint that makes a
+	// double-reversal impossible. Both halves of that guarantee are the
+	// point of C1.6, and this field is what lets a remote caller keep
+	// them.
+	//
+	// At most one of entry / entry_id may be set; TransitionParams
+	// enforces that, and exactly one is required when the transition rule
+	// requires an entry.
+	EntryID *int64 `json:"entry_id,omitempty"`
 }
 
 // postTransition is POST /v1/orders/{external_id}/transitions. When the
@@ -186,6 +205,7 @@ func (s *Server) postTransition(w http.ResponseWriter, r *http.Request) {
 			Reason:     req.Reason,
 			OccurredAt: req.OccurredAt,
 			Entry:      entryReq,
+			EntryID:    req.EntryID,
 		})
 		return err
 	})

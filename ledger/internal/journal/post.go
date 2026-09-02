@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"ledger/internal/accounts"
 	"ledger/internal/money"
 )
 
@@ -202,23 +203,43 @@ func resolveExisting(ctx context.Context, tx pgx.Tx, req EntryRequest, newHash [
 	return existing, nil
 }
 
+// entrySelectSQL is the one column list every entry read uses, so a
+// column added to journal_entries can never be picked up by some reads
+// and silently missed by others.
+const entrySelectSQL = `
+	SELECT id, idempotency_key, payload_hash, entry_type, order_id, actor,
+		occurred_at, recorded_at, reversal_of, metadata
+	FROM journal_entries`
+
+// isNoRows reports whether err is pgx's "query returned nothing", so
+// callers can turn that into their own domain error rather than leaking
+// a driver sentinel past this package's boundary.
+func isNoRows(err error) bool {
+	return errors.Is(err, pgx.ErrNoRows)
+}
+
 // GetEntryByIdempotencyKey looks up an entry by its idempotency key.
 // Exported for callers that need to locate an earlier entry to act on it
 // further -- for example C1.6's reorg handling, which is given the
 // original deposit_final entry's idempotency key (not its numeric id) by
 // whichever caller detected the reorg, and needs the id to call Reverse.
-func GetEntryByIdempotencyKey(ctx context.Context, tx pgx.Tx, key string) (Entry, error) {
-	row := tx.QueryRow(ctx, `
-		SELECT id, idempotency_key, payload_hash, entry_type, order_id, actor,
-			occurred_at, recorded_at, reversal_of, metadata
-		FROM journal_entries
-		WHERE idempotency_key = $1
-	`, key)
-	return scanEntry(row)
+//
+// A key that has never been used returns ErrEntryNotFound rather than
+// pgx.ErrNoRows: this is reachable from the HTTP boundary (C1.11's reorg
+// route hands it a caller-supplied key), and every error that can reach
+// that boundary must map to exactly one stable error code -- which a
+// driver sentinel shared with every other empty query cannot do.
+func GetEntryByIdempotencyKey(ctx context.Context, q accounts.Queryer, key string) (Entry, error) {
+	row := q.QueryRow(ctx, entrySelectSQL+` WHERE idempotency_key = $1`, key)
+	entry, err := scanEntry(row)
+	if isNoRows(err) {
+		return Entry{}, fmt.Errorf("%w: idempotency key %q", ErrEntryNotFound, key)
+	}
+	return entry, err
 }
 
-func loadLines(ctx context.Context, tx pgx.Tx, entryID int64) ([]PostedLine, error) {
-	rows, err := tx.Query(ctx, `
+func loadLines(ctx context.Context, q accounts.Queryer, entryID int64) ([]PostedLine, error) {
+	rows, err := q.Query(ctx, `
 		SELECT jl.seq, jl.account_id, a.code, jl.asset, jl.amount_units
 		FROM journal_lines jl
 		JOIN accounts a ON a.id = jl.account_id

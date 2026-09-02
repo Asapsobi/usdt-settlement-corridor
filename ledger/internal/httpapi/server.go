@@ -51,10 +51,14 @@ func NewRouter(s *Server) http.Handler {
 		r.Use(authMiddleware(s.Auth))
 
 		r.With(requireIdempotencyKey).Post("/entries", s.postEntry)
+		r.Get("/entries", s.getEntryByKey)
+		r.Get("/entries/{id}", s.getEntry)
+		r.With(requireIdempotencyKey).Post("/entries/{id}/reversal", s.postReversal)
 
 		r.With(requireIdempotencyKey).Post("/orders", s.postOrder)
 		r.Get("/orders/{external_id}", s.getOrder)
 		r.With(requireIdempotencyKey).Post("/orders/{external_id}/transitions", s.postTransition)
+		r.With(requireIdempotencyKey).Post("/orders/{external_id}/reorg", s.postReorg)
 
 		r.Get("/accounts/{code}/balance", s.getAccountBalance)
 		r.Get("/balances", s.getBalances)

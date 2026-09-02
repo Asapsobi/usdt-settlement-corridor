@@ -8,6 +8,7 @@ require (
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stretchr/testify v1.12.1
+	go.yaml.in/yaml/v3 v3.0.5
 )
 
 require (
@@ -23,7 +24,6 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/sethvargo/go-retry v0.4.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect

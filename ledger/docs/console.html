@@ -220,6 +220,49 @@
 
   <div class="col wide">
     <div class="panel">
+      <h2>Reversal &amp; reorg (C1.11)</h2>
+      <p class="hint">
+        Corrections are never edits -- an entry is reversed by a new entry negating every line,
+        linked via <code>reversal_of</code>, and an entry may be reversed <b>at most once</b>.
+        Note the lifecycle buttons above still post hand-built negating entries for
+        refund / failed-dispatch (that is how they were written before these routes existed);
+        those balance, but they are <i>not</i> linked reversals. This panel is the real thing.
+      </p>
+
+      <h3>Reverse an entry</h3>
+      <div class="row">
+        <div class="field"><label for="revEntryId">entry id</label><input id="revEntryId" placeholder="e.g. 42"></div>
+        <div class="field"><label for="revEntryKey">…or look one up by idempotency key</label><input id="revEntryKey" placeholder="console:xyz:funded"></div>
+        <button id="btnLookupEntry">Look up</button>
+      </div>
+      <div class="row">
+        <div class="field"><label for="revReason">reason (required)</label><input id="revReason" value="manual reversal from console"></div>
+        <button id="btnReverse" class="danger">Reverse entry</button>
+      </div>
+      <div id="reverseResult" class="hint"></div>
+
+      <hr class="sep">
+
+      <h3>Report a deposit reorg</h3>
+      <p class="hint">
+        You report one fact -- the deposit is gone -- and the ledger decides what it means from
+        the order's state. <b>funded</b> → reversed, back to <code>quoted</code>, no loss.
+        <b>dispatching / settled</b> → the payout already left, so the loss is booked to
+        <code>expense:loss:reorg</code> and the system <b>halts</b>. Any other state is refused.
+      </p>
+      <div class="row">
+        <div class="field"><label for="reorgOrder">order (external_id)</label><input id="reorgOrder" placeholder="select an order above"></div>
+        <div class="field"><label for="reorgKey">original_entry_key</label><input id="reorgKey" placeholder="auto-filled from the selected order"></div>
+      </div>
+      <div class="row">
+        <button id="btnReorg" class="danger">Report reorg</button>
+      </div>
+      <div id="reorgResult" class="hint"></div>
+    </div>
+  </div>
+
+  <div class="col wide">
+    <div class="panel">
       <h2>Activity log</h2>
       <div class="row"><button id="btnClearLog">Clear log</button></div>
       <div id="activityLog" style="margin-top:8px;"><span class="hint">Nothing yet -- try "Check connection".</span></div>
@@ -249,11 +292,18 @@ let logSeq = 0;
 // (a sandboxed preview, a data: URL, private browsing with storage
 // blocked) -- degrade to "just don't persist" rather than letting that
 // exception take down the rest of this script's initialization.
+// Defaults match this repo's local dev setup (see docs/runbook.md /
+// README): ledgerd on :8081, LEDGER_API_TOKENS=console-token:console.
+// A saved value from a previous session always wins over these, so
+// pointing the console at a different server once is remembered.
+const DEFAULT_BASE_URL = 'http://localhost:8081';
+const DEFAULT_TOKEN = 'console-token';
+
 function loadConn() {
   let savedUrl = null, savedToken = null;
   try { savedUrl = localStorage.getItem('c1_base_url'); savedToken = localStorage.getItem('c1_token'); } catch {}
-  document.getElementById('baseUrl').value = savedUrl || 'http://localhost:8080';
-  document.getElementById('token').value = savedToken || '';
+  document.getElementById('baseUrl').value = savedUrl || DEFAULT_BASE_URL;
+  document.getElementById('token').value = savedToken || DEFAULT_TOKEN;
 }
 function saveConn() {
   try {
@@ -559,6 +609,8 @@ function renderOrderDetail() {
   });
   const refreshBtn = document.getElementById('btnRefreshOrder');
   if (refreshBtn) refreshBtn.onclick = () => refreshOrder(o.external_id);
+
+  syncReorgFields();
 }
 
 // ---------- raw entry poster ----------
@@ -583,6 +635,85 @@ async function postRawEntry() {
   refreshSystem();
 }
 
+// ---------- reversal & reorg (C1.11) ----------
+
+// The deposit entry's idempotency key is the one runAction sent as the
+// Idempotency-Key header when it funded the order, and postTransition
+// uses that header value as the entry's own key -- so it is derivable,
+// which is the whole point of the key convention: a caller can always
+// reconstruct it without having stored anything.
+function depositKeyFor(externalId) { return 'console:' + externalId + ':funded'; }
+
+async function lookupEntryByKey() {
+  const key = document.getElementById('revEntryKey').value.trim();
+  const out = document.getElementById('reverseResult');
+  if (!key) { out.textContent = 'enter an idempotency key to look up'; return; }
+  const r = await api('GET', '/v1/entries?idempotency_key=' + encodeURIComponent(key));
+  if (!r.ok) {
+    out.innerHTML = `<span class="badge err">${escapeHtml(r.data && r.data.error ? r.data.error.code : r.status)}</span>`;
+    return;
+  }
+  document.getElementById('revEntryId').value = r.data.id;
+  out.innerHTML = `<span class="badge ok">found</span> entry ${r.data.id} · ${escapeHtml(r.data.entry_type)}`
+    + (r.data.reversal_of ? ' <span class="badge muted">is itself a reversal</span>' : '');
+}
+
+async function reverseEntry() {
+  const out = document.getElementById('reverseResult');
+  const id = document.getElementById('revEntryId').value.trim();
+  const reason = document.getElementById('revReason').value.trim();
+  if (!id) { out.textContent = 'enter an entry id (or look one up by key)'; return; }
+  if (!reason) { out.textContent = 'a reason is required'; return; }
+
+  const r = await api('POST', '/v1/entries/' + encodeURIComponent(id) + '/reversal',
+    { reason, occurred_at: nowIso() }, 'console:reverse:' + randTag());
+
+  if (r.ok) {
+    out.innerHTML = `<span class="badge ok">reversed</span> entry ${id} → reversal ${r.data.id}`;
+  } else if (r.status === 409 && r.data && r.data.existing_reversal) {
+    // The 409 carries the reversal that already exists, so a retry after a
+    // timeout can tell "already done" from "someone else did it".
+    out.innerHTML = `<span class="badge err">already_reversed</span> entry ${id} was already reversed by entry ${r.data.existing_reversal.id}`;
+  } else {
+    out.innerHTML = `<span class="badge err">${escapeHtml(r.data && r.data.error ? r.data.error.code : r.status)}</span> ${escapeHtml(r.data && r.data.error ? r.data.error.message : '')}`;
+  }
+  refreshSystem();
+}
+
+async function reportReorg() {
+  const out = document.getElementById('reorgResult');
+  const externalId = document.getElementById('reorgOrder').value.trim();
+  const key = document.getElementById('reorgKey').value.trim();
+  if (!externalId) { out.textContent = 'select an order above, or type an external_id'; return; }
+  if (!key) { out.textContent = 'original_entry_key is required'; return; }
+
+  const r = await api('POST', '/v1/orders/' + encodeURIComponent(externalId) + '/reorg',
+    { original_entry_key: key }, 'console:reorg:' + randTag());
+
+  if (r.ok) {
+    const idx = orders.findIndex(x => x.external_id === externalId);
+    if (idx >= 0) orders[idx] = r.data;
+    renderOrderList();
+    renderOrderDetail();
+    out.innerHTML = `<span class="badge ok">handled</span> order is now <b>${escapeHtml(r.data.state)}</b>`
+      + (r.data.state === 'settled' ? ' — scenario B: loss booked, system halted' : ' — scenario A: no loss');
+  } else {
+    out.innerHTML = `<span class="badge err">${escapeHtml(r.data && r.data.error ? r.data.error.code : r.status)}</span> ${escapeHtml(r.data && r.data.error ? r.data.error.message : '')}`;
+  }
+  refreshSystem();
+}
+
+// Keep the reorg fields pointed at whatever order is selected above,
+// without clobbering a value the user typed themselves.
+function syncReorgFields() {
+  if (!selected) return;
+  const orderField = document.getElementById('reorgOrder');
+  const keyField = document.getElementById('reorgKey');
+  if (!orderField || !keyField) return;
+  if (orderField.dataset.touched !== '1') orderField.value = selected;
+  if (keyField.dataset.touched !== '1') keyField.value = depositKeyFor(selected);
+}
+
 // ---------- wiring ----------
 document.getElementById('btnCheck').onclick = checkConnection;
 document.getElementById('btnRefreshSystem').onclick = refreshSystem;
@@ -594,6 +725,13 @@ document.getElementById('balanceAccountPreset').onchange = (e) => {
 };
 document.getElementById('btnCreateOrder').onclick = createOrder;
 document.getElementById('btnPostEntry').onclick = postRawEntry;
+document.getElementById('btnLookupEntry').onclick = lookupEntryByKey;
+document.getElementById('btnReverse').onclick = reverseEntry;
+document.getElementById('btnReorg').onclick = reportReorg;
+// Once either reorg field is edited by hand, stop auto-filling it.
+for (const id of ['reorgOrder', 'reorgKey']) {
+  document.getElementById(id).oninput = (e) => { e.target.dataset.touched = '1'; };
+}
 document.getElementById('btnClearLog').onclick = () => {
   logSeq = 0;
   document.getElementById('activityLog').innerHTML = '<span class="hint">cleared.</span>';

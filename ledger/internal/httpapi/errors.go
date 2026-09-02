@@ -52,6 +52,14 @@ var (
 	errInvalidRequest = newAPIError(http.StatusBadRequest, "invalid_request", "the request could not be validated")
 	errInvalidEntry   = newAPIError(http.StatusUnprocessableEntity, "invalid_entry", "the entry's shape is invalid for this operation")
 	errUnauthorized   = newAPIError(http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+
+	// C1.11's four codes, for conditions that only became reachable over
+	// HTTP once the reversal surface was exposed. Each maps from exactly
+	// one domain sentinel that C1.6 already defined.
+	errEntryNotFound          = newAPIError(http.StatusNotFound, "entry_not_found", "no journal entry exists with that id or idempotency key")
+	errAlreadyReversed        = newAPIError(http.StatusConflict, "already_reversed", "that entry has already been reversed; an entry may be reversed at most once")
+	errCannotReverseAReversal = newAPIError(http.StatusUnprocessableEntity, "cannot_reverse_a_reversal", "that entry is itself a reversal, and a reversal cannot be reversed")
+	errUnexpectedState        = newAPIError(http.StatusConflict, "unexpected_state", "the order is in a state this operation is not defined for")
 )
 
 // mapError translates a domain error from any lower layer into the
@@ -73,7 +81,17 @@ func mapError(err error) *apiError {
 		return errInvalidEntry
 	case errors.Is(err, journal.ErrInvalidIdempotencyKey):
 		return errInvalidRequest
+	case errors.Is(err, journal.ErrEntryNotFound):
+		return errEntryNotFound
+	case errors.Is(err, journal.ErrAlreadyReversed):
+		return errAlreadyReversed
+	case errors.Is(err, journal.ErrCannotReverseAReversal):
+		return errCannotReverseAReversal
+	case errors.Is(err, journal.ErrInvalidReverseParams):
+		return errInvalidRequest
 
+	case errors.Is(err, orders.ErrUnexpectedState):
+		return errUnexpectedState
 	case errors.Is(err, orders.ErrSystemHalted):
 		return errSystemHalted
 	case errors.Is(err, orders.ErrIllegalTransition):

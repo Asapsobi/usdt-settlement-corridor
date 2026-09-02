@@ -75,6 +75,86 @@ paths:
         "422": { $ref: "#/components/responses/Unprocessable" }
         "423": { $ref: "#/components/responses/Halted" }
 
+    get:
+      summary: Look up an entry by its idempotency key
+      description: >
+        The lookup a remote caller actually needs: every producer knows
+        the key it used (the convention requires it to be reconstructible
+        from facts about the outside world, so a retry regenerates it),
+        but not the numeric id, which only appears in a response it may
+        have missed.
+      parameters:
+        - name: idempotency_key
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entries/{id}:
+    get:
+      summary: Fetch a journal entry by id
+      parameters:
+        - $ref: "#/components/parameters/EntryID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entries/{id}/reversal:
+    post:
+      summary: Reverse a journal entry
+      description: >
+        Posts a new entry negating every line of the original, linked via
+        reversal_of. An entry may be reversed AT MOST ONCE, enforced by a
+        UNIQUE constraint, and a reversal can never itself be reversed.
+        Deliberately not idempotent -- a second call is 409
+        already_reversed, never a silent replay -- so that 409 carries the
+        reversal that already exists, letting a caller whose first request
+        timed out tell "I already did this" from "someone else did".
+        The reversing entry's own idempotency key is derived from the
+        original's, never from this request's Idempotency-Key header.
+      parameters:
+        - $ref: "#/components/parameters/EntryID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostReversalRequest" }
+      responses:
+        "201":
+          description: Reversal posted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: entry_not_found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: already_reversed -- includes the reversal that exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AlreadyReversed" }
+        "422":
+          description: cannot_reverse_a_reversal.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /v1/orders:
     post:
       summary: Create an order (always starts in state quoted)
@@ -134,6 +214,48 @@ paths:
         "422": { $ref: "#/components/responses/Unprocessable" }
         "423": { $ref: "#/components/responses/Halted" }
 
+  /v1/orders/{external_id}/reorg:
+    post:
+      summary: Report that this order's BEP20 deposit was reorged out
+      description: >
+        The caller reports one fact -- the deposit that funded this order
+        no longer exists on chain -- and C1 decides what it means from the
+        order's own state. funded is scenario A: reverse the deposit,
+        return to quoted, no loss and no halt. dispatching or settled is
+        scenario B: reverse the deposit, book the full amount_out to
+        expense:loss:reorg, and HALT, because the payout already left.
+        Any other state is 409 unexpected_state, never a best guess. The
+        scenario is deliberately NOT a request parameter: a buggy watcher
+        must not be able to book a post-settlement reorg as routine.
+      parameters:
+        - $ref: "#/components/parameters/ExternalID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostReorgRequest" }
+      responses:
+        "200":
+          description: >
+            Reorg handled. Scenario A returns the order in quoted;
+            scenario B returns it unchanged (it really did settle) and the
+            ledger is now halted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: order_not_found, or entry_not_found for original_entry_key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: unexpected_state, or already_reversed if reported twice.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /v1/accounts/{code}/balance:
     get:
       summary: An account's balance
@@ -162,7 +284,7 @@ paths:
   /v1/balances:
     get:
       summary: Every account balance matching a code prefix
-      description: e.g. ?prefix=asset:tron:slot: for slot-cap checks.
+      description: "e.g. ?prefix=asset:tron:slot: for slot-cap checks."
       parameters:
         - name: prefix
           in: query
@@ -283,6 +405,12 @@ components:
       in: path
       required: true
       schema: { type: string }
+    EntryID:
+      name: id
+      in: path
+      required: true
+      description: A journal entry's numeric id.
+      schema: { type: integer, format: int64 }
 
   responses:
     BadRequest:
@@ -366,6 +494,45 @@ components:
               amount: { type: string }
         outcome: { type: string, enum: [created, replayed] }
 
+    PostReversalRequest:
+      type: object
+      required: [reason, occurred_at]
+      properties:
+        reason:
+          type: string
+          description: Why this entry is being reversed. Required, recorded on the reversal.
+        occurred_at: { type: string, format: date-time }
+
+    PostReorgRequest:
+      type: object
+      required: [original_entry_key]
+      properties:
+        original_entry_key:
+          type: string
+          description: >
+            The idempotency key of the deposit_final entry that funded this
+            order -- not its numeric id. This is what the watcher reporting
+            the reorg has: the same key it minted from the tx hash and log
+            index when it first reported the deposit.
+
+    AlreadyReversed:
+      type: object
+      description: >
+        The 409 body for POST /v1/entries/{id}/reversal when the entry
+        already has one. The usual error envelope, plus the reversal that
+        exists -- so a caller whose first request timed out can tell that
+        its own call is what created it.
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, enum: [already_reversed] }
+            message: { type: string }
+        existing_reversal:
+          allOf:
+            - $ref: "#/components/schemas/Entry"
+          description: Omitted if it could not be read back.
+
     PostOrderRequest:
       type: object
       required:
@@ -415,7 +582,10 @@ components:
         entry:
           type: object
           nullable: true
-          description: Required exactly when the transition rule requires one.
+          description: >
+            An entry to post as part of this transition. Exactly one of
+            entry / entry_id is required when the transition rule requires
+            an entry; supplying both is rejected.
           properties:
             entry_type: { type: string }
             occurred_at: { type: string, format: date-time }
@@ -423,6 +593,19 @@ components:
               type: array
               items: { $ref: "#/components/schemas/EntryLine" }
             metadata: { type: object }
+        entry_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            An ALREADY-POSTED entry -- in practice a reversal created via
+            POST /v1/entries/{id}/reversal -- to record as this
+            transition's cause without posting anything new. This is how
+            the two reversal-shaped transitions (funded->quoted,
+            dispatching->held) are driven correctly: hand-building a
+            negating entry via `entry` instead produces an ordinary entry
+            with reversal_of NULL, unlinked to what it undoes and outside
+            the UNIQUE constraint that makes a double-reversal impossible.
 
     Balance:
       type: object

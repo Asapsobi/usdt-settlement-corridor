@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"ledger/internal/accounts"
 	"ledger/internal/money"
 )
 
@@ -55,12 +56,14 @@ type negatedLine struct {
 func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reason string, occurredAt time.Time) (entry Entry, err error) {
 	var original Entry
 	var idempotencyKey string
-	var accounts []string
+	// auditAccounts, not "accounts": the latter would shadow the
+	// accounts package for the whole function body.
+	var auditAccounts []string
 	var amounts []auditAmount
 
 	defer func() {
 		if err != nil {
-			auditFailure(actor, idempotencyKey, "reversal", original.OrderID, accounts, amounts, err)
+			auditFailure(actor, idempotencyKey, "reversal", original.OrderID, auditAccounts, amounts, err)
 			return
 		}
 		auditSuccess(ctx, entry)
@@ -76,9 +79,13 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 		return Entry{}, fmt.Errorf("%w: zero occurred_at", ErrInvalidReverseParams)
 	}
 
+	// getEntryByID already reports a missing row as ErrEntryNotFound, so
+	// this only has to pass that through unwrapped -- wrapping it in a
+	// "reverse: loading entry" message would still satisfy errors.Is, but
+	// would bury the one detail a caller acts on behind an internal step.
 	original, err = getEntryByID(ctx, tx, originalEntryID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Entry{}, fmt.Errorf("%w: id %d", ErrEntryNotFound, originalEntryID)
+	if errors.Is(err, ErrEntryNotFound) {
+		return Entry{}, err
 	}
 	if err != nil {
 		return Entry{}, fmt.Errorf("journal: reverse: loading entry %d: %w", originalEntryID, err)
@@ -121,7 +128,7 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 	for i, n := range negated {
 		hashLines[i] = Line{AccountCode: n.accountCode, Amount: n.amount}
 	}
-	accounts, amounts = requestedLinesToAudit(hashLines)
+	auditAccounts, amounts = requestedLinesToAudit(hashLines)
 
 	hash, err := canonicalHash(EntryRequest{
 		IdempotencyKey: idempotencyKey,
@@ -177,12 +184,14 @@ func Reverse(ctx context.Context, tx pgx.Tx, originalEntryID int64, actor, reaso
 	return entry, nil
 }
 
-func getEntryByID(ctx context.Context, tx pgx.Tx, id int64) (Entry, error) {
-	row := tx.QueryRow(ctx, `
-		SELECT id, idempotency_key, payload_hash, entry_type, order_id, actor,
-			occurred_at, recorded_at, reversal_of, metadata
-		FROM journal_entries
-		WHERE id = $1
-	`, id)
-	return scanEntry(row)
+// getEntryByID takes an accounts.Queryer rather than a pgx.Tx so the
+// read-only lookups in lookup.go can reuse it against the pool directly;
+// Reverse still passes its own tx, unchanged.
+func getEntryByID(ctx context.Context, q accounts.Queryer, id int64) (Entry, error) {
+	row := q.QueryRow(ctx, entrySelectSQL+` WHERE id = $1`, id)
+	entry, err := scanEntry(row)
+	if isNoRows(err) {
+		return Entry{}, fmt.Errorf("%w: id %d", ErrEntryNotFound, id)
+	}
+	return entry, err
 }
