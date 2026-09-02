@@ -4,7 +4,9 @@
 
 **How to use this file.** Paste §0 once at the start of the session — standing context the agent must hold for every chunk. Then paste chunks C2.0 → C2.10 one at a time, in order. Do not move to the next chunk until the current chunk's acceptance criteria pass against a real (or forked/simulated) chain, not a mock of your own assumptions about one.
 
-**Before you start:** read the two call-outs immediately below. The first is four interface gaps between this spec and the C1 that's already built — none of them are this document's to close unilaterally, and C2 cannot be finished without closing them. The second is new information about BSC itself that changes a number already published in `product-operations-architecture.md`.
+**Before you start:** read the two call-outs immediately below. The first is four interface gaps found between this spec and the C1 that's already built — one (#1, the reorg endpoint) has since been closed by C1.11 and is marked as such; the other three are still open and none of them are this document's to close unilaterally. The second is new information about BSC itself that changes a number already published in `product-operations-architecture.md`.
+
+**Update, 2 Sep 2026:** gap #1 below is closed — C1.11 added `POST /v1/orders/{external_id}/reorg` and `POST /v1/entries/{id}/reversal`, committed to the `ledger/` repo at `41c4bd0`. §A and C2.6 are updated to the actual shipped shape, which differs from this document's original guess in a couple of small but load-bearing ways (no `actor` or `occurred_at` in the reorg body; the transition example was missing `asset` on every line and had two fields — `idempotency_key`, `actor` — that don't exist on the real DTO and would be rejected outright). Gaps #2 and #3 are still open.
 
 ---
 
@@ -12,7 +14,9 @@
 
 C1 is built (`c1-ledger-build-prompts.md`, all of C1.0–C1.10, verified against its own test suite as of the 1 Sep 2026 audit — see `c1-scenario-catalog.md`). That means C2's interface to it isn't a design choice anymore, it's a contract to read carefully — and reading it carefully surfaces four things C1's own spec describes but C1's own HTTP surface (§C1.8) doesn't actually expose a way to do. Each of these blocks a specific C2 chunk below; treat them as prerequisites, not as C2's problem to route around.
 
-1. **There is no reorg-report endpoint.** `c1-ledger-build-prompts.md`'s C1.6 defines `HandleDepositReorg(ctx, orderID, originalEntryKey, actor)` as the sanctioned path for both reorg scenarios (A: recoverable, before dispatch; B: the loss case, after settlement) — but it's an internal Go function on C1's own `internal/orders` package, and C1.8's endpoint list (`POST /entries`, `POST /orders/{id}/transitions`, and the rest) has nothing that maps to it. The generic transitions endpoint could plausibly be stretched to cover scenario A (`funded → quoted` is a legal transition, "requires entry (reversal)"), but scenario B isn't a transition C2 (or anything external) can express through the existing order-state API at all — it doesn't change the order's state, it posts a loss entry and halts the system out-of-band. **Before C2.6 can be built, C1 needs a new endpoint** — the obvious shape is `POST /v1/orders/{external_id}/reorg` taking `{original_idempotency_key, actor, occurred_at}` and dispatching internally to `HandleDepositReorg`, returning whichever of scenario A or B applied. This is a small, contained addition to C1.8, not a redesign — flagging it here so it doesn't get discovered mid-build.
+1. ~~There is no reorg-report endpoint.~~ **Closed — C1.11, commit `41c4bd0`.** This gap was real when first written: `HandleDepositReorg(ctx, orderID, originalEntryKey, actor)` was an internal Go function on C1's `internal/orders` package with no HTTP path to it, and C1.8's endpoint list had nothing that mapped to scenario B (which isn't a transition — it posts a loss entry and halts the system out-of-band, not something the generic transitions endpoint could be stretched to cover). C1.11 added `POST /v1/orders/{external_id}/reorg` as the fix, plus `POST /v1/entries/{id}/reversal` (C2.6 needs both — see §A). **The actual shape differs from the guess this document originally made below**, in two ways worth knowing before writing C2.6 against it:
+   - Request body is `{"original_entry_key": "<idempotency key>"}` only. No `actor` field — every C1 write derives the actor from the bearer token, never a request body field, matching every other endpoint. No `occurred_at` — the handler timestamps the reversal itself.
+   - Response is the `Order`, not a scenario tag — C1 still decides A vs B internally from the order's own state and returns whatever it left the order as; the caller was never going to be trusted to name the scenario itself, that was always the point of routing through `HandleDepositReorg`, so nothing here actually changed except that it's reachable now.
 
 2. **Nothing owns sweeping the per-order deposit account, and no entry type exists for it.** Walk §B's worked example in the C1 doc: E1 credits `asset:bsc:deposit:1042` with the full $3,000. E2 (the conversion) never touches that account again — it moves `liability:customer:acme` and `position:corridor` instead. The $3,000 of actual on-chain BEP20 sitting at the physical deposit address is never shown leaving it. Physically, those tokens have to move to wherever the treasury actually holds BEP20 before E5's `asset:cex:<venue>` rebalance leg makes sense — and `component-map.md` explicitly lists "sweeping deposits" under what C2 does **not** own, without naming who does. S1 (key management) is the only component with signing authority over deposit addresses, so it's the most likely owner, but nothing currently specifies the entry type (candidate: `deposit_swept`, `DR asset:bsc:treasury CR asset:bsc:deposit:<order_id>` — `asset:bsc:treasury` doesn't exist in §A's chart of accounts yet either) or who calls C1 to post it. **This needs an owner and a chart-of-accounts addition before C2 (or S1) is complete**, even though the sweep operation itself is out of C2's scope.
 
@@ -140,18 +144,19 @@ Idempotency-Key: watcher:deposit_final:<tx_hash>:<log_index>
   "to_state": "funded",
   "expected_version": <order's current version, from a prior GET>,
   "reason": "bep20_deposit_final",
+  "occurred_at": "<block timestamp at finality, RFC3339 UTC>",
   "entry": {
-    "idempotency_key": "watcher:deposit_final:<tx_hash>:<log_index>",
     "entry_type": "deposit_final",
-    "actor": "watcher",
     "occurred_at": "<block timestamp at finality, RFC3339 UTC>",
     "lines": [
-      {"account_code": "asset:bsc:deposit:<order_id>", "amount": "<decimal string>"},
-      {"account_code": "liability:customer:<customer_id>", "amount": "-<decimal string>"}
+      {"account_code": "asset:bsc:deposit:<order_id>", "asset": "USDT_BEP20", "amount": "<decimal string>"},
+      {"account_code": "liability:customer:<customer_id>", "asset": "USDT_BEP20", "amount": "-<decimal string>"}
     ]
   }
 }
 ```
+
+Two things this example gets right that are easy to get wrong by analogy with other APIs: **there is no `idempotency_key` or `actor` field anywhere in this body.** C1's JSON decoder rejects unknown fields outright (`DisallowUnknownFields`), so adding either would fail the whole request with `400 invalid_request`, not silently ignore it. The single `Idempotency-Key` header becomes the identity of both the transition attempt and the journal entry it posts — one header, two things it's the key for, by construction. Actor is derived server-side from whichever bearer token authenticated the call, on every C1 write, no exceptions — it's not a value any caller ever supplies. And note `occurred_at` appears **twice**, once for the transition record and once for the entry it posts — they'll be the same value here (the block timestamp) but they're genuinely two separate fields on two separate DTOs, both required.
 
 Amounts are decimal strings, never JSON numbers — C1.8 rejects a JSON number outright, and it's called out as "the most likely way this system loses money." C2's own money type should therefore be the same `int64` minor-units representation C1 uses internally, formatted through the same rules (6 decimals for USDT_BEP20), so a value never round-trips through a float at any point between the chain log and the HTTP body.
 
@@ -159,9 +164,20 @@ Amounts are decimal strings, never JSON numbers — C1.8 rejects a JSON number o
 
 C1 doesn't push order data to C2 — nothing in C1.8 is a webhook or event stream, and building one is explicitly C6's job (decision 5), not C1's or C2's. So the direction of discovery has to run the other way: **whoever creates the order (C6, once it exists) must call C2**, not the reverse. That means C2 needs an inbound endpoint of its own — see C2.9 — where the caller hands over `order_id`, `external_id`, `customer_id`, `quoted_at`, `quote_expires_at`, and gets back an assigned deposit address. C2 then needs to independently learn when that order leaves a state it cares about (funded, or terminal), which — absent a push mechanism — means C2 polls `GET /v1/orders/{external_id}` on whatever addresses it's still actively watching. This polling dependency is a real cost (nothing here makes it free or instant) and should be treated as a placeholder for a proper event mechanism once C6 exists, not a permanent design.
 
-### Reporting a reorg — blocked on gap #1 above
+### Reporting a reorg
 
-Once C1 exposes the endpoint described in the gap list (`POST /v1/orders/{external_id}/reorg` or equivalent), C2.6 calls it with the original idempotency key and lets C1 decide internally whether the order's current state makes this scenario A or scenario B. Until that endpoint exists, C2.6 cannot be finished — build everything else in this spec first, and treat C2.6 as blocked, not skippable.
+C1.11 added the endpoint (see gap #1). C2.6 calls it with only the original deposit's idempotency key:
+
+```
+POST /v1/orders/{external_id}/reorg
+Idempotency-Key: watcher:reorg_report:<tx_hash>:<log_index>
+
+{
+  "original_entry_key": "watcher:deposit_final:<tx_hash>:<log_index>"
+}
+```
+
+No `actor` (from the bearer token, as everywhere else), no `occurred_at`, no scenario flag — C1 decides internally whether the order's current state makes this scenario A or scenario B from `HandleDepositReorg`, and returns the order however it left it (back to `quoted` for A; unchanged, and now halted, for B). C2 never gets to assert which scenario applies; that was always the reason for routing through a single ledger-side function instead of two separate calls.
 
 ---
 
@@ -470,13 +486,13 @@ ACCEPTANCE
 
 ---
 
-## C2.6 — Reorg handling (blocked on the C1 endpoint gap)
+## C2.6 — Reorg handling
 
 ```
-This chunk cannot be completed until C1 exposes a reorg-report endpoint (see
-"Read this first," gap #1). Everything up to the actual HTTP call can and should
-be built and tested now; the call itself is the one piece to leave as a typed,
-tested, but unreachable stub until the C1 side exists.
+C1.11 closed the endpoint gap this chunk originally depended on (see gap #1) —
+POST /v1/orders/{external_id}/reorg exists, is tested, and is committed at
+c93dfb9..41c4bd0 in the ledger repo. This chunk is no longer blocked; build it
+whole, including the live call, against a real running C1 instance.
 
 SCOPE
 - Detecting a post-final reorg: CheckFinality's own finalized-height tracking is
@@ -484,26 +500,39 @@ SCOPE
   ever contradicted by a later finalized-height read from the provider pool
   (i.e., the chain's own consensus finality was itself violated), that is an
   extraordinary event, categorically different from the routine pre-final case
-  in C2.3. Log it as a distinct, loud event type from the moment it's detected,
-  independent of whether the reporting call to C1 can succeed yet.
-- ReportReorg(ctx, order_id, original_idempotency_key, actor) error — builds the
-  request body per whatever C1's new endpoint ends up requiring, but the HTTP
-  call itself is behind an interface (ReorgReporter) so the detection and
-  bookkeeping logic can be fully tested against a fake implementation before the
-  real endpoint exists.
+  in C2.3. Log it as a distinct, loud event type from the moment it's detected.
+- ReportReorg(ctx, orderExternalID, originalEntryKey) error — POSTs to
+  /v1/orders/{external_id}/reorg with body {"original_entry_key": <the exact
+  idempotency key C2.7 used for that deposit's deposit_final entry>}. No actor
+  field (the bearer token supplies it), no occurred_at, no scenario flag — see
+  §A's "Reporting a reorg" for the full shape and why it's this narrow. Behind
+  an interface (ReorgReporter) anyway, not for the reason it used to be (an
+  unreachable endpoint) but so the detection/bookkeeping logic upstream of the
+  call can still be tested against a fake without needing a live C1 for every
+  run.
+- Map C1's response: order back in `quoted` is scenario A (routine, log at
+  info); order unchanged and C1 now reports halted (poll GET /v1/system/halt
+  or watch for 423 on the next unrelated call) is scenario B (a real loss,
+  alert loudly — this is exactly the "impossible to handle quietly" case
+  c1-ledger-build-prompts.md's C1.6 was built to guarantee).
 
-ACCEPTANCE (of the parts that don't depend on the missing endpoint)
+ACCEPTANCE
 - A finalized-height contradiction is detected and classified within one
   CheckFinality tick of occurring, against a forked chain that can be made to
   violate its own prior finality (this requires deliberately misconfiguring the
   simulated finality gadget — document how, since it's not a normal chain
   behavior to reproduce).
 - ReportReorg is called exactly once per contradicted candidate, idempotently —
-  a retry of the surrounding process does not call it twice.
-- Once C1's endpoint exists: extend this chunk with a live integration test
-  against a real C1 instance, both scenario A (order still funded/pre-dispatch)
-  and scenario B (order already dispatching/settled), confirming C1's response
-  in each case matches c1-ledger-build-prompts.md's C1.6 acceptance criteria.
+  a retry of the surrounding process does not call it twice, and calling it
+  twice on purpose (simulating a retry) hits C1's own already_reversed path
+  cleanly rather than erroring in some C2-side way.
+- Against a real running C1 instance (testcontainers, same pattern C1 itself
+  uses): scenario A (order still funded/pre-dispatch) returns the order to
+  `quoted` with a zero net effect on C1's trial balance; scenario B (order
+  already dispatching/settled) results in expense:loss:reorg holding exactly
+  the reported amount_out and C1 reporting halted — confirming C1's actual
+  response matches c1-ledger-build-prompts.md's C1.6 acceptance criteria, not
+  a mock of it.
 ```
 
 ---
@@ -698,15 +727,15 @@ candidates finalizing in the same tick).
 | C2.3 Block ingestion loop | 1.0 | — |
 | C2.4 Log parsing and classification | 1.0 | Verify the USDT BEP20 contract address yourself before this chunk starts |
 | C2.5 Finality policy (§B) | 1.5 | The crux chunk — do not compress this to save time |
-| C2.6 Reorg handling | 1.0 build + wait | Blocked on the C1 endpoint gap; build everything testable now, integrate once unblocked |
+| C2.6 Reorg handling | 1.0 | No longer blocked — C1.11 closed the endpoint gap. Build whole, against a real C1. |
 | C2.7 Emission to C1 | 1.0 | Needs a running C1 instance to test against for real |
 | C2.8 Orphaned-deposit handling | 0.5 | Mechanism only — policy is a separate, non-engineering decision |
 | C2.9 HTTP boundary | 1.0 | Can run in parallel with C2.7/C2.8 |
 | C2.10 Replay harness | 1.5 | Needs a controllable forked/simulated chain set up first — budget time for that tooling, it's not free |
 
-≈10.5–11 days, consistent with the 1.5–2 eng-week estimate in `component-map.md`, on the assumption the C1 endpoint gap (#1) is closed early rather than discovered mid-build.
+≈10.5–11 days, consistent with the 1.5–2 eng-week estimate in `component-map.md`. The estimate originally assumed gap #1 would be closed early rather than discovered mid-build — it now is closed (C1.11), so the full sequence C2.0→C2.10 can run without an integration pause at C2.6.
 
-**Before starting C2.0:** close or explicitly accept-as-open each of the four gaps in "Read this first." At minimum, get a real answer on gap #4 (re-measure the actual finality wall-clock time against your chosen RPC providers) before anything downstream of it — pricing pages, SLA copy, the status page (S3) — gets built assuming the old number.
+**Before starting C2.0:** gap #1 is closed. Gaps #2 (sweep entry type/owner) and #3 (deposit-after-expiry policy) remain open but don't block C2 itself — C2 never sweeps and C2.8 only needs to capture the orphaned case, not resolve it. Gap #4 (BSC finality timing) is addressed above with sourced figures, but **verify it against your own chosen RPC providers before anything customer-facing** — pricing pages, SLA copy, the status page (S3) — gets built assuming those numbers hold in practice.
 
 ---
 
