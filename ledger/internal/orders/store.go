@@ -244,6 +244,15 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 
 	r, legal := transitionTable[pair{From: current.State, To: toState}]
 	if !legal {
+		if toState == current.State && p.Entry != nil {
+			replayed, ok, err := replayIfAlreadyPosted(ctx, tx, current, *p.Entry)
+			if err != nil {
+				return Order{}, err
+			}
+			if ok {
+				return replayed, nil
+			}
+		}
 		return Order{}, fmt.Errorf("%w: %s -> %s", ErrIllegalTransition, current.State, toState)
 	}
 
@@ -310,6 +319,46 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 	}
 
 	return updated, nil
+}
+
+// replayIfAlreadyPosted handles the one case Transition's own
+// transitionTable check cannot: a caller (C2's deposit-final report,
+// concretely) redelivering a transition-with-entry request after it
+// ALREADY succeeded and the order left the state that pair was legal
+// from -- e.g. Funded -> Funded is not a legal transitionTable pair, so
+// a redelivered "fund this order" request would otherwise fall straight
+// through to ErrIllegalTransition. That is correct for a genuinely new
+// entry request that happens to name the order's current state, but
+// wrong for an exact replay of a request that already succeeded --
+// found while building C2's ReportDepositFinal against a real running
+// ledgerd: C2 has no persistent record of which candidates it already
+// reported (by design, see the C2 build spec's own finality.Tracker), so
+// a process restart re-observing an already-final on-chain deposit
+// produces exactly this redelivery.
+//
+// This only ever acts when an entry with entryReq.IdempotencyKey ALREADY
+// EXISTS -- for a brand-new key it returns (Order{}, false, nil)
+// unconditionally, deferring to the caller's own ErrIllegalTransition,
+// and never posts anything through this path. Whether a found key's
+// payload actually matches (a genuine replay) or not (a caller bug reusing
+// a key for a different request) is decided by journal.Post's own
+// ON CONFLICT + payload-hash comparison -- reused here, not
+// reimplemented, so that comparison lives in exactly one place: matching
+// payload returns Outcome=Replayed and no error; a mismatched one returns
+// ErrIdempotencyConflict, propagated up as the P1-bug signal it is meant
+// to be, never silently treated as success.
+func replayIfAlreadyPosted(ctx context.Context, tx pgx.Tx, current Order, entryReq journal.EntryRequest) (Order, bool, error) {
+	if _, err := journal.GetEntryByIdempotencyKey(ctx, tx, entryReq.IdempotencyKey); err != nil {
+		if errors.Is(err, journal.ErrEntryNotFound) {
+			return Order{}, false, nil
+		}
+		return Order{}, false, fmt.Errorf("orders: checking for an already-posted entry %q: %w", entryReq.IdempotencyKey, err)
+	}
+
+	if _, err := journal.Post(ctx, tx, entryReq); err != nil {
+		return Order{}, false, fmt.Errorf("orders: replaying entry %q: %w", entryReq.IdempotencyKey, err)
+	}
+	return current, true, nil
 }
 
 const orderSelectSQL = `

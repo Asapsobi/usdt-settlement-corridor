@@ -162,6 +162,97 @@ func TestReorgOnFreshQuotedOrder_StillErrors(t *testing.T) {
 	require.Contains(t, err.Error(), string(orders.Quoted))
 }
 
+// TestTransition_ReplayAfterAlreadyFunded_IsIdempotent covers the C2.7
+// gap found while building C2's ReportDepositFinal against a real
+// running ledgerd: a redelivered "fund this order" request -- the exact
+// shape a C2 restart re-observing an already-final on-chain deposit
+// produces, since C2's own finality.Tracker keeps no persistent record
+// of what it already reported -- must succeed as a no-op, not
+// ErrIllegalTransition (Funded -> Funded is not a legal transitionTable
+// pair, so before this fix it fell straight through to that error).
+func TestTransition_ReplayAfterAlreadyFunded_IsIdempotent(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order, _, depositKey := depositedOrder(t, ctx, pool)
+	require.Equal(t, orders.Funded, order.State)
+
+	original, err := journal.GetEntryByKey(ctx, pool, depositKey)
+	require.NoError(t, err)
+	lines := make([]journal.Line, len(original.Lines))
+	for i, l := range original.Lines {
+		lines[i] = journal.Line{AccountCode: l.AccountCode, Amount: l.Amount}
+	}
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	balanceBefore, err := journal.Balance(ctx, pool, depositAcc)
+	require.NoError(t, err)
+
+	// The redelivered request: same idempotency key, same entry_type,
+	// order_id, lines, and occurred_at (canonicalHash's exact inputs) --
+	// actor and the transition's own reason may differ, since neither is
+	// part of the entry's payload hash.
+	var replay orders.Order
+	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		replay, err = orders.Transition(ctx, tx, order.ID, orders.Funded, order.Version, orders.TransitionParams{
+			Actor: "test:watcher-restart", Reason: "redelivered deposit_final report", OccurredAt: time.Now(),
+			Entry: &journal.EntryRequest{
+				IdempotencyKey: depositKey,
+				EntryType:      original.EntryType,
+				Actor:          "test:watcher-restart",
+				OccurredAt:     original.OccurredAt,
+				OrderID:        &order.ID,
+				Lines:          lines,
+			},
+		})
+		return err
+	})
+	require.NoError(t, err, "a redelivered fund request must succeed as a no-op replay")
+	require.Equal(t, orders.Funded, replay.State)
+	require.Equal(t, order.Version, replay.Version, "a replay must not bump the version")
+
+	balanceAfter, err := journal.Balance(ctx, pool, depositAcc)
+	require.NoError(t, err)
+	require.Equal(t, balanceBefore.Units, balanceAfter.Units, "a replay must not double-credit")
+}
+
+// TestTransition_SameStateNewEntry_StillIllegal guards the narrowness of
+// that fix: a BRAND NEW idempotency key naming the order's current state
+// must still be rejected outright, never silently posted through this
+// path -- replayIfAlreadyPosted only ever acts on a key that already
+// exists.
+func TestTransition_SameStateNewEntry_StillIllegal(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order, custBEP, _ := depositedOrder(t, ctx, pool)
+	require.Equal(t, orders.Funded, order.State)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	newKey := fmt.Sprintf("test:brand-new-key:%s:%d", runID, order.ID)
+
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := orders.Transition(ctx, tx, order.ID, orders.Funded, order.Version, orders.TransitionParams{
+			Actor: "test", Reason: "should be rejected", OccurredAt: time.Now(),
+			Entry: &journal.EntryRequest{
+				IdempotencyKey: newKey,
+				EntryType:      "deposit_final",
+				Actor:          "test",
+				OccurredAt:     time.Now(),
+				OrderID:        &order.ID,
+				Lines: []journal.Line{
+					{AccountCode: depositAcc, Amount: order.AmountIn},
+					{AccountCode: custBEP, Amount: money.Amount{Asset: order.AmountIn.Asset, Units: -order.AmountIn.Units}},
+				},
+			},
+		})
+		return err
+	})
+	require.ErrorIs(t, err, orders.ErrIllegalTransition)
+
+	_, err = journal.GetEntryByKey(ctx, pool, newKey)
+	require.ErrorIs(t, err, journal.ErrEntryNotFound, "a brand-new key must never get posted through the same-state replay path")
+}
+
 // advanceDepositedOrderTo walks an already-Funded, already-deposited
 // order the rest of the way to target (Screened, Dispatching, or
 // Settled), posting the real E2/E3 entries the §B worked example uses,
