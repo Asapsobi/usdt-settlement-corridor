@@ -1,0 +1,304 @@
+openapi: 3.1.0
+info:
+  title: C2 Deposit Watcher API
+  version: "1.0.0"
+  description: >
+    Service-to-service HTTP boundary for C2, the deposit watcher. No
+    customer-facing auth and no per-customer scoping -- C6 owns that, the
+    same posture as C1's ledger core API. Every write handler requires an
+    Idempotency-Key header. Every amount is a decimal string, never a
+    JSON number.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Process is up.
+
+  /readyz:
+    get:
+      summary: Readiness check (process up AND database reachable)
+      security: []
+      responses:
+        "200":
+          description: Ready to serve.
+        "503":
+          description: Not ready (database unreachable).
+
+  /metrics:
+    get:
+      summary: Prometheus exposition format
+      security: []
+      responses:
+        "200":
+          description: >
+            watcher_candidates_detected_total,
+            watcher_candidates_finalized_total,
+            watcher_reports_to_ledger_total{code},
+            watcher_orphaned_deposits_total,
+            watcher_provider_agreement_failures_total,
+            watcher_cursor_lag_blocks, plus standard Go/process metrics.
+
+  /v1/addresses:
+    post:
+      summary: Assign a deposit address to an order
+      description: >
+        Idempotent on order_id: calling twice with the same order_id
+        returns 200 both times with the identical address, never 201 then
+        200 -- a first-time assignment and a replay of one are not
+        distinguishable by status code here, unlike C1's Created-vs-
+        Replayed journal entries.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostAddressRequest"
+      responses:
+        "200":
+          description: The assigned (or previously assigned) address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Address" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/addresses/{order_id}:
+    get:
+      summary: Look up the address assigned to an order
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: The watched address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Address" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/addresses/{order_id}/retire:
+    post:
+      summary: Retire an order's watched address
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: The retired address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Address" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/orphaned-deposits:
+    get:
+      summary: List orphaned deposits (gap #3's capture-and-surface mechanism)
+      description: >
+        A deposit that finalized on-chain for an order C1 no longer
+        considers open. This endpoint never decides what to do about one
+        -- it exists purely for operator visibility and manual
+        reconciliation.
+      parameters:
+        - name: resolved
+          in: query
+          required: false
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: Orphaned deposits, most recently detected first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deposits:
+                    type: array
+                    items: { $ref: "#/components/schemas/OrphanedDeposit" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/orphaned-deposits/{id}/resolve:
+    post:
+      summary: Record how an orphaned deposit was resolved
+      description: >
+        resolved_by is the authenticated actor (the bearer token), never
+        a request body field -- this system's actor convention
+        everywhere else. Fails 409 already_resolved rather than silently
+        overwriting a prior resolution.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution]
+              properties:
+                resolution: { type: string }
+      responses:
+        "200":
+          description: The resolved deposit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrphanedDeposit" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/system/providers:
+    get:
+      summary: Per-provider RPC health
+      responses:
+        "200":
+          description: Provider health snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderHealth" }
+        "503":
+          description: No RPC provider pool is configured on this instance.
+
+  /v1/system/invariants:
+    get:
+      summary: Cursor lag, pending-finality count, oldest pending candidate age
+      description: >
+        Each field is independently omitted, not a 503 for the whole
+        endpoint, if its own source isn't configured on this instance.
+      responses:
+        "200":
+          description: Current invariant readings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invariants" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Service-to-service only. One token per service identity; the
+        token maps to the actor recorded on every write. Designed so mTLS
+        could replace this without touching any handler.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    OrderID:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+  responses:
+    BadRequest:
+      description: invalid_request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: order_not_found or orphaned_deposit_not_found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: illegal_transition or already_resolved.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    PostAddressRequest:
+      type: object
+      required: [order_id, external_id, customer_id, quoted_at, quote_expires_at]
+      properties:
+        order_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        customer_id: { type: string }
+        quoted_at: { type: string, format: date-time }
+        quote_expires_at: { type: string, format: date-time }
+
+    Address:
+      type: object
+      properties:
+        address: { type: string }
+        order_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        customer_id: { type: string }
+        status: { type: string, enum: [WATCHING, FUNDED, RETIRED] }
+        quoted_at: { type: string, format: date-time }
+        quote_expires_at: { type: string, format: date-time }
+        assigned_at: { type: string, format: date-time }
+        retired_at: { type: string, format: date-time }
+        retired_reason: { type: string }
+
+    OrphanedDeposit:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        order_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        tx_hash: { type: string }
+        log_index: { type: integer }
+        amount: { type: string, description: Decimal string, never a JSON number. }
+        detected_at: { type: string, format: date-time }
+        order_state_at_detection: { type: string }
+        resolution: { type: string }
+        resolved_at: { type: string, format: date-time }
+        resolved_by: { type: string }
+
+    ProviderHealth:
+      type: object
+      properties:
+        name: { type: string }
+        healthy: { type: boolean }
+        consecutive_failures: { type: integer }
+        total_rounds: { type: integer }
+        total_failures: { type: integer }
+        last_error: { type: string }
+
+    Invariants:
+      type: object
+      properties:
+        cursor_lag_blocks: { type: integer, format: int64 }
+        pending_finality_count: { type: integer }
+        oldest_pending_candidate_age_seconds: { type: number }

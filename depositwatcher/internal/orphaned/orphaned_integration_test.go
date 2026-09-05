@@ -7,6 +7,8 @@ package orphaned_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,13 +70,13 @@ func sampleDeposit(txHash string) orphaned.Deposit {
 func TestRecord_AndList(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	txHash := "0xtest-record-and-list"
+	txHash := fmt.Sprintf("0xtest-record-and-list-%d", time.Now().UnixNano())
 
 	if err := orphaned.Record(ctx, pool, sampleDeposit(txHash)); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
-	deposits, err := orphaned.List(ctx, pool)
+	deposits, err := orphaned.List(ctx, pool, nil)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -100,7 +102,7 @@ func TestRecord_AndList(t *testing.T) {
 func TestRecord_IdempotentOnTxHashAndLogIndex(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	txHash := "0xtest-idempotent-record"
+	txHash := fmt.Sprintf("0xtest-idempotent-record-%d", time.Now().UnixNano())
 	deposit := sampleDeposit(txHash)
 
 	if err := orphaned.Record(ctx, pool, deposit); err != nil {
@@ -110,7 +112,7 @@ func TestRecord_IdempotentOnTxHashAndLogIndex(t *testing.T) {
 		t.Fatalf("Record (duplicate): %v", err)
 	}
 
-	deposits, err := orphaned.List(ctx, pool)
+	deposits, err := orphaned.List(ctx, pool, nil)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -122,5 +124,119 @@ func TestRecord_IdempotentOnTxHashAndLogIndex(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("got %d rows for a duplicate-recorded (tx_hash, log_index), want exactly 1", count)
+	}
+}
+
+func TestGet_NotFound(t *testing.T) {
+	pool := testPool(t)
+	_, err := orphaned.Get(context.Background(), pool, -1)
+	if !errors.Is(err, orphaned.ErrNotFound) {
+		t.Fatalf("Get(-1): got %v, want ErrNotFound", err)
+	}
+}
+
+func TestResolve_SetsResolutionAndResolvedBy(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	txHash := fmt.Sprintf("0xtest-resolve-%d", time.Now().UnixNano())
+	if err := orphaned.Record(ctx, pool, sampleDeposit(txHash)); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	deposits, err := orphaned.List(ctx, pool, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var id int64
+	for _, d := range deposits {
+		if d.TxHash == txHash {
+			id = d.ID
+		}
+	}
+	if id == 0 {
+		t.Fatal("setup: could not find the recorded deposit's id")
+	}
+
+	resolved, err := orphaned.Resolve(ctx, pool, id, "manually refunded off-chain", "operator:alice")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Resolution == nil || *resolved.Resolution != "manually refunded off-chain" {
+		t.Fatalf("Resolve: Resolution = %v, want set", resolved.Resolution)
+	}
+	if resolved.ResolvedBy == nil || *resolved.ResolvedBy != "operator:alice" {
+		t.Fatalf("Resolve: ResolvedBy = %v, want operator:alice", resolved.ResolvedBy)
+	}
+	if resolved.ResolvedAt == nil {
+		t.Fatal("Resolve: ResolvedAt is nil, want set")
+	}
+
+	// A second resolve must not silently overwrite the first.
+	_, err = orphaned.Resolve(ctx, pool, id, "a different resolution", "operator:bob")
+	if !errors.Is(err, orphaned.ErrAlreadyResolved) {
+		t.Fatalf("Resolve (second attempt): got %v, want ErrAlreadyResolved", err)
+	}
+}
+
+func TestResolve_NotFound(t *testing.T) {
+	pool := testPool(t)
+	_, err := orphaned.Resolve(context.Background(), pool, -1, "resolution", "operator:alice")
+	if !errors.Is(err, orphaned.ErrNotFound) {
+		t.Fatalf("Resolve(-1): got %v, want ErrNotFound", err)
+	}
+}
+
+func TestList_FiltersByResolved(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resolvedTxHash := fmt.Sprintf("0xtest-list-filter-resolved-%d", time.Now().UnixNano())
+	unresolvedTxHash := fmt.Sprintf("0xtest-list-filter-unresolved-%d", time.Now().UnixNano())
+
+	if err := orphaned.Record(ctx, pool, sampleDeposit(resolvedTxHash)); err != nil {
+		t.Fatalf("Record (resolved fixture): %v", err)
+	}
+	if err := orphaned.Record(ctx, pool, sampleDeposit(unresolvedTxHash)); err != nil {
+		t.Fatalf("Record (unresolved fixture): %v", err)
+	}
+	all, err := orphaned.List(ctx, pool, nil)
+	if err != nil {
+		t.Fatalf("List(nil): %v", err)
+	}
+	var resolvedID int64
+	for _, d := range all {
+		if d.TxHash == resolvedTxHash {
+			resolvedID = d.ID
+		}
+	}
+	if _, err := orphaned.Resolve(ctx, pool, resolvedID, "resolved for this test", "operator:alice"); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	resolvedOnly := true
+	resolvedList, err := orphaned.List(ctx, pool, &resolvedOnly)
+	if err != nil {
+		t.Fatalf("List(resolved=true): %v", err)
+	}
+	assertContainsTxHash(t, resolvedList, resolvedTxHash, true)
+	assertContainsTxHash(t, resolvedList, unresolvedTxHash, false)
+
+	unresolvedOnly := false
+	unresolvedList, err := orphaned.List(ctx, pool, &unresolvedOnly)
+	if err != nil {
+		t.Fatalf("List(resolved=false): %v", err)
+	}
+	assertContainsTxHash(t, unresolvedList, resolvedTxHash, false)
+	assertContainsTxHash(t, unresolvedList, unresolvedTxHash, true)
+}
+
+func assertContainsTxHash(t *testing.T, deposits []orphaned.Deposit, txHash string, want bool) {
+	t.Helper()
+	got := false
+	for _, d := range deposits {
+		if d.TxHash == txHash {
+			got = true
+		}
+	}
+	if got != want {
+		t.Errorf("txHash %s present in list = %v, want %v", txHash, got, want)
 	}
 }

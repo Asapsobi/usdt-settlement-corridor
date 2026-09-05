@@ -18,3 +18,10 @@ func getLastScanned(ctx context.Context, q db.Queryer) (uint64, error) {
 	}
 	return uint64(last), nil
 }
+
+// LastScannedHeight is getLastScanned, exported for operator visibility
+// (C2.9's GET /system/invariants, "cursor lag") -- the ingestion loop
+// itself only ever needs the unexported form.
+func LastScannedHeight(ctx context.Context, q db.Queryer) (uint64, error) {
+	return getLastScanned(ctx, q)
+}

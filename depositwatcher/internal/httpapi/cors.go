@@ -1,0 +1,26 @@
+package httpapi
+
+import "net/http"
+
+// corsMiddleware lets this API be called directly from a browser -- an
+// operator-facing tool pointed at a local watcherd. It changes nothing
+// about who's allowed to write: the bearer token remains the only thing
+// that authorizes a request, and CORS only controls whether a browser is
+// permitted to read a cross-origin response. Wildcarding
+// Access-Control-Allow-Origin is safe specifically because auth here is
+// a header the caller's own JS sets explicitly (Authorization: Bearer
+// ...), never a cookie the browser attaches on its own -- there's no
+// ambient credential for a permissive origin to leak. Same reasoning as
+// C1's own corsMiddleware.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

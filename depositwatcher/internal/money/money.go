@@ -10,10 +10,16 @@
 package money
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
+	"strings"
 )
+
+// ErrInvalidDecimal is returned by ParseDecimal for anything that isn't a
+// plain decimal string within this package's own precision.
+var ErrInvalidDecimal = errors.New("money: invalid decimal string")
 
 // Decimals is this service's minor-unit precision for USDT_BEP20, matching
 // C1's money.Asset.Decimals() for that asset exactly. It is NOT the token
@@ -58,6 +64,73 @@ func FromOnChainUnits(raw *big.Int, onChainDecimals int) (Amount, error) {
 		return 0, fmt.Errorf("money: on-chain amount %s overflows int64 minor units", raw)
 	}
 	return Amount(scaled.Int64()), nil
+}
+
+// ParseDecimal parses a plain decimal string ("3000.000000", "-0.5", "12")
+// into an Amount, the inverse of Format. This exists for the candidate
+// pipeline (C2.10): the ONE place this service ever needs the quoted
+// amount_in it did not derive itself is C1's own order record (GET
+// /v1/orders/{external_id}), which returns it as exactly this shape --
+// never rounds, never a float at any point. A string with more
+// fractional digits than Decimals is rejected outright, matching C1's
+// own money.ParseDecimal's discipline exactly (mirrored, not shared:
+// this is a different module).
+func ParseDecimal(s string) (Amount, error) {
+	if s == "" {
+		return 0, fmt.Errorf("%w: empty string", ErrInvalidDecimal)
+	}
+
+	neg := false
+	rest := s
+	switch rest[0] {
+	case '-':
+		neg = true
+		rest = rest[1:]
+	case '+':
+		rest = rest[1:]
+	}
+	if rest == "" {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidDecimal, s)
+	}
+
+	intPart, fracPart, hasDot := strings.Cut(rest, ".")
+	if hasDot && strings.Contains(fracPart, ".") {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidDecimal, s)
+	}
+	if intPart == "" && fracPart == "" {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidDecimal, s)
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	if !isDigits(intPart) || (fracPart != "" && !isDigits(fracPart)) {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidDecimal, s)
+	}
+	if len(fracPart) > Decimals {
+		return 0, fmt.Errorf("%w: %q has more than %d decimal places", ErrInvalidDecimal, s, Decimals)
+	}
+
+	digits := intPart + fracPart + strings.Repeat("0", Decimals-len(fracPart))
+	units, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %q: %v", ErrInvalidDecimal, s, err)
+	}
+	if neg {
+		units = -units
+	}
+	return Amount(units), nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Format renders a as a plain decimal string with exactly Decimals

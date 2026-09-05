@@ -177,12 +177,39 @@ type Config struct {
 	ReorgReporter           ReorgReporter
 	OrphanedDepositRecorder OrphanedDepositRecorder
 
+	// Metrics is optional -- nil means no metrics are recorded, never a
+	// panic. C2.9's httpapi.Metrics implements this to drive
+	// candidates_detected_total/candidates_finalized_total.
+	Metrics MetricsRecorder
+
 	// StalePendingCeiling defaults to DefaultStalePendingCeiling if <= 0.
 	StalePendingCeiling time.Duration
 
 	// Now defaults to time.Now; overridable so tests can drive the
 	// stale-pending ceiling without actually sleeping for it.
 	Now func() time.Time
+}
+
+// MetricsRecorder is how a Tracker reports the two counters C2.9's build
+// spec names that only this package ever knows the moment of: a
+// candidate becoming trackable, and one reaching finality. Behind an
+// interface, optional, for the same reason every other Config dependency
+// here is: testable without pulling in a metrics library for every run.
+type MetricsRecorder interface {
+	CandidateDetected()
+	CandidateFinalized()
+}
+
+func (t *Tracker) recordDetected() {
+	if t.cfg.Metrics != nil {
+		t.cfg.Metrics.CandidateDetected()
+	}
+}
+
+func (t *Tracker) recordFinalized() {
+	if t.cfg.Metrics != nil {
+		t.cfg.Metrics.CandidateFinalized()
+	}
 }
 
 // Tracker holds every deposit candidate observed but not yet finalized
@@ -263,6 +290,7 @@ func (t *Tracker) OnLogObserved(ctx context.Context, log ObservedLog, classifica
 		"order_id", log.OrderID, "amount", log.Amount, "classification", classification)
 
 	t.pending[key] = &Candidate{ObservedLog: log, Classification: classification, DetectedAt: t.cfg.Now()}
+	t.recordDetected()
 	return nil
 }
 
@@ -412,6 +440,7 @@ func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
 	t.finalized[key] = c
 	delete(t.pending, key)
 	t.mu.Unlock()
+	t.recordFinalized()
 }
 
 // HandleUnreportable records c as an orphaned deposit (C2.8's mechanism
@@ -528,4 +557,22 @@ func (t *Tracker) FinalizedCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.finalized)
+}
+
+// OldestPendingDetectedAt returns the DetectedAt of the longest-pending
+// candidate, for operator visibility (C2.9's GET /system/invariants,
+// "oldest pending candidate age") -- computing the age itself from that
+// timestamp is the caller's job, against its own clock, not this
+// package's Config.Now (which exists for testability, not for serving
+// operator-facing wall-clock reads).
+func (t *Tracker) OldestPendingDetectedAt() (detectedAt time.Time, found bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, c := range t.pending {
+		if !found || c.DetectedAt.Before(detectedAt) {
+			detectedAt = c.DetectedAt
+			found = true
+		}
+	}
+	return detectedAt, found
 }

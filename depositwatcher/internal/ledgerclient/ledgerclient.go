@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"depositwatcher/internal/finality"
+	"depositwatcher/internal/money"
 )
 
 // Client calls one C1 (ledger) instance, authenticating with a single
@@ -25,6 +26,26 @@ type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+
+	// Metrics is optional -- nil means no metrics are recorded, never a
+	// panic. Set directly after New; C2.9's httpapi.Metrics implements
+	// this to drive reports_to_ledger_total{code}.
+	Metrics MetricsRecorder
+}
+
+// MetricsRecorder is how ReportDepositFinal reports the one counter
+// C2.9's build spec names that only this call site knows the moment
+// of: the result code of a deposit-final report attempt. Behind an
+// interface, optional, for the same reason every other pluggable
+// dependency in this service is: testable without a metrics library.
+type MetricsRecorder interface {
+	ReportedToLedger(resultCode string)
+}
+
+func (c *Client) recordReport(resultCode string) {
+	if c.Metrics != nil {
+		c.Metrics.ReportedToLedger(resultCode)
+	}
 }
 
 // New returns a Client for baseURL (e.g. "http://localhost:8080"),
@@ -40,8 +61,28 @@ func New(baseURL, token string) *Client {
 // Order is the subset of C1's order resource this client actually reads.
 type Order struct {
 	ExternalID string `json:"external_id"`
+	CustomerID string `json:"customer_id"`
 	State      string `json:"state"`
+	AmountIn   string `json:"amount_in"` // decimal string, always USDT_BEP20 -- see money.ParseDecimal
 	Version    int32  `json:"version"`
+}
+
+// QuotedAmount returns externalID's order's quoted amount_in as this
+// service's own money.Amount -- the one fact the candidate pipeline
+// (C2.10) needs from C1 that it has no local copy of, since C2.1's
+// watched_addresses deliberately stores no amount at all ("no ledger of
+// money," per the build spec). Parsed via money.ParseDecimal, never a
+// float at any point between C1's response and classification.
+func (c *Client) QuotedAmount(ctx context.Context, externalID string) (money.Amount, error) {
+	order, err := c.GetOrder(ctx, externalID)
+	if err != nil {
+		return 0, fmt.Errorf("ledgerclient: quoted amount for %s: %w", externalID, err)
+	}
+	amount, err := money.ParseDecimal(order.AmountIn)
+	if err != nil {
+		return 0, fmt.Errorf("ledgerclient: quoted amount for %s: parsing %q: %w", externalID, order.AmountIn, err)
+	}
+	return amount, nil
 }
 
 type apiErrorBody struct {
@@ -230,6 +271,7 @@ func (c *Client) ReportDepositFinal(ctx context.Context, candidate finality.Cand
 func (c *Client) reportDepositFinal(ctx context.Context, candidate finality.Candidate, allowVersionRetry bool) error {
 	order, err := c.GetOrder(ctx, candidate.ExternalID)
 	if err != nil {
+		c.recordReport("get_order_failed")
 		return fmt.Errorf("ledgerclient: deposit_final for %s: fetching current version: %w", candidate.ExternalID, err)
 	}
 
@@ -256,13 +298,16 @@ func (c *Client) reportDepositFinal(ctx context.Context, candidate finality.Cand
 	status, body, err := c.do(ctx, http.MethodPost,
 		fmt.Sprintf("/v1/orders/%s/transitions", candidate.ExternalID), idempotencyKey, reqBody)
 	if err != nil {
+		c.recordReport("network_error")
 		return fmt.Errorf("ledgerclient: deposit_final for %s: %w", candidate.ExternalID, err)
 	}
 	if status == http.StatusOK {
+		c.recordReport("ok")
 		return nil
 	}
 
 	apiErr := decodeAPIError(status, body)
+	c.recordReport(apiErr.Code)
 	switch apiErr.Code {
 	case "version_conflict":
 		if !allowVersionRetry {

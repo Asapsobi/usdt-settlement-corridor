@@ -1,21 +1,31 @@
-// Command watcherd serves C2, the deposit watcher. This chunk (C2.0) only
-// proves the scaffold: it connects to its own database and serves a
-// health check. No chain access, no address assignment, no HTTP boundary
-// beyond /healthz -- those are later chunks.
+// Command watcherd serves C2, the deposit watcher, over HTTP.
+//
+// This wires up the HTTP boundary (C2.9) and address derivation (C2.0)
+// against a real database. It does NOT yet start the chain-ingestion
+// loop or the finality ticker (C2.3/C2.5) -- those need RPC provider
+// URLs, a ledgerclient base URL/token, and the USDT BEP20 contract
+// address/topic, none of which this codebase has an env-driven config
+// step for yet. Server.ChainPool and Server.Tracker are left nil:
+// GET /system/providers and the chain-derived fields of
+// GET /system/invariants degrade explicitly (see httpapi.Server's own
+// doc comment) rather than this command inventing that wiring
+// speculatively. Wiring the full engine in is a distinct, later step.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
+	"depositwatcher/internal/addresses"
 	"depositwatcher/internal/db"
+	"depositwatcher/internal/httpapi"
 )
 
 func main() {
@@ -42,12 +52,28 @@ func run() error {
 	}
 	defer pool.Close()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthzHandler(pool))
+	xpub := os.Getenv("WATCHER_XPUB")
+	if xpub == "" {
+		return errors.New("watcherd: WATCHER_XPUB is not set")
+	}
+	if err := addresses.Configure(xpub); err != nil {
+		return err
+	}
+
+	auth, err := httpapi.AuthConfigFromEnv()
+	if err != nil {
+		return err
+	}
+
+	router := httpapi.NewRouter(&httpapi.Server{
+		Pool:      pool,
+		Auth:      auth,
+		BuildInfo: buildInfo,
+	})
 
 	srv := &http.Server{
 		Addr:    listenAddr(),
-		Handler: mux,
+		Handler: router,
 	}
 
 	serveErr := make(chan error, 1)
@@ -74,33 +100,31 @@ func run() error {
 	return nil
 }
 
-type healthzResponse struct {
-	Status string `json:"status"`
-	DB     string `json:"db"`
-}
-
-// healthzHandler pings the database on every call rather than only at
-// startup -- a connection that was fine at boot and dies later (the
-// database restarts, a network partition) must be visible here, not
-// masked by a check that only ever ran once.
-func healthzHandler(pool *db.Pool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		resp := healthzResponse{Status: "ok", DB: "ok"}
-		status := http.StatusOK
-		if err := pool.Ping(r.Context()); err != nil {
-			resp.Status = "degraded"
-			resp.DB = "unreachable"
-			status = http.StatusServiceUnavailable
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(resp)
-	}
-}
-
 func listenAddr() string {
 	if addr := os.Getenv("WATCHER_LISTEN_ADDR"); addr != "" {
 		return addr
 	}
 	return ":8082"
+}
+
+// buildInfo reads module version and VCS revision from the binary's own
+// embedded build metadata rather than requiring -ldflags at build time.
+// Same implementation as C1's ledgerd -- duplicated rather than shared
+// because these are two separate modules with no common internal package
+// between them.
+func buildInfo() (version, commit string) {
+	version, commit = "unknown", "unknown"
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	if info.Main.Version != "" {
+		version = info.Main.Version
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			commit = s.Value
+		}
+	}
+	return
 }

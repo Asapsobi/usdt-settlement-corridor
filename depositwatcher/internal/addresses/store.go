@@ -27,6 +27,14 @@ const (
 var (
 	ErrOrderNotFound = errors.New("addresses: no watched address for that order")
 
+	// ErrAddressNotFound is GetByAddress's own not-found -- distinct from
+	// ErrOrderNotFound so a log line or error message naming "an address"
+	// never gets misreported as naming "an order," which have different
+	// callers and different meanings ("this order was never assigned an
+	// address" vs. "this on-chain address is not in our book at all,"
+	// e.g. a candidate pipeline's routine, expected chain noise).
+	ErrAddressNotFound = errors.New("addresses: no watched address with that address")
+
 	// ErrNotConfigured means Configure was never called. Assign fails
 	// closed rather than deriving against an empty or zero-value key --
 	// same reasoning as orders.ErrHaltCacheNotConfigured in the ledger: a
@@ -163,6 +171,23 @@ func GetByOrderID(ctx context.Context, q Queryer, orderID int64) (WatchedAddress
 	}
 	if err != nil {
 		return WatchedAddress{}, fmt.Errorf("addresses: get order %d: %w", orderID, err)
+	}
+	return wa, nil
+}
+
+// GetByAddress looks up the watched address row for addr itself -- what
+// the candidate pipeline needs to resolve an observed Transfer log's `to`
+// back to the order it belongs to (and whether that order's address is
+// still WATCHING/FUNDED, or RETIRED -- a late deposit, C2.8's job) before
+// it can do anything else with that log.
+func GetByAddress(ctx context.Context, q Queryer, addr Address) (WatchedAddress, error) {
+	row := q.QueryRow(ctx, selectSQL+` WHERE address = $1`, string(addr))
+	wa, err := scanWatchedAddress(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WatchedAddress{}, fmt.Errorf("%w: %s", ErrAddressNotFound, addr)
+	}
+	if err != nil {
+		return WatchedAddress{}, fmt.Errorf("addresses: get address %s: %w", addr, err)
 	}
 	return wa, nil
 }
