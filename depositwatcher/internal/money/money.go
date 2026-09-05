@@ -1,0 +1,60 @@
+// Package money is depositwatcher's minimal money primitive. This service
+// only ever handles one asset -- USDT_BEP20, watched deposits into it, never
+// anything else -- so unlike C1's own money.Amount (ledger/internal/money),
+// there is no Asset field here: tracking a field that can only ever hold one
+// value would be dead weight, not symmetry with C1. What this package does
+// keep identical to C1's is the representation itself: signed minor units in
+// an int64, never a float, per the C2 build spec's own instruction ("C2's
+// own money type should therefore be the same int64 minor-units
+// representation C1 uses internally").
+package money
+
+import (
+	"fmt"
+	"math/big"
+)
+
+// Decimals is this service's minor-unit precision for USDT_BEP20, matching
+// C1's money.Asset.Decimals() for that asset exactly. It is NOT the token
+// contract's own on-chain decimals -- see chain.ParseTransferLog, which is
+// where that distinction actually matters and is verified.
+const Decimals = 6
+
+// Amount is a quantity of USDT_BEP20 in the ledger's minor units (see
+// Decimals): Amount(1) is one millionth of one USDT, Amount(1_000000) is
+// 1.000000 USDT.
+type Amount int64
+
+// FromOnChainUnits converts raw -- an amount already known to be expressed
+// in onChainDecimals fractional digits -- into this package's Decimals-place
+// minor-unit convention. raw must be non-negative (an ERC20 Transfer's
+// amount is a uint256; a caller passing anything else has a bug upstream)
+// and onChainDecimals must be at least Decimals.
+//
+// Fractional precision below Decimals is truncated, never rounded, and
+// truncating all the way down to zero is not an error: a real, nonzero
+// on-chain transfer legitimately can be too small to represent at the
+// ledger's precision, and that is exactly the case classification's
+// ZeroValue/Dust outcomes exist to name rather than silently discard as a
+// bug. What IS an error is a value that, even after truncation, does not
+// fit in an int64 -- returned rather than silently wrapped, the same
+// discipline C1's own money package uses for overflow.
+func FromOnChainUnits(raw *big.Int, onChainDecimals int) (Amount, error) {
+	if raw == nil {
+		return 0, fmt.Errorf("money: nil raw amount")
+	}
+	if raw.Sign() < 0 {
+		return 0, fmt.Errorf("money: negative on-chain amount %s", raw)
+	}
+	if onChainDecimals < Decimals {
+		return 0, fmt.Errorf("money: onChainDecimals %d is finer than this package's own %d-decimal floor",
+			onChainDecimals, Decimals)
+	}
+
+	divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(onChainDecimals-Decimals)), nil)
+	scaled := new(big.Int).Quo(raw, divisor)
+	if !scaled.IsInt64() {
+		return 0, fmt.Errorf("money: on-chain amount %s overflows int64 minor units", raw)
+	}
+	return Amount(scaled.Int64()), nil
+}

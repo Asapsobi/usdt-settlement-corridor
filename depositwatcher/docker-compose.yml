@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: watcher
+      POSTGRES_PASSWORD: watcher
+      POSTGRES_DB: watcher_dev
+    ports:
+      - "5433:5432" # distinct from ledger's docker-compose (5432), so both can run together
+    volumes:
+      - watcher_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watcher -d watcher_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  watcher_pgdata:

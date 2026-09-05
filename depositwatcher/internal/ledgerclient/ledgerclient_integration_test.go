@@ -1,0 +1,479 @@
+//go:build integration
+
+// Requires a real, reachable Postgres 16 instance (LEDGER_TEST_DATABASE_URL)
+// AND a sibling checkout of the ledger module at ../../../ledger -- the
+// same usdt-settlement-corridor layout this whole project already uses.
+// This builds and runs the REAL ledgerd binary as a subprocess and drives
+// it purely over HTTP, exactly as the C2.6 build spec demands ("against a
+// real running C1 instance... confirming C1's actual response... not a
+// mock of it") -- not go-ethereum's testcontainers-go dependency (this
+// environment has no Docker), and not a call into ledger's own internal
+// Go packages (blocked anyway: they're a different module's internal/
+// tree). Run via `make test-integration` (build tag "integration").
+package ledgerclient_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"depositwatcher/internal/finality"
+	"depositwatcher/internal/ledgerclient"
+)
+
+const (
+	ledgerListenAddr = ":18435"
+	ledgerBaseURL    = "http://localhost:18435"
+	ledgerAPIToken   = "c26-integration-test-token"
+	ledgerActor      = "watcher" // must match the actor half of LEDGER_API_TOKENS below
+)
+
+// liveLedger is a real ledgerd process, built and started fresh for this
+// test file, plus a raw SQL connection to the same database used ONLY
+// for account-creation fixture setup -- there is no public HTTP endpoint
+// for creating an account (C1's own chart of accounts is either seeded
+// at boot or created via the internal accounts.Create Go function; C2
+// never gets to call that), so this mirrors accounts.Create's own INSERT
+// exactly, as test scaffolding, never as a claim that C2 itself can or
+// should write to C1's database directly.
+type liveLedger struct {
+	t    *testing.T
+	pool *pgxpool.Pool
+}
+
+func startLiveLedger(t *testing.T) *liveLedger {
+	t.Helper()
+	dbURL := os.Getenv("LEDGER_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("LEDGER_TEST_DATABASE_URL not set; skipping integration test")
+	}
+
+	ledgerRoot, err := filepath.Abs(filepath.Join("..", "..", "..", "ledger"))
+	if err != nil {
+		t.Fatalf("resolving ledger module path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ledgerRoot, "go.mod")); err != nil {
+		t.Skipf("no sibling ledger module found at %s; skipping (expects the usdt-settlement-corridor layout)", ledgerRoot)
+	}
+
+	tmpDir := t.TempDir()
+	migrateBin := filepath.Join(tmpDir, "migrate_bin")
+	ledgerdBin := filepath.Join(tmpDir, "ledgerd_bin")
+
+	build := func(out, pkg string) {
+		cmd := exec.Command("go", "build", "-o", out, pkg)
+		cmd.Dir = ledgerRoot
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("building %s: %v\n%s", pkg, err, output)
+		}
+	}
+	build(migrateBin, "./cmd/migrate")
+	build(ledgerdBin, "./cmd/ledgerd")
+
+	migrate := exec.Command(migrateBin, "up")
+	migrate.Dir = ledgerRoot // goose.Up uses a relative "migrations" path, resolved against the process's cwd
+	migrate.Env = append(os.Environ(), "LEDGER_DATABASE_URL="+dbURL)
+	if output, err := migrate.CombinedOutput(); err != nil {
+		t.Fatalf("running ledger migrations: %v\n%s", err, output)
+	}
+
+	pool, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("connecting to ledger test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	ledgerd := exec.Command(ledgerdBin)
+	ledgerd.Dir = ledgerRoot
+	ledgerd.Env = append(os.Environ(),
+		"LEDGER_DATABASE_URL="+dbURL,
+		"LEDGER_API_TOKENS="+ledgerAPIToken+":"+ledgerActor,
+		"LEDGER_LISTEN_ADDR="+ledgerListenAddr,
+	)
+	// Surface ledgerd's own logs on test failure -- invaluable for
+	// diagnosing a scenario-B halt or a rejected transition without
+	// re-running under a debugger.
+	var logs bytes.Buffer
+	ledgerd.Stdout = &logs
+	ledgerd.Stderr = &logs
+	if err := ledgerd.Start(); err != nil {
+		t.Fatalf("starting ledgerd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ledgerd.Process.Kill()
+		_ = ledgerd.Wait()
+		if t.Failed() {
+			t.Logf("ledgerd output:\n%s", logs.String())
+		}
+	})
+
+	ll := &liveLedger{t: t, pool: pool}
+	ll.waitHealthy()
+	return ll
+}
+
+func (ll *liveLedger) waitHealthy() {
+	ll.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(ledgerBaseURL + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	ll.t.Fatalf("ledgerd never became healthy at %s within the deadline", ledgerBaseURL)
+}
+
+// createAccount mirrors accounts.Create's own INSERT exactly (see this
+// file's own top-of-file comment for why raw SQL, not the Go function,
+// is used here).
+func (ll *liveLedger) createAccount(code, accountType, asset string, normalSide int) {
+	ll.t.Helper()
+	_, err := ll.pool.Exec(context.Background(), `
+		INSERT INTO accounts (code, type, asset, normal_side)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (code) DO NOTHING
+	`, code, accountType, asset, normalSide)
+	if err != nil {
+		ll.t.Fatalf("creating fixture account %q: %v", code, err)
+	}
+}
+
+type orderResp struct {
+	ID         int64  `json:"id"`
+	ExternalID string `json:"external_id"`
+	State      string `json:"state"`
+	Version    int32  `json:"version"`
+}
+
+type haltResp struct {
+	Halted bool   `json:"halted"`
+	Reason string `json:"reason"`
+}
+
+func (ll *liveLedger) do(method, path string, idempotencyKey string, body any) (*http.Response, []byte) {
+	ll.t.Helper()
+	var reader *bytes.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			ll.t.Fatalf("encoding request body: %v", err)
+		}
+		reader = bytes.NewReader(b)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequest(method, ledgerBaseURL+path, reader)
+	if err != nil {
+		ll.t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ledgerAPIToken)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		ll.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		ll.t.Fatalf("%s %s: reading response body: %v", method, path, err)
+	}
+	return resp, respBody
+}
+
+func (ll *liveLedger) createOrder(externalID, customerID, amountIn, amountOut, fee, networkFee string) orderResp {
+	ll.t.Helper()
+	now := time.Now().UTC()
+	resp, body := ll.do(http.MethodPost, "/v1/orders", "create:"+externalID, map[string]any{
+		"external_id":       externalID,
+		"customer_id":       customerID,
+		"tier":              "STANDARD",
+		"amount_in":         amountIn,
+		"amount_out":        amountOut,
+		"fee_units":         fee,
+		"network_fee_units": networkFee,
+		"recipient_address": "T-recipient-" + externalID,
+		"quoted_at":         now,
+		"quote_expires_at":  now.Add(10 * time.Minute),
+	})
+	if resp.StatusCode != http.StatusCreated {
+		ll.t.Fatalf("POST /v1/orders for %s: status %d: %s", externalID, resp.StatusCode, body)
+	}
+	var o orderResp
+	if err := json.Unmarshal(body, &o); err != nil {
+		ll.t.Fatalf("decoding order response: %v: %s", err, body)
+	}
+	return o
+}
+
+func (ll *liveLedger) transition(externalID, idempotencyKey, toState string, expectedVersion int32, entry map[string]any) orderResp {
+	ll.t.Helper()
+	reqBody := map[string]any{
+		"to_state":         toState,
+		"expected_version": expectedVersion,
+		"reason":           "c2.6 integration test: " + toState,
+		"occurred_at":      time.Now().UTC(),
+	}
+	if entry != nil {
+		reqBody["entry"] = entry
+	}
+	resp, body := ll.do(http.MethodPost, fmt.Sprintf("/v1/orders/%s/transitions", externalID), idempotencyKey, reqBody)
+	if resp.StatusCode != http.StatusOK {
+		ll.t.Fatalf("POST /v1/orders/%s/transitions to %s: status %d: %s", externalID, toState, resp.StatusCode, body)
+	}
+	var o orderResp
+	if err := json.Unmarshal(body, &o); err != nil {
+		ll.t.Fatalf("decoding transition response: %v: %s", err, body)
+	}
+	return o
+}
+
+func (ll *liveLedger) getOrder(externalID string) orderResp {
+	ll.t.Helper()
+	resp, body := ll.do(http.MethodGet, "/v1/orders/"+externalID, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		ll.t.Fatalf("GET /v1/orders/%s: status %d: %s", externalID, resp.StatusCode, body)
+	}
+	var o orderResp
+	if err := json.Unmarshal(body, &o); err != nil {
+		ll.t.Fatalf("decoding order response: %v: %s", err, body)
+	}
+	return o
+}
+
+func (ll *liveLedger) getHalt() haltResp {
+	ll.t.Helper()
+	resp, body := ll.do(http.MethodGet, "/v1/system/halt", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		ll.t.Fatalf("GET /v1/system/halt: status %d: %s", resp.StatusCode, body)
+	}
+	var h haltResp
+	if err := json.Unmarshal(body, &h); err != nil {
+		ll.t.Fatalf("decoding halt response: %v: %s", err, body)
+	}
+	return h
+}
+
+func (ll *liveLedger) clearHalt(t *testing.T) {
+	t.Helper()
+	resp, body := ll.do(http.MethodPost, "/v1/system/halt", "clear:"+t.Name(), map[string]any{
+		"action": "clear", "note": "c2.6 integration test cleanup",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("clearing halt after %s: status %d: %s (may already be clear)", t.Name(), resp.StatusCode, body)
+	}
+}
+
+func (ll *liveLedger) accountBalance(code string) string {
+	ll.t.Helper()
+	resp, body := ll.do(http.MethodGet, "/v1/accounts/"+code+"/balance", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		ll.t.Fatalf("GET /v1/accounts/%s/balance: status %d: %s", code, resp.StatusCode, body)
+	}
+	var out struct {
+		Balance string `json:"balance"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		ll.t.Fatalf("decoding balance response: %v: %s", err, body)
+	}
+	return out.Balance
+}
+
+// ---------------------------------------------------------------------
+
+const (
+	testAmountIn   = "3000.000000" // baseAmounts() in ledger's own replay harness -- amountIn == amountOut+fee+networkFee, exactly
+	testAmountOut  = "2990.700000"
+	testFee        = "7.500000"
+	testNetworkFee = "1.800000"
+)
+
+// parseMinorUnits parses a plain 6-decimal amount string ("2990.700000",
+// "-7.500000") into an int64 count of minor units, without ever routing
+// through a float -- same discipline the ledger's own money package
+// uses, reimplemented minimally here since this is test-only code
+// checking a balance DELTA (expense:loss:reorg is a shared, persistent
+// account across every run against this test database, so its absolute
+// balance is never itself the right thing to assert on).
+func parseMinorUnits(t *testing.T, s string) int64 {
+	t.Helper()
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	intPart, fracPart, _ := strings.Cut(s, ".")
+	for len(fracPart) < 6 {
+		fracPart += "0"
+	}
+	v, err := strconv.ParseInt(intPart+fracPart, 10, 64)
+	if err != nil {
+		t.Fatalf("parsing decimal amount %q: %v", s, err)
+	}
+	if neg {
+		v = -v
+	}
+	return v
+}
+
+func TestReportReorg_ScenarioA_OrderReturnsToQuoted(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c26-scenario-a-" + fmt.Sprint(time.Now().UnixNano())
+
+	order := ll.createOrder(externalID, "cust-a", testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := fmt.Sprintf("liability:customer:%s:bep20", externalID)
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	txHash := "0x" + fmt.Sprintf("%064x", time.Now().UnixNano())
+	originalEntryKey := finality.DepositFinalIdempotencyKey(common.HexToHash(txHash), 0)
+
+	funded := ll.transition(externalID, originalEntryKey, "funded", order.Version, map[string]any{
+		"entry_type":  "deposit_final",
+		"occurred_at": time.Now().UTC(),
+		"lines": []map[string]any{
+			{"account_code": depositAcc, "asset": "USDT_BEP20", "amount": testAmountIn},
+			{"account_code": custBEP, "asset": "USDT_BEP20", "amount": "-" + testAmountIn},
+		},
+	})
+	if funded.State != "funded" {
+		t.Fatalf("order state after funding = %q, want funded", funded.State)
+	}
+
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportReorg(context.Background(), externalID, originalEntryKey); err != nil {
+		t.Fatalf("ReportReorg (first call): %v", err)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.State != "quoted" {
+		t.Fatalf("order state after scenario-A reorg = %q, want quoted", after.State)
+	}
+
+	// A retry (simulating a redelivered report) must succeed cleanly, not
+	// error C2-side. This exercises orders.HandleDepositReorg's own
+	// Quoted-state idempotency check (added to fix exactly this gap: an
+	// order sitting in Quoted from scenario A's own prior success used to
+	// fall through to ErrUnexpectedState instead of being recognized as
+	// an already-handled reorg -- see reorgRetryFromQuoted in
+	// ledger/internal/orders/reorg.go).
+	if err := client.ReportReorg(context.Background(), externalID, originalEntryKey); err != nil {
+		t.Fatalf("ReportReorg (retry, must be idempotent): %v", err)
+	}
+	afterRetry := ll.getOrder(externalID)
+	if afterRetry.State != "quoted" || afterRetry.Version != after.Version {
+		t.Fatalf("order after a retried scenario-A report = (state=%s, version=%d), want unchanged (state=quoted, version=%d)",
+			afterRetry.State, afterRetry.Version, after.Version)
+	}
+}
+
+func TestReportReorg_ScenarioB_LossBookedAndLedgerHalted(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c26-scenario-b-" + fmt.Sprint(time.Now().UnixNano())
+
+	order := ll.createOrder(externalID, "cust-b", testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := fmt.Sprintf("liability:customer:%s:bep20", externalID)
+	custTRC := fmt.Sprintf("liability:customer:%s:trc20", externalID)
+	slot := fmt.Sprintf("asset:tron:slot:%s", externalID)
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+	ll.createAccount(custTRC, "LIABILITY", "USDT_TRC20", -1)
+	ll.createAccount(slot, "ASSET", "USDT_TRC20", 1)
+
+	txHash := "0x" + fmt.Sprintf("%064x", time.Now().UnixNano())
+	originalEntryKey := finality.DepositFinalIdempotencyKey(common.HexToHash(txHash), 0)
+
+	funded := ll.transition(externalID, originalEntryKey, "funded", order.Version, map[string]any{
+		"entry_type":  "deposit_final",
+		"occurred_at": time.Now().UTC(),
+		"lines": []map[string]any{
+			{"account_code": depositAcc, "asset": "USDT_BEP20", "amount": testAmountIn},
+			{"account_code": custBEP, "asset": "USDT_BEP20", "amount": "-" + testAmountIn},
+		},
+	})
+
+	screened := ll.transition(externalID, "screen:"+externalID, "screened", funded.Version, nil)
+
+	dispatching := ll.transition(externalID, "dispatch:"+externalID, "dispatching", screened.Version, map[string]any{
+		"entry_type":  "conversion",
+		"occurred_at": time.Now().UTC(),
+		"lines": []map[string]any{
+			{"account_code": custBEP, "asset": "USDT_BEP20", "amount": testAmountIn},
+			{"account_code": "position:corridor:USDT_BEP20", "asset": "USDT_BEP20", "amount": "-" + testAmountIn},
+			{"account_code": "position:corridor:USDT_TRC20", "asset": "USDT_TRC20", "amount": testAmountIn},
+			{"account_code": custTRC, "asset": "USDT_TRC20", "amount": "-" + testAmountOut},
+			{"account_code": "revenue:fee", "asset": "USDT_TRC20", "amount": "-" + testFee},
+			{"account_code": "revenue:network_fee", "asset": "USDT_TRC20", "amount": "-" + testNetworkFee},
+		},
+	})
+
+	settled := ll.transition(externalID, "settle:"+externalID, "settled", dispatching.Version, map[string]any{
+		"entry_type":  "payout_settled",
+		"occurred_at": time.Now().UTC(),
+		"lines": []map[string]any{
+			{"account_code": custTRC, "asset": "USDT_TRC20", "amount": testAmountOut},
+			{"account_code": slot, "asset": "USDT_TRC20", "amount": "-" + testAmountOut},
+		},
+	})
+	if settled.State != "settled" {
+		t.Fatalf("order state after settling = %q, want settled", settled.State)
+	}
+
+	// expense:loss:reorg is a shared, pre-seeded account that persists
+	// across every run against this test database -- its absolute
+	// balance is never the right thing to assert on, only the delta this
+	// one reorg report adds to it.
+	lossBefore := parseMinorUnits(t, ll.accountBalance("expense:loss:reorg"))
+
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportReorg(context.Background(), externalID, originalEntryKey); err != nil {
+		t.Fatalf("ReportReorg (scenario B): %v", err)
+	}
+	t.Cleanup(func() { ll.clearHalt(t) })
+
+	after := ll.getOrder(externalID)
+	if after.State != "settled" {
+		t.Fatalf("order state after scenario-B reorg = %q, want unchanged (settled) -- the payout already left", after.State)
+	}
+
+	halt := ll.getHalt()
+	if !halt.Halted {
+		t.Fatal("expected the ledger to be halted after a scenario-B reorg, got halted=false")
+	}
+
+	lossAfter := parseMinorUnits(t, ll.accountBalance("expense:loss:reorg"))
+	wantDelta := parseMinorUnits(t, testAmountOut)
+	if gotDelta := lossAfter - lossBefore; gotDelta != wantDelta {
+		t.Fatalf("expense:loss:reorg grew by %d minor units, want exactly the reported amount_out (%d)", gotDelta, wantDelta)
+	}
+
+	// A retry must still hit already_reversed, not attempt a second loss.
+	if err := client.ReportReorg(context.Background(), externalID, originalEntryKey); err != nil {
+		t.Fatalf("ReportReorg (retry, must be idempotent): %v", err)
+	}
+	lossAfterRetry := parseMinorUnits(t, ll.accountBalance("expense:loss:reorg"))
+	if lossAfterRetry != lossAfter {
+		t.Fatalf("expense:loss:reorg balance changed after a retried report: %d -> %d minor units, want unchanged", lossAfter, lossAfterRetry)
+	}
+}
