@@ -71,3 +71,21 @@ func TestFromOnChainUnits_OverflowsInt64(t *testing.T) {
 		t.Fatal("expected an overflow error, got nil")
 	}
 }
+
+func TestAmount_Format(t *testing.T) {
+	tests := []struct {
+		amount Amount
+		want   string
+	}{
+		{3000_000000, "3000.000000"},
+		{-3000_000000, "-3000.000000"},
+		{1, "0.000001"},
+		{-1, "-0.000001"},
+		{0, "0.000000"},
+	}
+	for _, tc := range tests {
+		if got := tc.amount.Format(); got != tc.want {
+			t.Errorf("Amount(%d).Format() = %q, want %q", tc.amount, got, tc.want)
+		}
+	}
+}

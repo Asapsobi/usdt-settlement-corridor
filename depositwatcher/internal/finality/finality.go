@@ -24,6 +24,27 @@ import (
 	"depositwatcher/internal/money"
 )
 
+// ErrPermanentFailure is a sentinel a FinalHandler wraps its own error in
+// to mean "retrying this exact call can never succeed" -- C2.7's
+// ledgerclient.ReportDepositFinal wraps it for C1's illegal_transition
+// (the order left quoted before C2 got here -- C2.8's job, not a retry
+// case) and idempotency_conflict (a structural bug in this service's own
+// key construction, not a transient condition). finalize treats an error
+// wrapping this differently from any other FinalHandler failure: dropped
+// from tracking instead of retried next tick, since retrying a call that
+// cannot succeed only delays noticing it needs a person, not a retry.
+var ErrPermanentFailure = errors.New("finality: permanent failure, do not retry")
+
+// ErrOrphanedDeposit is the narrower of the two ErrPermanentFailure
+// cases (C2.7's illegal_transition specifically, wrapped alongside
+// ErrPermanentFailure, never alone): a deposit finalized on-chain for an
+// order C1 no longer considers open. finalize routes an error wrapping
+// this to HandleUnreportable (C2.8) instead of just logging and
+// dropping -- this is real customer money that needs a human, not a
+// structural bug in this service's own code (that's what
+// ErrPermanentFailure alone, without this, still means).
+var ErrOrphanedDeposit = errors.New("finality: order no longer open for this deposit")
+
 // DefaultStalePendingCeiling is the build spec's own example: "orders of
 // magnitude beyond the ~1s current expectation" for the finalized tag to
 // catch up to a candidate. Crossing it means the provider pool or the
@@ -126,6 +147,22 @@ type ReorgReporter interface {
 	ReportReorg(ctx context.Context, externalID, originalEntryKey string) error
 }
 
+// OrphanedDepositRecorder persists a deposit C1 no longer has an open
+// order for (C2.8's mechanism, gap #3's still-undecided policy) --
+// internal/orphaned.Record is the real store this backs onto. Behind an
+// interface for the same reason FinalHandler/ReorgReporter are:
+// testable without a live database for every run.
+//
+// This package has no way to learn the order's current state itself
+// (that requires a fresh C1 lookup, and finality deliberately never
+// imports ledgerclient) -- a real implementation is expected to fetch it
+// fresh at recording time (via GetOrder, best-effort, e.g. "unknown" if
+// even that fails) rather than trust anything cached from before c1Error
+// happened, which could already be stale by the time this runs.
+type OrphanedDepositRecorder interface {
+	RecordOrphanedDeposit(ctx context.Context, c Candidate, c1Error error) error
+}
+
 // Config controls a Tracker's chain-query target and alerting.
 type Config struct {
 	// ContractAddress and TransferTopic scope the re-verification LogsAt
@@ -135,9 +172,10 @@ type Config struct {
 	ContractAddress common.Address
 	TransferTopic   common.Hash
 
-	OnFinal        FinalHandler
-	OnStalePending StalePendingHandler // optional
-	ReorgReporter  ReorgReporter
+	OnFinal                 FinalHandler
+	OnStalePending          StalePendingHandler // optional
+	ReorgReporter           ReorgReporter
+	OrphanedDepositRecorder OrphanedDepositRecorder
 
 	// StalePendingCeiling defaults to DefaultStalePendingCeiling if <= 0.
 	StalePendingCeiling time.Duration
@@ -175,6 +213,9 @@ func New(cfg Config) (*Tracker, error) {
 	}
 	if cfg.ReorgReporter == nil {
 		return nil, errors.New("finality: Config.ReorgReporter must be set")
+	}
+	if cfg.OrphanedDepositRecorder == nil {
+		return nil, errors.New("finality: Config.OrphanedDepositRecorder must be set")
 	}
 	if cfg.StalePendingCeiling <= 0 {
 		cfg.StalePendingCeiling = DefaultStalePendingCeiling
@@ -333,16 +374,67 @@ func (t *Tracker) drop(key candidateKey) {
 }
 
 func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
+	key := c.key()
 	if err := t.cfg.OnFinal(ctx, *c); err != nil {
+		if errors.Is(err, ErrPermanentFailure) {
+			if errors.Is(err, ErrOrphanedDeposit) {
+				// Real customer money, an order C1 no longer has open
+				// for it: must be recorded, not merely logged, before
+				// this candidate is allowed to stop being tracked. If
+				// recording itself fails (e.g. a transient DB error),
+				// leave it pending -- retrying HandleUnreportable next
+				// tick is safe (Record is idempotent on tx_hash:log_index)
+				// and strictly better than losing track of an orphaned
+				// deposit because its OWN recording attempt happened to
+				// fail once.
+				if handleErr := t.HandleUnreportable(ctx, *c, err); handleErr != nil {
+					slog.Error("finality: HandleUnreportable failed, will retry next tick",
+						"tx_hash", c.TxHash, "log_index", c.LogIndex, "error", handleErr)
+					return
+				}
+			} else {
+				// A structural bug in this service's own code (e.g.
+				// idempotency_conflict), not a customer-money case --
+				// nothing to record, just needs a person to look at it.
+				slog.Error("finality: OnFinal permanently failed, dropping from tracking",
+					"tx_hash", c.TxHash, "log_index", c.LogIndex, "order_id", c.OrderID, "external_id", c.ExternalID, "error", err)
+			}
+			t.mu.Lock()
+			delete(t.pending, key)
+			t.mu.Unlock()
+			return
+		}
 		slog.Error("finality: OnFinal handler failed, will retry next tick",
 			"tx_hash", c.TxHash, "log_index", c.LogIndex, "error", err)
 		return
 	}
-	key := c.key()
 	t.mu.Lock()
 	t.finalized[key] = c
 	delete(t.pending, key)
 	t.mu.Unlock()
+}
+
+// HandleUnreportable records c as an orphaned deposit (C2.8's mechanism
+// for gap #3): a candidate that finalized on-chain but whose order C1 no
+// longer considers open, per c1Error (C2.7's illegal_transition
+// response). Called from finalize the moment that failure is detected --
+// exposed as its own method, matching this chunk's own build spec,
+// rather than folded invisibly into finalize's private logic.
+//
+// This never retries the transition, never guesses at a resolution, and
+// posts nothing else to C1 on its own initiative -- strictly a
+// capture-and-surface mechanism until gap #3's actual business policy
+// exists to drive one. The alert here is the loud, immediate signal;
+// Config.OrphanedDepositRecorder (internal/orphaned) is what makes the
+// row durable and visible via C2.9's HTTP surface afterward.
+func (t *Tracker) HandleUnreportable(ctx context.Context, c Candidate, c1Error error) error {
+	if err := t.cfg.OrphanedDepositRecorder.RecordOrphanedDeposit(ctx, c, c1Error); err != nil {
+		return fmt.Errorf("finality: recording orphaned deposit for %s: %w", c.ExternalID, err)
+	}
+	slog.Error("finality: ORPHANED DEPOSIT -- a finalized deposit's order is no longer open; recorded for manual reconciliation",
+		"tx_hash", c.TxHash, "log_index", c.LogIndex, "order_id", c.OrderID, "external_id", c.ExternalID,
+		"amount", c.Amount, "c1_error", c1Error)
+	return nil
 }
 
 // checkPostFinalReorgs re-verifies every remembered finalized candidate

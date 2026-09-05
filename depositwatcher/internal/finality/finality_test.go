@@ -201,18 +201,63 @@ func (f *fakeReorgReporter) callCount() int {
 	return len(f.calls)
 }
 
+// fakeOrphanedDepositRecorder records every RecordOrphanedDeposit call it
+// receives -- a no-op stand-in for internal/orphaned, tested against a
+// real database only in that package's own integration test.
+type fakeOrphanedDepositRecorder struct {
+	mu    sync.Mutex
+	calls []finality.Candidate
+	err   error // if set, RecordOrphanedDeposit returns this on every call
+}
+
+func (f *fakeOrphanedDepositRecorder) RecordOrphanedDeposit(_ context.Context, c finality.Candidate, _ error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.calls = append(f.calls, c)
+	return nil
+}
+
+func (f *fakeOrphanedDepositRecorder) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
 func newTracker(t *testing.T, onFinal finality.FinalHandler) *finality.Tracker {
 	t.Helper()
 	tr, err := finality.New(finality.Config{
-		ContractAddress: testContract,
-		TransferTopic:   testTopic,
-		OnFinal:         onFinal,
-		ReorgReporter:   &fakeReorgReporter{},
+		ContractAddress:         testContract,
+		TransferTopic:           testTopic,
+		OnFinal:                 onFinal,
+		ReorgReporter:           &fakeReorgReporter{},
+		OrphanedDepositRecorder: &fakeOrphanedDepositRecorder{},
 	})
 	if err != nil {
 		t.Fatalf("finality.New: %v", err)
 	}
 	return tr
+}
+
+// newTrackerWithRecorder is newTracker plus access to the fake
+// OrphanedDepositRecorder itself, for the C2.8 tests below that need to
+// assert on what was recorded.
+func newTrackerWithRecorder(t *testing.T, onFinal finality.FinalHandler) (*finality.Tracker, *fakeOrphanedDepositRecorder) {
+	t.Helper()
+	recorder := &fakeOrphanedDepositRecorder{}
+	tr, err := finality.New(finality.Config{
+		ContractAddress:         testContract,
+		TransferTopic:           testTopic,
+		OnFinal:                 onFinal,
+		ReorgReporter:           &fakeReorgReporter{},
+		OrphanedDepositRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("finality.New: %v", err)
+	}
+	return tr, recorder
 }
 
 // newTrackerWithReporter is newTracker plus access to the fake
@@ -222,10 +267,11 @@ func newTrackerWithReporter(t *testing.T, onFinal finality.FinalHandler) (*final
 	t.Helper()
 	reporter := &fakeReorgReporter{}
 	tr, err := finality.New(finality.Config{
-		ContractAddress: testContract,
-		TransferTopic:   testTopic,
-		OnFinal:         onFinal,
-		ReorgReporter:   reporter,
+		ContractAddress:         testContract,
+		TransferTopic:           testTopic,
+		OnFinal:                 onFinal,
+		ReorgReporter:           reporter,
+		OrphanedDepositRecorder: &fakeOrphanedDepositRecorder{},
 	})
 	if err != nil {
 		t.Fatalf("finality.New: %v", err)
@@ -432,6 +478,177 @@ func TestCheckFinality_ProviderDisagreement_FinalizationWithheld(t *testing.T) {
 	}
 }
 
+func TestCheckFinality_OnFinalPermanentFailure_DropsCandidateWithoutRetry(t *testing.T) {
+	pool, a, b := twoNodePool(t)
+	txHash := bigHash(1)
+	logSet := []types.Log{testLog(100, txHash, 0)}
+	a.setLogs(logSet)
+	b.setLogs(logSet)
+	a.setFinalized(100, common.Hash{})
+	b.setFinalized(100, common.Hash{})
+
+	var onFinalCalls int
+	tracker := newTracker(t, func(context.Context, finality.Candidate) error {
+		onFinalCalls++
+		return fmt.Errorf("order no longer in quoted: %w", finality.ErrPermanentFailure)
+	})
+	if err := tracker.OnLogObserved(context.Background(), sampleObservedLog(100, txHash, 0), chain.Exact); err != nil {
+		t.Fatalf("OnLogObserved: %v", err)
+	}
+
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 1): %v", err)
+	}
+	if onFinalCalls != 1 {
+		t.Fatalf("OnFinal called %d times, want exactly 1", onFinalCalls)
+	}
+	if got := tracker.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() = %d, want 0 -- a permanent failure must be dropped, not left pending", got)
+	}
+	if got := tracker.FinalizedCount(); got != 0 {
+		t.Fatalf("FinalizedCount() = %d, want 0 -- a permanent failure never counts as finalized", got)
+	}
+
+	// A later tick must not call OnFinal again -- the candidate is gone,
+	// not retried.
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 2): %v", err)
+	}
+	if onFinalCalls != 1 {
+		t.Fatalf("OnFinal called %d times after a later tick, want still exactly 1 (no retry after a permanent failure)", onFinalCalls)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Orphaned deposits (C2.8)
+// ---------------------------------------------------------------------
+
+func TestCheckFinality_OrphanedDeposit_RecordedExactlyOnce(t *testing.T) {
+	pool, a, b := twoNodePool(t)
+	txHash := bigHash(1)
+	logSet := []types.Log{testLog(100, txHash, 0)}
+	a.setLogs(logSet)
+	b.setLogs(logSet)
+	a.setFinalized(100, common.Hash{})
+	b.setFinalized(100, common.Hash{})
+
+	tracker, recorder := newTrackerWithRecorder(t, func(context.Context, finality.Candidate) error {
+		return fmt.Errorf("order no longer in quoted: %w: %w", finality.ErrPermanentFailure, finality.ErrOrphanedDeposit)
+	})
+	if err := tracker.OnLogObserved(context.Background(), sampleObservedLog(100, txHash, 0), chain.Exact); err != nil {
+		t.Fatalf("OnLogObserved: %v", err)
+	}
+
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 1): %v", err)
+	}
+	if recorder.callCount() != 1 {
+		t.Fatalf("RecordOrphanedDeposit called %d times, want exactly 1", recorder.callCount())
+	}
+	if got := tracker.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() = %d, want 0 -- recorded, must not stay pending", got)
+	}
+	if got := tracker.FinalizedCount(); got != 0 {
+		t.Fatalf("FinalizedCount() = %d, want 0 -- an orphaned deposit never counts as finalized", got)
+	}
+
+	// A later tick must not record it again.
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 2): %v", err)
+	}
+	if recorder.callCount() != 1 {
+		t.Fatalf("RecordOrphanedDeposit called %d times after a later tick, want still exactly 1", recorder.callCount())
+	}
+}
+
+func TestCheckFinality_OrphanedDeposit_NotConfusedWithOtherPermanentFailures(t *testing.T) {
+	// A plain ErrPermanentFailure (e.g. C2.7's idempotency_conflict, a
+	// structural bug alert, not customer money orphaned by an expired
+	// order) must never reach the recorder -- there is nothing to record,
+	// and HandleUnreportable is specifically for ErrOrphanedDeposit.
+	pool, a, b := twoNodePool(t)
+	txHash := bigHash(1)
+	logSet := []types.Log{testLog(100, txHash, 0)}
+	a.setLogs(logSet)
+	b.setLogs(logSet)
+	a.setFinalized(100, common.Hash{})
+	b.setFinalized(100, common.Hash{})
+
+	tracker, recorder := newTrackerWithRecorder(t, func(context.Context, finality.Candidate) error {
+		return fmt.Errorf("bug alert: %w", finality.ErrPermanentFailure)
+	})
+	if err := tracker.OnLogObserved(context.Background(), sampleObservedLog(100, txHash, 0), chain.Exact); err != nil {
+		t.Fatalf("OnLogObserved: %v", err)
+	}
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality: %v", err)
+	}
+	if recorder.callCount() != 0 {
+		t.Fatalf("RecordOrphanedDeposit called %d times for a non-orphaned permanent failure, want 0", recorder.callCount())
+	}
+	if got := tracker.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() = %d, want 0", got)
+	}
+}
+
+func TestCheckFinality_OrphanedDeposit_RetriesRecordingOnFailureThenStops(t *testing.T) {
+	pool, a, b := twoNodePool(t)
+	txHash := bigHash(1)
+	logSet := []types.Log{testLog(100, txHash, 0)}
+	a.setLogs(logSet)
+	b.setLogs(logSet)
+	a.setFinalized(100, common.Hash{})
+	b.setFinalized(100, common.Hash{})
+
+	recorder := &fakeOrphanedDepositRecorder{err: errors.New("simulated database write failure")}
+	tracker, err := finality.New(finality.Config{
+		ContractAddress: testContract,
+		TransferTopic:   testTopic,
+		OnFinal: func(context.Context, finality.Candidate) error {
+			return fmt.Errorf("%w: %w", finality.ErrPermanentFailure, finality.ErrOrphanedDeposit)
+		},
+		ReorgReporter:           &fakeReorgReporter{},
+		OrphanedDepositRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("finality.New: %v", err)
+	}
+	if err := tracker.OnLogObserved(context.Background(), sampleObservedLog(100, txHash, 0), chain.Exact); err != nil {
+		t.Fatalf("OnLogObserved: %v", err)
+	}
+
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 1, recording fails): %v", err)
+	}
+	if recorder.callCount() != 0 {
+		t.Fatalf("callCount() = %d, want 0 (the failed attempt is not recorded as a call)", recorder.callCount())
+	}
+	if got := tracker.PendingCount(); got != 1 {
+		t.Fatalf("PendingCount() = %d, want 1 -- a failed recording must leave the candidate pending for retry", got)
+	}
+
+	recorder.mu.Lock()
+	recorder.err = nil
+	recorder.mu.Unlock()
+
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 2, recording succeeds): %v", err)
+	}
+	if recorder.callCount() != 1 {
+		t.Fatalf("callCount() = %d, want exactly 1 after the retry succeeds", recorder.callCount())
+	}
+	if got := tracker.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() = %d, want 0 after a successful recording", got)
+	}
+
+	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
+		t.Fatalf("CheckFinality (tick 3): %v", err)
+	}
+	if recorder.callCount() != 1 {
+		t.Fatalf("callCount() = %d after a further tick, want exactly 1 (no double recording)", recorder.callCount())
+	}
+}
+
 func TestCheckFinality_ReVerificationQueryFails_LeavesCandidatePending(t *testing.T) {
 	pool, a, b := twoNodePool(t)
 	txHash := bigHash(1)
@@ -479,12 +696,13 @@ func TestCheckFinality_StalePendingAlertsOnceAfterCeiling(t *testing.T) {
 	var stalled []finality.Candidate
 	var mu sync.Mutex
 	tracker, err := finality.New(finality.Config{
-		ContractAddress:     testContract,
-		TransferTopic:       testTopic,
-		OnFinal:             func(context.Context, finality.Candidate) error { return nil },
-		ReorgReporter:       &fakeReorgReporter{},
-		StalePendingCeiling: 5 * time.Minute,
-		Now:                 clock,
+		ContractAddress:         testContract,
+		TransferTopic:           testTopic,
+		OnFinal:                 func(context.Context, finality.Candidate) error { return nil },
+		ReorgReporter:           &fakeReorgReporter{},
+		OrphanedDepositRecorder: &fakeOrphanedDepositRecorder{},
+		StalePendingCeiling:     5 * time.Minute,
+		Now:                     clock,
 		OnStalePending: func(c finality.Candidate, pending time.Duration) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -607,10 +825,11 @@ func TestCheckFinality_PostFinalReorg_RetriesReportOnFailureThenStops(t *testing
 
 	reporter := &fakeReorgReporter{}
 	tracker, err := finality.New(finality.Config{
-		ContractAddress: testContract,
-		TransferTopic:   testTopic,
-		OnFinal:         func(context.Context, finality.Candidate) error { return nil },
-		ReorgReporter:   reporter,
+		ContractAddress:         testContract,
+		TransferTopic:           testTopic,
+		OnFinal:                 func(context.Context, finality.Candidate) error { return nil },
+		ReorgReporter:           reporter,
+		OrphanedDepositRecorder: &fakeOrphanedDepositRecorder{},
 	})
 	if err != nil {
 		t.Fatalf("finality.New: %v", err)

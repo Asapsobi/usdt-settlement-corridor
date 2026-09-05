@@ -12,6 +12,7 @@ package money
 import (
 	"fmt"
 	"math/big"
+	"strconv"
 )
 
 // Decimals is this service's minor-unit precision for USDT_BEP20, matching
@@ -57,4 +58,28 @@ func FromOnChainUnits(raw *big.Int, onChainDecimals int) (Amount, error) {
 		return 0, fmt.Errorf("money: on-chain amount %s overflows int64 minor units", raw)
 	}
 	return Amount(scaled.Int64()), nil
+}
+
+// Format renders a as a plain decimal string with exactly Decimals
+// fractional digits (e.g. Amount(3000_000000).Format() -> "3000.000000"),
+// the shape C1's own money.Format uses and §A requires for every amount
+// crossing the HTTP boundary -- never a JSON number, never routed
+// through a float here either. a may be negative (a Line request credits
+// one account with the negated amount of the other); FormatInt handles
+// the math.MinInt64 edge case correctly, unlike negating a first would.
+func (a Amount) Format() string {
+	neg := a < 0
+	digits := strconv.FormatInt(int64(a), 10)
+	if neg {
+		digits = digits[1:]
+	}
+	for len(digits) < Decimals+1 {
+		digits = "0" + digits
+	}
+	intPart, fracPart := digits[:len(digits)-Decimals], digits[len(digits)-Decimals:]
+	out := intPart + "." + fracPart
+	if neg {
+		out = "-" + out
+	}
+	return out
 }

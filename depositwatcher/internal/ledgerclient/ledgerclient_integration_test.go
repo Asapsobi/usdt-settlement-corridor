@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 
 	"depositwatcher/internal/finality"
 	"depositwatcher/internal/ledgerclient"
+	"depositwatcher/internal/money"
 )
 
 const (
@@ -277,10 +279,20 @@ func (ll *liveLedger) getHalt() haltResp {
 func (ll *liveLedger) clearHalt(t *testing.T) {
 	t.Helper()
 	resp, body := ll.do(http.MethodPost, "/v1/system/halt", "clear:"+t.Name(), map[string]any{
-		"action": "clear", "note": "c2.6 integration test cleanup",
+		"action": "clear", "note": "c2.6/c2.7 integration test cleanup",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Logf("clearing halt after %s: status %d: %s (may already be clear)", t.Name(), resp.StatusCode, body)
+	}
+}
+
+func (ll *liveLedger) setHalt(t *testing.T, reason string) {
+	t.Helper()
+	resp, body := ll.do(http.MethodPost, "/v1/system/halt", "set:"+t.Name(), map[string]any{
+		"action": "set", "reason": reason, "note": "c2.7 integration test: forcing a halt",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("setting halt for %s: status %d: %s", t.Name(), resp.StatusCode, body)
 	}
 }
 
@@ -475,5 +487,202 @@ func TestReportReorg_ScenarioB_LossBookedAndLedgerHalted(t *testing.T) {
 	lossAfterRetry := parseMinorUnits(t, ll.accountBalance("expense:loss:reorg"))
 	if lossAfterRetry != lossAfter {
 		t.Fatalf("expense:loss:reorg balance changed after a retried report: %d -> %d minor units, want unchanged", lossAfter, lossAfterRetry)
+	}
+}
+
+// ---------------------------------------------------------------------
+// C2.7 -- ReportDepositFinal
+// ---------------------------------------------------------------------
+
+// newTxHash builds a fresh, distinct tx hash for each test -- these
+// candidates don't come from a real chain, so all that matters is
+// uniqueness (so idempotency keys never collide across test runs against
+// this persistent database).
+func newTxHash() common.Hash {
+	return common.HexToHash(fmt.Sprintf("0x%x", time.Now().UnixNano()))
+}
+
+// newDepositCandidate builds a finality.Candidate as C2.5's own Tracker
+// would hand it to ReportDepositFinal. Classification is left at its
+// zero value (Exact) -- ReportDepositFinal never inspects it.
+func newDepositCandidate(order orderResp, customerID string, amount money.Amount) finality.Candidate {
+	return finality.Candidate{
+		ObservedLog: finality.ObservedLog{
+			TxHash:     newTxHash(),
+			LogIndex:   0,
+			Height:     1,
+			BlockTime:  time.Now().UTC(),
+			OrderID:    order.ID,
+			ExternalID: order.ExternalID,
+			CustomerID: customerID,
+			Amount:     amount,
+		},
+	}
+}
+
+func TestReportDepositFinal_HappyPath(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-happy-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-happy-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	amount := money.Amount(3000_000000) // 3000.000000 -- matches testAmountIn
+	candidate := newDepositCandidate(order, customerID, amount)
+
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal: %v", err)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.State != "funded" {
+		t.Fatalf("order state after ReportDepositFinal = %q, want funded", after.State)
+	}
+
+	if got := ll.accountBalance(depositAcc); got != testAmountIn {
+		t.Errorf("deposit account balance = %s, want %s", got, testAmountIn)
+	}
+	custBalance := ll.accountBalance(custBEP)
+	if parseMinorUnits(t, custBalance) != -parseMinorUnits(t, testAmountIn) {
+		t.Errorf("customer liability balance = %s, want the negation of %s", custBalance, testAmountIn)
+	}
+}
+
+func TestReportDepositFinal_IllegalTransition_OrderAlreadyExpired(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-expired-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-expired-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	expired := ll.transition(externalID, "expire:"+externalID, "expired", order.Version, nil)
+	if expired.State != "expired" {
+		t.Fatalf("setup: order state = %q, want expired", expired.State)
+	}
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	candidate := newDepositCandidate(order, customerID, money.Amount(3000_000000))
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	err := client.ReportDepositFinal(context.Background(), candidate)
+	if err == nil {
+		t.Fatal("ReportDepositFinal: expected an error for an already-expired order, got nil")
+	}
+	if !errors.Is(err, finality.ErrPermanentFailure) {
+		t.Fatalf("ReportDepositFinal: got %v, want an error wrapping finality.ErrPermanentFailure", err)
+	}
+	var apiErr *ledgerclient.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "illegal_transition" {
+		t.Fatalf("ReportDepositFinal: got %v, want an APIError with code illegal_transition", err)
+	}
+
+	// Confirm C1 itself is genuinely untouched -- no entry, no balance
+	// change, still expired.
+	stillExpired := ll.getOrder(externalID)
+	if stillExpired.State != "expired" {
+		t.Fatalf("order state after the rejected report = %q, want unchanged (expired)", stillExpired.State)
+	}
+	if got := ll.accountBalance(depositAcc); got != "0.000000" {
+		t.Fatalf("deposit account balance = %s, want 0.000000 (nothing should have posted)", got)
+	}
+}
+
+// TestReportDepositFinal_ReplayAfterRestart_DoesNotDoubleCredit exercises
+// the exact scenario this chunk's own ACCEPTANCE section names: "a C2
+// restart that re-processes a block it already handled." C2.5's own
+// finality.Tracker keeps candidates entirely in process memory (a
+// documented limitation, not an oversight -- see finality.go's own
+// comment), so a real restart re-observing the same on-chain log calls
+// ReportDepositFinal a second time for a candidate identical in every
+// field, including its idempotency key. Exercises
+// orders.replayIfAlreadyPosted (ledger/internal/orders/store.go), added
+// to fix exactly this gap: Funded -> Funded used to fall straight
+// through orders.Transition's transitionTable check to
+// ErrIllegalTransition before ever reaching journal.Post's own
+// idempotency-key handling.
+func TestReportDepositFinal_ReplayAfterRestart_DoesNotDoubleCredit(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-replay-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-replay-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	candidate := newDepositCandidate(order, customerID, money.Amount(3000_000000))
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal (first call): %v", err)
+	}
+	firstBalance := ll.accountBalance(depositAcc)
+
+	// The exact same candidate again -- same tx_hash:log_index, same
+	// idempotency key, same amount. A real C2 restart re-observing this
+	// block would produce exactly this call.
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal (replay): must succeed as a no-op, got: %v", err)
+	}
+
+	afterBalance := ll.accountBalance(depositAcc)
+	if afterBalance != firstBalance {
+		t.Fatalf("deposit account balance changed on replay: %s -> %s -- this is the exact double-credit this test exists to catch",
+			firstBalance, afterBalance)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.State != "funded" {
+		t.Fatalf("order state after replay = %q, want unchanged (funded)", after.State)
+	}
+}
+
+// TestReportDepositFinal_QuotedToFundedIsNeverHaltBlocked checks a
+// specific, load-bearing claim in this chunk's own build spec ("On 423
+// system_halted: back off and retry") against orders.transitionTable's
+// actual, already-shipped configuration: {Quoted, Funded} is NOT
+// HaltBlocked (see reorg.go's own doc comment: "quoted->funded (deposit
+// recording) must keep working while halted"). If that's still true,
+// ReportDepositFinal's system_halted branch is unreachable for this
+// specific transition -- not wrong to keep defensively, just never
+// exercised by a real deposit_final call in practice.
+func TestReportDepositFinal_QuotedToFundedIsNeverHaltBlocked(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-halted-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-halted-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	ll.setHalt(t, "MANUAL_TEST_HALT")
+	t.Cleanup(func() { ll.clearHalt(t) })
+
+	halt := ll.getHalt()
+	if !halt.Halted {
+		t.Fatal("setup: expected the ledger to be halted")
+	}
+
+	candidate := newDepositCandidate(order, customerID, money.Amount(3000_000000))
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	err := client.ReportDepositFinal(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("ReportDepositFinal while halted: got an error (%v) -- if this now fails with system_halted, "+
+			"HandleDepositReorg's transitionTable started HaltBlocking Quoted->Funded and this test (and its "+
+			"own finding) is stale; ReportDepositFinal's system_halted handling would then actually be exercised", err)
+	}
+	after := ll.getOrder(externalID)
+	if after.State != "funded" {
+		t.Fatalf("order state while halted = %q, want funded (deposit recording is documented to work while halted)", after.State)
 	}
 }
