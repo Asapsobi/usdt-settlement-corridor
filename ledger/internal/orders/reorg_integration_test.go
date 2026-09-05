@@ -110,6 +110,58 @@ func TestReorgScenarioA(t *testing.T) {
 	require.Equal(t, int64(0), trial[money.USDT_BEP20])
 }
 
+// TestReorgRetryFromQuoted_AfterScenarioA_IsIdempotent covers the exact
+// gap found while building C2 (the deposit watcher) against a real
+// running ledgerd: a caller that redelivers a scenario-A reorg report
+// after the order is already back in Quoted must see success, not
+// ErrUnexpectedState -- invariant 2's idempotency guarantee applies to
+// this endpoint too, not just to journal.Post/Reverse directly.
+func TestReorgRetryFromQuoted_AfterScenarioA_IsIdempotent(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order, _, depositKey := depositedOrder(t, ctx, pool)
+
+	var afterFirst orders.Order
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		afterFirst, err = orders.HandleDepositReorg(ctx, tx, order.ID, depositKey, "test:watcher")
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, orders.Quoted, afterFirst.State)
+
+	var afterRetry orders.Order
+	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		afterRetry, err = orders.HandleDepositReorg(ctx, tx, order.ID, depositKey, "test:watcher")
+		return err
+	})
+	require.NoError(t, err, "a redelivered scenario-A report must not error")
+	require.Equal(t, orders.Quoted, afterRetry.State)
+	require.Equal(t, afterFirst.Version, afterRetry.Version, "a retry must post nothing and transition nothing")
+
+	trial, err := journal.TrialBalance(ctx, pool)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), trial[money.USDT_BEP20], "a retry must have zero additional effect on the books")
+}
+
+// TestReorgOnFreshQuotedOrder_StillErrors guards the narrowness of that
+// fix: an order that has been Quoted since creation -- never funded at
+// all -- must still get ErrUnexpectedState for an unrelated or bogus
+// key, not be silently treated as an idempotent reorg retry.
+func TestReorgOnFreshQuotedOrder_StillErrors(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order := newQuotedOrder(t, ctx, pool)
+
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := orders.HandleDepositReorg(ctx, tx, order.ID, "no-such-entry-key", "test:watcher")
+		return err
+	})
+	require.ErrorIs(t, err, orders.ErrUnexpectedState)
+	require.Contains(t, err.Error(), string(orders.Quoted))
+}
+
 // advanceDepositedOrderTo walks an already-Funded, already-deposited
 // order the rest of the way to target (Screened, Dispatching, or
 // Settled), posting the real E2/E3 entries the §B worked example uses,

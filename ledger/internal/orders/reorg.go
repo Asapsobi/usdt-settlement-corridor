@@ -33,14 +33,19 @@ var ErrUnexpectedState = errors.New("orders: unexpected state for reorg handling
 //     ledger is halted, because a settlement that will not be paid for is
 //     exactly the class of problem this system must never handle quietly.
 //
-// Any other state -- quoted, screened, held, refunded, expired -- returns
+// Quoted is a third, narrower case handled below: not a fresh scenario,
+// but the state scenario A's own success already leaves an order in. A
+// reorg report redelivered after that success must not read as a fresh
+// ErrUnexpectedState -- see reorgRetryFromQuoted.
+//
+// Any other state -- screened, held, refunded, expired -- returns
 // ErrUnexpectedState naming the actual state, rather than doing nothing
 // or doing something that merely looks plausible.
 //
 // originalEntryKey is the idempotency key of the deposit_final entry that
-// funded this order -- the caller (C2, the deposit watcher, not built
-// yet) knows this key because it is the same one it used when it first
-// posted that entry; HandleDepositReorg has no other way to find it.
+// funded this order -- the caller (C2, the deposit watcher) knows this
+// key because it is the same one it used when it first posted that
+// entry; HandleDepositReorg has no other way to find it.
 func HandleDepositReorg(ctx context.Context, tx pgx.Tx, orderID int64, originalEntryKey string, actor string) (Order, error) {
 	order, err := Get(ctx, tx, orderID)
 	if err != nil {
@@ -52,9 +57,49 @@ func HandleDepositReorg(ctx context.Context, tx pgx.Tx, orderID int64, originalE
 		return reorgScenarioA(ctx, tx, order, originalEntryKey, actor)
 	case Dispatching, Settled:
 		return reorgScenarioB(ctx, tx, order, originalEntryKey, actor)
+	case Quoted:
+		return reorgRetryFromQuoted(ctx, tx, order, originalEntryKey)
 	default:
 		return Order{}, fmt.Errorf("%w: order %d is in state %s", ErrUnexpectedState, orderID, order.State)
 	}
+}
+
+// reorgRetryFromQuoted handles a reorg report arriving while the order is
+// already Quoted -- which an order reaches either by never having been
+// funded yet, or by scenario A's own prior success (Funded -> Quoted is
+// legal only via that path; see transitionTable). Those two histories are
+// indistinguishable from the order's state alone, so this checks the one
+// fact that does distinguish them: whether originalEntryKey's entry has
+// already been reversed.
+//
+//   - Not reversed (or the key names no entry at all): this order's
+//     Quoted state has nothing to do with originalEntryKey. Genuinely
+//     ErrUnexpectedState -- the same answer HandleDepositReorg gave
+//     before this case existed.
+//   - Already reversed: this is a redelivered report of a reorg C1
+//     already processed. No reversal, no transition, nothing posted --
+//     the order is returned exactly as it stands, which is invariant 2's
+//     own idempotency guarantee applied to this endpoint specifically.
+//     Returning ErrUnexpectedState here instead -- as this function did
+//     before this fix -- told a legitimately retrying caller its report
+//     was never handled at all, which is false.
+func reorgRetryFromQuoted(ctx context.Context, tx pgx.Tx, order Order, originalEntryKey string) (Order, error) {
+	original, err := journal.GetEntryByIdempotencyKey(ctx, tx, originalEntryKey)
+	if err != nil {
+		if errors.Is(err, journal.ErrEntryNotFound) {
+			return Order{}, fmt.Errorf("%w: order %d is in state %s", ErrUnexpectedState, order.ID, order.State)
+		}
+		return Order{}, fmt.Errorf("orders: reorg retry from quoted: looking up %q: %w", originalEntryKey, err)
+	}
+
+	_, reversed, err := journal.ReversalOf(ctx, tx, original.ID)
+	if err != nil {
+		return Order{}, fmt.Errorf("orders: reorg retry from quoted: checking reversal of entry %d: %w", original.ID, err)
+	}
+	if !reversed {
+		return Order{}, fmt.Errorf("%w: order %d is in state %s", ErrUnexpectedState, order.ID, order.State)
+	}
+	return order, nil
 }
 
 // reorgScenarioA: reverse the deposit, return the order to quoted. If the
