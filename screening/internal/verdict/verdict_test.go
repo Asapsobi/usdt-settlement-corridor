@@ -105,6 +105,22 @@ func TestUnavailable_IsFailClosedHold(t *testing.T) {
 	}
 }
 
+func TestPassVendorUnavailable_IsFailOpenPass(t *testing.T) {
+	d := PassVendorUnavailable()
+	if d.Classification != Pass {
+		t.Fatalf("PassVendorUnavailable().Classification = %v, want Pass", d.Classification)
+	}
+	if d.ReasonCode != ReasonPassVendorUnavailable {
+		t.Fatalf("PassVendorUnavailable().ReasonCode = %q, want %q", d.ReasonCode, ReasonPassVendorUnavailable)
+	}
+	if d.ReasonCode == ReasonPass {
+		t.Fatal("PassVendorUnavailable().ReasonCode must never equal the plain ReasonPass -- it must be auditable as distinct")
+	}
+	if d.ScreeningResultID != 0 {
+		t.Fatalf("PassVendorUnavailable().ScreeningResultID = %d, want 0 (no backing result row)", d.ScreeningResultID)
+	}
+}
+
 func TestClassify_ScreeningResultIDIsNeverSetByThisPackage(t *testing.T) {
 	// Classify has no cache access -- it must never fabricate a FK. The
 	// caller (C3.4) is responsible for filling this in once the Verdict

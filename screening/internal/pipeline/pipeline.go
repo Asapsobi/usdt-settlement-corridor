@@ -24,9 +24,13 @@ import (
 // screenable orders faster than discovery can possibly produce them.
 const DefaultInterval = 5 * time.Second
 
-// DefaultTimeout bounds a single provider.Screen call. Config, not a
+// DefaultTimeout bounds a single provider.Screen attempt. Config, not a
 // hardcoded constant used directly -- see Config's own doc comment.
 const DefaultTimeout = 10 * time.Second
+
+// DefaultRetries is how many attempts provider.ScreenWithPolicy makes
+// before giving up, when Retries is unset.
+const DefaultRetries = 3
 
 // Reporter is the one call this pipeline needs from C1 --
 // ledgerclient.Client's real implementation, or a fake for testing.
@@ -34,6 +38,17 @@ const DefaultTimeout = 10 * time.Second
 // module's existing convention (e.g. discovery.FundedOrderPoller).
 type Reporter interface {
 	ReportVerdict(ctx context.Context, externalID string, decision verdict.Decision) error
+}
+
+// MetricsRecorder is how this pipeline reports
+// screening_vendor_unavailable_total (C3.5's own build spec): one call
+// per exhausted-retries event, regardless of which OutagePolicy is
+// configured, so an operator sees vendor degradation even when
+// FailOpen is masking it from the order pipeline's own behavior.
+// Optional -- nil means no metrics are recorded, never a panic, the
+// same convention every other pluggable dependency in this module uses.
+type MetricsRecorder interface {
+	VendorUnavailable()
 }
 
 // Config scopes what this pipeline screens against and how.
@@ -59,6 +74,17 @@ type Config struct {
 	// TTL controls how long a fresh screening result stays cached,
 	// split by outcome -- see cache.TTLConfig's own doc comment.
 	TTL cache.TTLConfig
+	// Retries is provider.ScreenWithPolicy's own attempt budget.
+	// Defaults to DefaultRetries if <= 0.
+	Retries int
+	// OutagePolicy decides what happens once every retry is exhausted --
+	// see provider.OutagePolicy's own doc comment. The zero value is
+	// provider.FailClosed, which is both Go's natural zero value and
+	// this system's own shipped default ("Read this third" in the C3
+	// build spec) -- an uninitialized Config is always safe.
+	OutagePolicy provider.OutagePolicy
+	// Metrics is optional -- see MetricsRecorder's own doc comment.
+	Metrics MetricsRecorder
 }
 
 func (cfg Config) timeout() time.Duration {
@@ -73,6 +99,36 @@ func (cfg Config) thresholds() verdict.Thresholds {
 		return verdict.DefaultThresholds
 	}
 	return cfg.Thresholds
+}
+
+func (cfg Config) retries() int {
+	if cfg.Retries <= 0 {
+		return DefaultRetries
+	}
+	return cfg.Retries
+}
+
+func (cfg Config) recordVendorUnavailable() {
+	if cfg.Metrics != nil {
+		cfg.Metrics.VendorUnavailable()
+	}
+}
+
+// LogOutagePolicy logs cfg.OutagePolicy once, loudly for the non-default
+// FailOpen (Warn) and quietly for the default FailClosed (Info) --
+// exactly C1.7's own posture on a non-default TRX reconciliation
+// tolerance: a deliberate risk-tradeoff choice must be visible at
+// startup, never silent. Intended to be called once by whichever
+// process assembles this Config (cmd/screend, once its own engine
+// wiring exists -- see this chunk's own commit for why that wiring is
+// still out of scope here).
+func (cfg Config) LogOutagePolicy() {
+	if cfg.OutagePolicy == provider.FailOpen {
+		slog.Warn("pipeline: outage_policy is fail_open -- an exhausted vendor retry budget will be reported to C1 as a clean pass (screening_pass_vendor_unavailable), never silently",
+			"provider", cfg.ProviderName)
+		return
+	}
+	slog.Info("pipeline: outage_policy is fail_closed (default)", "provider", cfg.ProviderName)
 }
 
 // RunLoop checks screening_queue on an interval and screens every row
@@ -124,15 +180,17 @@ func RunTick(ctx context.Context, pool db.Queryer, prov provider.ScreeningProvid
 //  1. cache.Get(provider, address) -- an unexpired, non-invalidated hit
 //     skips the vendor call entirely (the whole point of caching by
 //     sender address).
-//  2. Otherwise, prov.Screen(ctx, address) under cfg.timeout(). On
-//     success, cache.Put persists it. On any error (including a
-//     timeout), no row is cached -- verdict.Unavailable() is used
-//     directly instead of classifying a fabricated Verdict, matching
-//     what that function exists for: the fail-closed, no-backing-row
-//     decision for exactly this case. (C3.5 replaces this single
-//     attempt with retries and a configurable outage policy; until then
-//     fail-closed, C1's own shipped default, is the only behavior this
-//     chunk needs.)
+//  2. Otherwise, provider.ScreenWithPolicy (retries with backoff, up to
+//     cfg.retries() attempts each bounded by cfg.timeout()). A real
+//     success is cached and classified normally. Once every retry is
+//     exhausted, cfg.OutagePolicy decides what gets reported instead of
+//     ever running the exhausted-retries placeholder through Classify
+//     (see provider.ScreenWithPolicy's own doc comment for why that
+//     placeholder must never be classified): FailClosed reports
+//     verdict.Unavailable() (Hold), FailOpen reports
+//     verdict.PassVendorUnavailable() (Pass, but audibly not a real
+//     clean result). Neither outcome gets a screening_results row --
+//     there was no real vendor response to cache.
 //  3. reporter.ReportVerdict with the classified Decision.
 //  4. The queue row is marked DONE -- including when C1 reports
 //     ledgerclient.ErrIllegalTransition (the order left funded before
@@ -199,13 +257,24 @@ func screen(ctx context.Context, pool db.Queryer, prov provider.ScreeningProvide
 		return decision, nil
 	}
 
-	screenCtx, cancel := context.WithTimeout(ctx, cfg.timeout())
-	v, err := prov.Screen(screenCtx, address)
-	cancel()
+	v, err := provider.ScreenWithPolicy(ctx, prov, address, cfg.timeout(), cfg.retries(), cfg.OutagePolicy)
 	if err != nil {
-		slog.Warn("pipeline: provider screen failed, failing closed (screening_hold_unavailable)",
-			"address", address, "error", err)
+		if !errors.Is(err, provider.ErrProviderUnavailable) {
+			return verdict.Decision{}, fmt.Errorf("pipeline: screening %s: %w", address, err)
+		}
+		// FailClosed exhaustion: ScreenWithPolicy already logged the
+		// details (address, retries, last_error) -- nothing more to add
+		// here beyond the metric.
+		cfg.recordVendorUnavailable()
 		return verdict.Unavailable(), nil
+	}
+	if provider.IsProviderUnavailable(v) {
+		// FailOpen exhaustion: a nil error, but still an outage event --
+		// same metric as the FailClosed branch above, since the metric's
+		// whole point is visibility regardless of which policy is
+		// masking it from the order pipeline's own behavior.
+		cfg.recordVendorUnavailable()
+		return verdict.PassVendorUnavailable(), nil
 	}
 
 	id, err := cache.Put(ctx, pool, cfg.ProviderName, address, v, cfg.TTL.For(v))

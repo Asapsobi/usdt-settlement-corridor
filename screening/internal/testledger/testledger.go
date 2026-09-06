@@ -262,6 +262,23 @@ func (l *Ledger) FundOrder(order OrderResp, customerID, senderAddress string) Or
 	return o
 }
 
+// LatestTransitionReason returns the `reason` column of the most recent
+// order_transitions row for orderID -- there is no public HTTP endpoint
+// for this, so this is test scaffolding only, used to confirm the exact
+// reason string a transition was recorded with (e.g. distinguishing
+// screening_pass_vendor_unavailable from a plain screening_pass).
+func (l *Ledger) LatestTransitionReason(orderID int64) string {
+	l.t.Helper()
+	var reason string
+	err := l.pool.QueryRow(context.Background(), `
+		SELECT reason FROM order_transitions WHERE order_id = $1 ORDER BY id DESC LIMIT 1
+	`, orderID).Scan(&reason)
+	if err != nil {
+		l.t.Fatalf("fetching latest transition reason for order %d: %v", orderID, err)
+	}
+	return reason
+}
+
 // GetOrder fetches GET /v1/orders/{externalID}.
 func (l *Ledger) GetOrder(externalID string) OrderResp {
 	l.t.Helper()

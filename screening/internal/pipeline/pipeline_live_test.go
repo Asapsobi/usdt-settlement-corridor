@@ -179,3 +179,57 @@ func TestPipeline_RestartMidPipelineReplaysSafely(t *testing.T) {
 		t.Fatalf("provider.Screen called %d times across the replay, want exactly 1 (the second pass must hit the cache)", mock.ScreenCallCount(sender))
 	}
 }
+
+// TestPipeline_FailOpenReachesScreenedDespiteVendorOutage_AgainstRealC1
+// is C3.5's own headline acceptance criterion, proven against a real
+// C1: "FailOpen policy: produces screening_pass_vendor_unavailable, and
+// the order does reach screened in C1 -- but the reason string on the
+// transition record makes the vendor-unavailable origin unambiguous."
+func TestPipeline_FailOpenReachesScreenedDespiteVendorOutage_AgainstRealC1(t *testing.T) {
+	pool := testPool(t)
+	ll := testledger.Start(t, pipelineLedgerListenAddr, pipelineLedgerAPIToken, pipelineLedgerActor)
+	client := ledgerclient.New(ll.BaseURL(), pipelineLedgerAPIToken)
+
+	externalID := "c35-live-failopen-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c35-live-failopen-cust-" + fmt.Sprint(time.Now().UnixNano())
+	const sender = "0xFailOpenSenderLive0000000000006"
+
+	order := ll.CreateOrder(externalID, customerID)
+	funded := ll.FundOrder(order, customerID, sender)
+
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO screening_queue (order_id, external_id, sender_address) VALUES ($1, $2, $3)
+	`, funded.ID, externalID, sender); err != nil {
+		t.Fatalf("seeding screening_queue: %v", err)
+	}
+	entry, err := discovery.Get(context.Background(), pool, funded.ID)
+	if err != nil {
+		t.Fatalf("discovery.Get: %v", err)
+	}
+
+	mock := provider.NewMockProvider(1)
+	mock.ForceTimeout(sender) // every attempt against this address fails
+	cfg := pipeline.Config{
+		ProviderName: "mock",
+		Timeout:      20 * time.Millisecond,
+		Retries:      1,
+		OutagePolicy: provider.FailOpen,
+		Thresholds:   verdict.DefaultThresholds,
+		TTL:          cache.DefaultTTLConfig,
+	}
+
+	if err := pipeline.ScreenAndReport(context.Background(), pool, mock, client, cfg, entry); err != nil {
+		t.Fatalf("ScreenAndReport: %v", err)
+	}
+
+	after := ll.GetOrder(externalID)
+	if after.State != "screened" {
+		t.Fatalf("order state = %q, want screened -- fail_open must still let the order through despite the vendor outage", after.State)
+	}
+
+	reason := ll.LatestTransitionReason(funded.ID)
+	if reason != verdict.ReasonPassVendorUnavailable {
+		t.Fatalf("transition reason = %q, want %q -- the vendor-unavailable origin must be unambiguous on C1's own audit record, never a plain screening_pass",
+			reason, verdict.ReasonPassVendorUnavailable)
+	}
+}

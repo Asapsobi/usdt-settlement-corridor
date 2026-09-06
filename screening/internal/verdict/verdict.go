@@ -21,6 +21,13 @@ const (
 	ReasonHoldAmbiguous             = "screening_hold_ambiguous"
 	ReasonHoldUnavailable           = "screening_hold_unavailable"
 	ReasonHoldStaleCacheInvalidated = "screening_hold_stale_cache_invalidated"
+	// ReasonPassVendorUnavailable is C3.5's fail-open outcome: every
+	// retry against the vendor was exhausted, and the configured outage
+	// policy is FailOpen, so the order is passed through anyway. Never
+	// just ReasonPass -- this string exists specifically so the origin
+	// is grep-able and auditable after the fact, distinguishable from an
+	// actual clean vendor result.
+	ReasonPassVendorUnavailable = "screening_pass_vendor_unavailable"
 )
 
 // Classification is deliberately a closed, two-value set. There is no
@@ -118,4 +125,15 @@ func Classify(v provider.Verdict, thresholds Thresholds) Decision {
 // ScreeningResultID stays 0.
 func Unavailable() Decision {
 	return Decision{Classification: Hold, ReasonCode: ReasonHoldUnavailable}
+}
+
+// PassVendorUnavailable is C3.5's fail-open decision: every retry
+// against the vendor was exhausted, and the configured outage policy is
+// FailOpen. Like Unavailable, this is not reachable through Classify --
+// there is no real Verdict to classify -- and has no backing
+// screening_results row, so ScreeningResultID stays 0. Never confuse
+// this with a real Classify-produced Pass: the whole point of a
+// distinct reason code is that an auditor can tell the two apart.
+func PassVendorUnavailable() Decision {
+	return Decision{Classification: Pass, ReasonCode: ReasonPassVendorUnavailable}
 }

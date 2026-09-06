@@ -198,6 +198,7 @@ func TestScreenAndReport_ProviderErrorFailsClosed(t *testing.T) {
 	mock.ForceTimeout(address)
 	cfg := testConfig()
 	cfg.Timeout = 20 * time.Millisecond
+	cfg.Retries = 1 // this test is about the exhausted->fail-closed outcome, not retry count
 
 	enqueue(t, pool, 20, "ext-provider-error", address)
 	entry, err := discovery.Get(ctx, pool, 20)
@@ -227,6 +228,152 @@ func TestScreenAndReport_ProviderErrorFailsClosed(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("a failed provider call should never write a screening_results row, found %d", count)
 	}
+}
+
+// fakeMetrics counts MetricsRecorder calls -- used to verify
+// screening_vendor_unavailable_total fires on every exhausted-retries
+// event regardless of OutagePolicy, per C3.5's own CONFIG section.
+type fakeMetrics struct {
+	vendorUnavailableCalls int
+}
+
+func (m *fakeMetrics) VendorUnavailable() { m.vendorUnavailableCalls++ }
+
+func TestScreenAndReport_FailOpenReportsAuditablePassAndReachesScreened(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	reporter := newFakeReporter()
+	mock := provider.NewMockProvider(1)
+	const address = "0xFailOpenAddress000000000000000003"
+	mock.ForceTimeout(address)
+	metrics := &fakeMetrics{}
+	cfg := testConfig()
+	cfg.Timeout = 20 * time.Millisecond
+	cfg.Retries = 1
+	cfg.OutagePolicy = provider.FailOpen
+	cfg.Metrics = metrics
+
+	enqueue(t, pool, 40, "ext-fail-open", address)
+	entry, err := discovery.Get(ctx, pool, 40)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if err := pipeline.ScreenAndReport(ctx, pool, mock, reporter, cfg, entry); err != nil {
+		t.Fatalf("ScreenAndReport: %v", err)
+	}
+
+	decision, ok := reporter.decisions["ext-fail-open"]
+	if !ok {
+		t.Fatal("ReportVerdict was never called")
+	}
+	if decision.Classification != verdict.Pass {
+		t.Fatalf("decision.Classification = %v, want Pass (fail-open)", decision.Classification)
+	}
+	if decision.ReasonCode != verdict.ReasonPassVendorUnavailable {
+		t.Fatalf("decision.ReasonCode = %q, want %q -- must be auditable, never a plain screening_pass",
+			decision.ReasonCode, verdict.ReasonPassVendorUnavailable)
+	}
+	if decision.ScreeningResultID != 0 {
+		t.Fatalf("decision.ScreeningResultID = %d, want 0 -- no real vendor response to cache", decision.ScreeningResultID)
+	}
+	if metrics.vendorUnavailableCalls != 1 {
+		t.Fatalf("VendorUnavailable() called %d times, want exactly 1", metrics.vendorUnavailableCalls)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM screening_results WHERE sender_address = $1`, address).Scan(&count); err != nil {
+		t.Fatalf("counting screening_results: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("a fail-open outage placeholder should never write a screening_results row, found %d", count)
+	}
+}
+
+func TestScreenAndReport_VendorUnavailableMetricFiresForFailClosedToo(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	reporter := newFakeReporter()
+	mock := provider.NewMockProvider(1)
+	const address = "0xFailClosedMetricAddr00000000004"
+	mock.ForceTimeout(address)
+	metrics := &fakeMetrics{}
+	cfg := testConfig()
+	cfg.Timeout = 20 * time.Millisecond
+	cfg.Retries = 1
+	cfg.Metrics = metrics // OutagePolicy left at zero value: FailClosed
+
+	enqueue(t, pool, 41, "ext-fail-closed-metric", address)
+	entry, err := discovery.Get(ctx, pool, 41)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if err := pipeline.ScreenAndReport(ctx, pool, mock, reporter, cfg, entry); err != nil {
+		t.Fatalf("ScreenAndReport: %v", err)
+	}
+	if metrics.vendorUnavailableCalls != 1 {
+		t.Fatalf("VendorUnavailable() called %d times under FailClosed, want exactly 1 -- the metric must fire regardless of policy", metrics.vendorUnavailableCalls)
+	}
+}
+
+// TestScreenAndReport_SucceedsOnRetryUsesRealVerdictNotOutagePath is
+// C3.5's own named acceptance criterion, exercised through the full
+// pipeline (not just provider.ScreenWithPolicy in isolation): a
+// provider that fails N-1 times then succeeds must be classified from
+// that real result, cached normally, never routed through the outage
+// placeholder.
+func TestScreenAndReport_SucceedsOnRetryUsesRealVerdictNotOutagePath(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	reporter := newFakeReporter()
+	mock := &flakyThenRecoverMock{recoverAfter: 2, inner: provider.NewMockProvider(1)}
+	const address = "0xFlakyRecoverAddress0000000000005"
+	cfg := testConfig()
+	cfg.Timeout = time.Second
+	cfg.Retries = 3
+
+	enqueue(t, pool, 42, "ext-flaky-recover", address)
+	entry, err := discovery.Get(ctx, pool, 42)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if err := pipeline.ScreenAndReport(ctx, pool, mock, reporter, cfg, entry); err != nil {
+		t.Fatalf("ScreenAndReport: %v", err)
+	}
+
+	decision, ok := reporter.decisions["ext-flaky-recover"]
+	if !ok {
+		t.Fatal("ReportVerdict was never called")
+	}
+	if decision.ReasonCode == verdict.ReasonHoldUnavailable || decision.ReasonCode == verdict.ReasonPassVendorUnavailable {
+		t.Fatalf("decision = %+v, took the outage path despite the 3rd attempt succeeding", decision)
+	}
+	if decision.ScreeningResultID == 0 {
+		t.Fatal("decision.ScreeningResultID = 0, want a real screening_results row from the successful attempt")
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM screening_results WHERE sender_address = $1`, address).Scan(&count); err != nil {
+		t.Fatalf("counting screening_results: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 cached screening_results row from the successful attempt, found %d", count)
+	}
+}
+
+// flakyThenRecoverMock fails its first N Screen calls with a timeout-like
+// error, then delegates to a real MockProvider from then on.
+type flakyThenRecoverMock struct {
+	recoverAfter int
+	calls        int
+	inner        *provider.MockProvider
+}
+
+func (m *flakyThenRecoverMock) Screen(ctx context.Context, address string) (provider.Verdict, error) {
+	m.calls++
+	if m.calls <= m.recoverAfter {
+		return provider.Verdict{}, errors.New("flakyThenRecoverMock: still failing")
+	}
+	return m.inner.Screen(ctx, address)
 }
 
 func TestScreenAndReport_ReporterFailureLeavesRowPendingForRetry(t *testing.T) {
