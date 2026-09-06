@@ -33,7 +33,7 @@ real domain errors lower layers can return:
 
 | Status | Code | Meaning | Example causes |
 |---|---|---|---|
-| 400 | `invalid_request` | The request itself is malformed or fails basic validation, unrelated to an amount. | Malformed JSON, an unknown field, a missing required field, a bad enum value, a missing `Idempotency-Key` header, `halt.ErrClearRequiresOperator`, `journal.ErrInvalidReverseParams`. |
+| 400 | `invalid_request` | The request itself is malformed or fails basic validation, unrelated to an amount. | Malformed JSON, an unknown field, a missing required field, a bad enum value, a missing `Idempotency-Key` header, `halt.ErrClearRequiresOperator`, `journal.ErrInvalidReverseParams`, `orders.ErrInvalidParams` (e.g. a malformed `GET /v1/orders` cursor, or `sender_address` supplied on a transition that isn't into `funded`), a missing/unknown `state` or non-positive `limit` on `GET /v1/orders`. |
 | 422 | `invalid_entry` | The entry's *shape* is invalid for this operation, distinct from a balance or asset problem. | Fewer than two lines, a zero-amount line, an entry supplied to a transition that doesn't accept one, an entry omitted from a transition that requires one, both `entry` and `entry_id` supplied to one transition. |
 | 401 | `unauthorized` | Missing or invalid bearer token. |  |
 

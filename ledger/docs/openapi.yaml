@@ -173,6 +173,40 @@ paths:
               schema: { $ref: "#/components/schemas/Order" }
         "400": { $ref: "#/components/responses/BadRequest" }
 
+    get:
+      summary: List orders in a given state, paginated by cursor
+      description: >
+        Added for C3 (screening) discovery: C1's only way to say "which
+        orders just entered a state", since there is no event bus in this
+        system by design. Deliberately generic -- a reusable list-by-state
+        primitive, not a point-to-point coupling to one caller. Keyset
+        pagination ordered by (updated_at, id), not OFFSET, so a page's
+        cost doesn't grow with how deep a caller has already paged.
+      parameters:
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [quoted, funded, screened, dispatching, settled, held, refunded, expired]
+        - name: updated_after
+          in: query
+          required: false
+          description: Opaque cursor from a previous response's next_cursor.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: "Default 100, max 500."
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
   /v1/orders/{external_id}:
     get:
       summary: Fetch an order by its external id
@@ -565,6 +599,14 @@ components:
         fee_units: { type: string }
         network_fee_units: { type: string }
         recipient_address: { type: string }
+        sender_address:
+          type: string
+          nullable: true
+          description: >
+            The BSC address that funded this order's deposit. Null until
+            the quoted->funded transition sets it (see
+            PostTransitionRequest.sender_address); never cleared
+            afterward. Added for C3 (screening).
         quoted_at: { type: string, format: date-time }
         quote_expires_at: { type: string, format: date-time }
         version: { type: integer }
@@ -606,6 +648,29 @@ components:
             negating entry via `entry` instead produces an ordinary entry
             with reversal_of NULL, unlinked to what it undoes and outside
             the UNIQUE constraint that makes a double-reversal impossible.
+        sender_address:
+          type: string
+          nullable: true
+          description: >
+            Only accepted when to_state is funded -- rejected with 400
+            invalid_request on any other target. Sibling to entry, not a
+            line or metadata field inside it: not a ledger amount, and C3
+            needs to query it structurally.
+
+    OrderList:
+      type: object
+      properties:
+        orders:
+          type: array
+          items: { $ref: "#/components/schemas/Order" }
+        next_cursor:
+          type: string
+          description: >
+            Opaque pagination token -- pass back as updated_after on the
+            next call. Present whenever there is a cursor to give,
+            including an empty page (echoes the caller's own
+            updated_after back), so a poller can always feed it straight
+            in as its next updated_after, forever.
 
     Balance:
       type: object

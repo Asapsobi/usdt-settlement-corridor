@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -37,6 +38,7 @@ type orderResponse struct {
 	FeeUnits         string    `json:"fee_units"`
 	NetworkFeeUnits  string    `json:"network_fee_units"`
 	RecipientAddress string    `json:"recipient_address"`
+	SenderAddress    *string   `json:"sender_address"`
 	QuotedAt         time.Time `json:"quoted_at"`
 	QuoteExpiresAt   time.Time `json:"quote_expires_at"`
 	Version          int32     `json:"version"`
@@ -52,7 +54,8 @@ func toOrderResponse(o orders.Order) orderResponse {
 	return orderResponse{
 		ID: o.ID, ExternalID: o.ExternalID, CustomerID: o.CustomerID, Tier: string(o.Tier), State: string(o.State),
 		AmountIn: amountIn, AmountOut: amountOut, FeeUnits: feeUnits, NetworkFeeUnits: networkFeeUnits,
-		RecipientAddress: o.RecipientAddress, QuotedAt: o.QuotedAt, QuoteExpiresAt: o.QuoteExpiresAt,
+		RecipientAddress: o.RecipientAddress, SenderAddress: o.SenderAddress,
+		QuotedAt: o.QuotedAt, QuoteExpiresAt: o.QuoteExpiresAt,
 		Version: o.Version, CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt,
 	}
 }
@@ -121,6 +124,78 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, toOrderResponse(order))
 }
 
+type listOrdersResponse struct {
+	Orders     []orderResponse `json:"orders"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+// getOrders is GET /v1/orders?state=<state>&updated_after=<cursor>&limit=<n>
+// -- added for C3 (screening) discovery: C1's only way to say "which
+// orders just entered a state", since there is no event bus in this
+// system by design (see docs/03-build/c3-screening-build-prompts.md's
+// "Read this first"). Deliberately generic (list-by-state, not
+// "list-funded-for-screening") so it's a reusable primitive for ops
+// tooling and C6 too, not a point-to-point coupling to one caller.
+//
+// next_cursor is always returned when there is a cursor to give,
+// including an empty page (echoes the caller's own updated_after back so
+// a poller never has to special-case "nothing new yet" versus "here's
+// where you were") -- a poller can always feed it straight back in as
+// its next updated_after, forever.
+func (s *Server) getOrders(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	stateParam := q.Get("state")
+	if stateParam == "" {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "state is required"))
+		return
+	}
+	state := orders.State(stateParam)
+	if !state.Valid() {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "unknown state "+stateParam))
+		return
+	}
+
+	limit := orders.DefaultListLimit
+	if raw := q.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "limit must be a positive integer"))
+			return
+		}
+		limit = parsed
+	}
+
+	var after *orders.Cursor
+	if raw := q.Get("updated_after"); raw != "" {
+		parsed, err := orders.ParseCursor(raw)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		after = &parsed
+	}
+
+	list, err := orders.ListByStateAfter(r.Context(), s.Pool, state, after, limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	resp := listOrdersResponse{Orders: make([]orderResponse, len(list))}
+	for i, o := range list {
+		resp.Orders[i] = toOrderResponse(o)
+	}
+	switch {
+	case len(list) > 0:
+		last := list[len(list)-1]
+		resp.NextCursor = (orders.Cursor{UpdatedAt: last.UpdatedAt, ID: last.ID}).String()
+	case after != nil:
+		resp.NextCursor = after.String()
+	}
+	respondJSON(w, http.StatusOK, resp)
+}
+
 type transitionEntryRequest struct {
 	EntryType  string             `json:"entry_type"`
 	OccurredAt time.Time          `json:"occurred_at"`
@@ -153,6 +228,12 @@ type postTransitionRequest struct {
 	// enforces that, and exactly one is required when the transition rule
 	// requires an entry.
 	EntryID *int64 `json:"entry_id,omitempty"`
+	// SenderAddress is sibling to entry, not a line or metadata field
+	// inside it: it isn't a ledger amount, and C3 needs to query it
+	// structurally, not parse a jsonb blob this API makes no shape
+	// promise about. Only accepted on a transition into funded -- see
+	// orders.TransitionParams.SenderAddress.
+	SenderAddress *string `json:"sender_address,omitempty"`
 }
 
 // postTransition is POST /v1/orders/{external_id}/transitions. When the
@@ -201,11 +282,12 @@ func (s *Server) postTransition(w http.ResponseWriter, r *http.Request) {
 	err = db.Tx(r.Context(), s.Pool, func(ctx context.Context, tx pgx.Tx) error {
 		var err error
 		updated, err = orders.Transition(ctx, tx, order.ID, orders.State(req.ToState), req.ExpectedVersion, orders.TransitionParams{
-			Actor:      actorFromContext(ctx),
-			Reason:     req.Reason,
-			OccurredAt: req.OccurredAt,
-			Entry:      entryReq,
-			EntryID:    req.EntryID,
+			Actor:         actorFromContext(ctx),
+			Reason:        req.Reason,
+			OccurredAt:    req.OccurredAt,
+			Entry:         entryReq,
+			EntryID:       req.EntryID,
+			SenderAddress: req.SenderAddress,
 		})
 		return err
 	})

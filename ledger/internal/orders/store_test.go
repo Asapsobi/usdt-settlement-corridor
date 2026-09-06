@@ -97,6 +97,10 @@ func TestTransitionParamsValidate(t *testing.T) {
 			id := int64(1)
 			p.EntryID = &id
 		}},
+		{"empty sender_address", func(p *TransitionParams) {
+			empty := ""
+			p.SenderAddress = &empty
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -107,5 +111,30 @@ func TestTransitionParamsValidate(t *testing.T) {
 				t.Fatalf("validate() = %v, want ErrInvalidParams", err)
 			}
 		})
+	}
+}
+
+func TestCursor_RoundTrip(t *testing.T) {
+	c := Cursor{UpdatedAt: time.Date(2026, 9, 6, 12, 0, 0, 123456789, time.UTC), ID: 42}
+	parsed, err := ParseCursor(c.String())
+	if err != nil {
+		t.Fatalf("ParseCursor(%q): %v", c.String(), err)
+	}
+	if !parsed.UpdatedAt.Equal(c.UpdatedAt) || parsed.ID != c.ID {
+		t.Fatalf("ParseCursor round-trip: got %+v, want %+v", parsed, c)
+	}
+}
+
+func TestCursor_ParseRejectsMalformed(t *testing.T) {
+	cases := []string{
+		"",
+		"not-valid-base64!!!",
+		"bm8tcGlwZS1oZXJl", // valid base64, but decodes to "no-pipe-here" (no "|")
+		"MjAyNi0wOS0wNlQxMjowMDowMFp8bm90LWFuLWlk", // "2026-09-06T12:00:00Z|not-an-id"
+	}
+	for _, s := range cases {
+		if _, err := ParseCursor(s); !errors.Is(err, ErrInvalidParams) {
+			t.Errorf("ParseCursor(%q) = %v, want ErrInvalidParams", s, err)
+		}
 	}
 }

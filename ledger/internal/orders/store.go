@@ -2,8 +2,11 @@ package orders
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -102,7 +105,7 @@ func Create(ctx context.Context, q accounts.Queryer, p CreateParams) (Order, err
 			 version)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0)
 		RETURNING id, external_id, customer_id, tier, state, amount_in, amount_out,
-			fee_units, network_fee_units, recipient_address, quoted_at, quote_expires_at,
+			fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
 			version, created_at, updated_at
 	`, p.ExternalID, p.CustomerID, string(p.Tier), string(Quoted),
 		p.AmountIn.Units, p.AmountOut.Units, p.FeeUnits.Units, p.NetworkFeeUnits.Units,
@@ -181,6 +184,19 @@ type TransitionParams struct {
 	// one of Entry / EntryID may be set, and exactly one must be set
 	// when the transition rule requires an entry.
 	EntryID *int64
+	// SenderAddress is the BSC address that funded this order's
+	// deposit, supplied by C2 alongside the quoted->funded transition's
+	// entry (see docs/03-build/c3-screening-build-prompts.md §A). Only
+	// accepted when toState is Funded -- nil on every other transition,
+	// which is also what every caller that predates this field already
+	// sends, so this is additive. A non-nil value always overwrites
+	// whatever was there (including a prior non-nil value): the only
+	// path that can reach the write is a real quoted->funded transition,
+	// which after a funded->quoted reversal (a reorg) can legitimately
+	// happen a second time for the same order, from a possibly different
+	// sender -- there is no separate "immutable" guard beyond that, since
+	// no other code path ever writes this column at all.
+	SenderAddress *string
 }
 
 func (p TransitionParams) validate() error {
@@ -195,6 +211,9 @@ func (p TransitionParams) validate() error {
 	}
 	if p.Entry != nil && p.EntryID != nil {
 		return fmt.Errorf("%w: both Entry and EntryID set", ErrInvalidParams)
+	}
+	if p.SenderAddress != nil && *p.SenderAddress == "" {
+		return fmt.Errorf("%w: sender_address, if set, must not be empty", ErrInvalidParams)
 	}
 	return nil
 }
@@ -284,6 +303,11 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 		return Order{}, fmt.Errorf("%w: %s -> %s", ErrEntryNotAllowed, current.State, toState)
 	}
 
+	if p.SenderAddress != nil && toState != Funded {
+		return Order{}, fmt.Errorf("%w: sender_address is only accepted on a transition into funded, got %s -> %s",
+			ErrInvalidParams, current.State, toState)
+	}
+
 	entryID := p.EntryID
 	if p.Entry != nil {
 		entry, err := journal.Post(ctx, tx, *p.Entry)
@@ -295,12 +319,13 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 
 	row := tx.QueryRow(ctx, `
 		UPDATE orders
-		SET state = $1, version = version + 1, updated_at = now()
+		SET state = $1, version = version + 1, updated_at = now(),
+			sender_address = COALESCE($4, sender_address)
 		WHERE id = $2 AND version = $3
 		RETURNING id, external_id, customer_id, tier, state, amount_in, amount_out,
-			fee_units, network_fee_units, recipient_address, quoted_at, quote_expires_at,
+			fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
 			version, created_at, updated_at
-	`, string(toState), orderID, expectedVersion)
+	`, string(toState), orderID, expectedVersion, p.SenderAddress)
 
 	updated, err := scanOrder(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -363,7 +388,7 @@ func replayIfAlreadyPosted(ctx context.Context, tx pgx.Tx, current Order, entryR
 
 const orderSelectSQL = `
 	SELECT id, external_id, customer_id, tier, state, amount_in, amount_out,
-		fee_units, network_fee_units, recipient_address, quoted_at, quote_expires_at,
+		fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
 		version, created_at, updated_at
 	FROM orders`
 
@@ -377,7 +402,7 @@ func scanOrder(row scanRow) (Order, error) {
 	var amountIn, amountOut, feeUnits, networkFeeUnits int64
 	err := row.Scan(
 		&o.ID, &o.ExternalID, &o.CustomerID, &tier, &state, &amountIn, &amountOut,
-		&feeUnits, &networkFeeUnits, &o.RecipientAddress, &o.QuotedAt, &o.QuoteExpiresAt,
+		&feeUnits, &networkFeeUnits, &o.RecipientAddress, &o.SenderAddress, &o.QuotedAt, &o.QuoteExpiresAt,
 		&o.Version, &o.CreatedAt, &o.UpdatedAt,
 	)
 	if err != nil {
@@ -390,4 +415,102 @@ func scanOrder(row scanRow) (Order, error) {
 	o.FeeUnits = money.Amount{Asset: money.USDT_TRC20, Units: feeUnits}
 	o.NetworkFeeUnits = money.Amount{Asset: money.USDT_TRC20, Units: networkFeeUnits}
 	return o, nil
+}
+
+// DefaultListLimit and MaxListLimit bound ListByStateAfter's page size --
+// a safety net for any caller (HTTP or direct Go) that doesn't apply its
+// own bound. C3's discovery poll (component-map.md's own volume figures,
+// ~4 deposits/hour peak) will never come close to MaxListLimit; it exists
+// so a malformed or malicious limit can't force an unbounded scan.
+const (
+	DefaultListLimit = 100
+	MaxListLimit     = 500
+)
+
+// Cursor is an opaque pagination bookmark for ListByStateAfter: the
+// (updated_at, id) of the last row a caller has already seen. Callers
+// must treat the string form as opaque -- constructed and parsed only
+// through Cursor.String and ParseCursor, never assembled by hand.
+type Cursor struct {
+	UpdatedAt time.Time
+	ID        int64
+}
+
+// String encodes c as an opaque, URL-safe token.
+func (c Cursor) String() string {
+	raw := fmt.Sprintf("%s|%d", c.UpdatedAt.UTC().Format(time.RFC3339Nano), c.ID)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// ParseCursor decodes a token previously produced by Cursor.String.
+func ParseCursor(s string) (Cursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%w: malformed cursor", ErrInvalidParams)
+	}
+	updatedAtRaw, idRaw, ok := strings.Cut(string(raw), "|")
+	if !ok {
+		return Cursor{}, fmt.Errorf("%w: malformed cursor", ErrInvalidParams)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtRaw)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%w: malformed cursor timestamp", ErrInvalidParams)
+	}
+	id, err := strconv.ParseInt(idRaw, 10, 64)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%w: malformed cursor id", ErrInvalidParams)
+	}
+	return Cursor{UpdatedAt: updatedAt, ID: id}, nil
+}
+
+// ListByStateAfter returns up to limit orders in state, ordered by
+// (updated_at, id) ascending, strictly after the given cursor -- keyset
+// pagination, not OFFSET, so a page's cost doesn't grow with how deep
+// into the result set a caller has already paged. after == nil starts
+// from the beginning. limit <= 0 uses DefaultListLimit; anything above
+// MaxListLimit is clamped down to it.
+//
+// This is C3's own discovery mechanism (§0/C3.3 of
+// docs/03-build/c3-screening-build-prompts.md): polling was chosen over
+// C1 pushing to C3 specifically so this stays a small, generically
+// reusable "list by state" primitive, not a point-to-point coupling to
+// one downstream service.
+func ListByStateAfter(ctx context.Context, q accounts.Queryer, state State, after *Cursor, limit int) ([]Order, error) {
+	if limit <= 0 {
+		limit = DefaultListLimit
+	}
+	if limit > MaxListLimit {
+		limit = MaxListLimit
+	}
+
+	var afterUpdatedAt *time.Time
+	var afterID *int64
+	if after != nil {
+		afterUpdatedAt = &after.UpdatedAt
+		afterID = &after.ID
+	}
+
+	rows, err := q.Query(ctx, orderSelectSQL+`
+		WHERE state = $1
+		  AND ($2::timestamptz IS NULL OR (updated_at, id) > ($2, $3))
+		ORDER BY updated_at ASC, id ASC
+		LIMIT $4
+	`, string(state), afterUpdatedAt, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("orders: list by state %s after cursor: %w", state, err)
+	}
+	defer rows.Close()
+
+	var out []Order
+	for rows.Next() {
+		o, err := scanOrder(rows)
+		if err != nil {
+			return nil, fmt.Errorf("orders: list by state %s after cursor: %w", state, err)
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("orders: list by state %s after cursor: %w", state, err)
+	}
+	return out, nil
 }

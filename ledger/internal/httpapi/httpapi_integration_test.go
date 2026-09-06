@@ -805,3 +805,147 @@ func TestPostReconciliationSnapshot(t *testing.T) {
 	decodeInto(t, resp, &result)
 	require.Equal(t, false, result["halted"])
 }
+
+// ---------------------------------------------------------------------
+// sender_address and GET /v1/orders?state= (added for C3/screening --
+// see docs/03-build/c3-screening-build-prompts.md's "Read this first").
+// ---------------------------------------------------------------------
+
+// fundOrderViaHTTP transitions order to funded over the real HTTP API,
+// with the real deposit_final entry shape C2's ledgerclient actually
+// sends (see depositwatcher/internal/ledgerclient/ledgerclient.go), plus
+// sender_address if non-empty.
+func fundOrderViaHTTP(t *testing.T, baseURL string, ctx context.Context, pool *pgxpool.Pool, order map[string]any, senderAddress string) map[string]any {
+	t.Helper()
+	custBEP := "liability:customer:" + uniqueSuffix(t) + ":USDT_BEP20"
+	_, err := accounts.Create(ctx, pool, custBEP, accounts.Liability, money.USDT_BEP20)
+	require.NoError(t, err)
+	depositAcc := "asset:bsc:deposit:" + uniqueSuffix(t)
+	_, err = accounts.Create(ctx, pool, depositAcc, accounts.Asset, money.USDT_BEP20)
+	require.NoError(t, err)
+
+	body := map[string]any{
+		"to_state": "funded", "expected_version": order["version"],
+		"reason": "deposit", "occurred_at": time.Now().Format(time.RFC3339),
+		"entry": map[string]any{
+			"entry_type": "deposit_final", "occurred_at": time.Now().Format(time.RFC3339),
+			"lines": []map[string]any{
+				{"account_code": depositAcc, "asset": "USDT_BEP20", "amount": order["amount_in"]},
+				{"account_code": custBEP, "asset": "USDT_BEP20", "amount": "-" + order["amount_in"].(string)},
+			},
+		},
+	}
+	if senderAddress != "" {
+		body["sender_address"] = senderAddress
+	}
+
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/orders/"+order["external_id"].(string)+"/transitions", idemKey(t), body)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var updated map[string]any
+	decodeInto(t, resp, &updated)
+	return updated
+}
+
+func TestSenderAddressRoundTripsThroughFundingTransition(t *testing.T) {
+	baseURL, ctxPool := testServer(t)
+	ctx := context.Background()
+	order := createOrderViaHTTP(t, baseURL)
+	require.Nil(t, order["sender_address"], "a freshly quoted order must have a null sender_address")
+
+	const sender = "0xSenderAddressHTTP00000000000000000001"
+	funded := fundOrderViaHTTP(t, baseURL, ctx, ctxPool, order, sender)
+	require.Equal(t, sender, funded["sender_address"])
+
+	// A fresh GET sees it too -- not just the transition response.
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/orders/"+order["external_id"].(string), "", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var reloaded map[string]any
+	decodeInto(t, resp, &reloaded)
+	require.Equal(t, sender, reloaded["sender_address"])
+}
+
+func TestSenderAddressRejectedOnNonFundedTransition(t *testing.T) {
+	baseURL, _ := testServer(t)
+	order := createOrderViaHTTP(t, baseURL)
+
+	body := map[string]any{
+		"to_state": "expired", "expected_version": order["version"],
+		"reason": "not a funding transition", "occurred_at": time.Now().Format(time.RFC3339),
+		"sender_address": "0xShouldNotBeAccepted00000000000000001",
+	}
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/orders/"+order["external_id"].(string)+"/transitions", idemKey(t), body)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "invalid_request", decodeError(t, resp).Error.Code)
+}
+
+func TestGetOrders_RequiresState(t *testing.T) {
+	baseURL, _ := testServer(t)
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/orders", "", nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "invalid_request", decodeError(t, resp).Error.Code)
+}
+
+func TestGetOrders_UnknownStateRejected(t *testing.T) {
+	baseURL, _ := testServer(t)
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/orders?state=bogus", "", nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "invalid_request", decodeError(t, resp).Error.Code)
+}
+
+func TestGetOrders_InvalidCursorRejected(t *testing.T) {
+	baseURL, _ := testServer(t)
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/orders?state=funded&updated_after=not-a-real-cursor", "", nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "invalid_request", decodeError(t, resp).Error.Code)
+}
+
+func TestGetOrders_FiltersByStateAndPaginatesWithCursor(t *testing.T) {
+	// Isolated database: this test asserts an EXACT set of orders for a
+	// state, which the shared ledger_test database (used by every other
+	// test in this file, running concurrently across packages) cannot
+	// guarantee.
+	baseURL, ctxPool := testServerIsolated(t)
+	ctx := context.Background()
+
+	var fundedExternalIDs []string
+	for i := 0; i < 3; i++ {
+		order := createOrderViaHTTP(t, baseURL)
+		funded := fundOrderViaHTTP(t, baseURL, ctx, ctxPool, order, "")
+		fundedExternalIDs = append(fundedExternalIDs, funded["external_id"].(string))
+		time.Sleep(2 * time.Millisecond) // force distinct updated_at for a stable page order
+	}
+	quotedOrder := createOrderViaHTTP(t, baseURL) // must never appear in state=funded
+
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < 20; pages++ {
+		url := baseURL + "/v1/orders?state=funded&limit=2"
+		if cursor != "" {
+			url += "&updated_after=" + cursor
+		}
+		resp := doRequest(t, http.MethodGet, url, "", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var page struct {
+			Orders     []map[string]any `json:"orders"`
+			NextCursor string           `json:"next_cursor"`
+		}
+		decodeInto(t, resp, &page)
+
+		if len(page.Orders) == 0 {
+			require.Equal(t, cursor, page.NextCursor, "an empty page must echo the caller's own cursor back")
+			break
+		}
+		for _, o := range page.Orders {
+			extID := o["external_id"].(string)
+			require.False(t, seen[extID], "order %s returned twice across pages", extID)
+			seen[extID] = true
+			require.NotEqual(t, quotedOrder["external_id"], extID, "a quoted order must never appear in a state=funded listing")
+		}
+		require.NotEmpty(t, page.NextCursor)
+		cursor = page.NextCursor
+	}
+
+	for _, extID := range fundedExternalIDs {
+		require.True(t, seen[extID], "funded order %s was never returned by any page", extID)
+	}
+}

@@ -603,3 +603,174 @@ func TestConcurrentTransitionSameVersionExactlyOneSucceeds(t *testing.T) {
 	require.Equal(t, orders.Expired, reloaded.State)
 	require.Equal(t, order.Version+1, reloaded.Version)
 }
+
+// ---------------------------------------------------------------------
+// sender_address (added for C3/screening -- see
+// docs/03-build/c3-screening-build-prompts.md's "Read this first" and
+// migrations/0009_orders_sender_address.sql).
+// ---------------------------------------------------------------------
+
+func TestTransition_SenderAddressSetOnFundedAndPersists(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order := newQuotedOrder(t, ctx, pool)
+	require.Nil(t, order.SenderAddress, "a freshly quoted order must have no sender_address yet")
+
+	acc1, acc2 := twoTRXAccounts(t, ctx, pool)
+	entry := simpleEntry(t, acc1, acc2)
+	sender := "0xSenderAddress0000000000000000000000001"
+
+	var updated orders.Order
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		updated, err = orders.Transition(ctx, tx, order.ID, orders.Funded, order.Version, orders.TransitionParams{
+			Actor: "test", Reason: "fund", OccurredAt: time.Now(),
+			Entry: &entry, SenderAddress: &sender,
+		})
+		return err
+	})
+	require.NoError(t, err)
+	require.NotNil(t, updated.SenderAddress)
+	require.Equal(t, sender, *updated.SenderAddress)
+
+	// Persisted, not just returned in-memory: a fresh read sees it too.
+	reloaded, err := orders.GetByExternalID(ctx, pool, order.ExternalID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded.SenderAddress)
+	require.Equal(t, sender, *reloaded.SenderAddress)
+}
+
+func TestTransition_SenderAddressRejectedOnNonFundedTarget(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order := newQuotedOrder(t, ctx, pool)
+	sender := "0xSenderAddress0000000000000000000000002"
+
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := orders.Transition(ctx, tx, order.ID, orders.Expired, order.Version, orders.TransitionParams{
+			Actor: "test", Reason: "not a funding transition", OccurredAt: time.Now(),
+			SenderAddress: &sender,
+		})
+		return err
+	})
+	require.ErrorIs(t, err, orders.ErrInvalidParams)
+
+	// Rejected before anything was written -- still Quoted, no sender_address.
+	reloaded, err := orders.Get(ctx, pool, order.ID)
+	require.NoError(t, err)
+	require.Equal(t, orders.Quoted, reloaded.State)
+	require.Nil(t, reloaded.SenderAddress)
+}
+
+// TestTransition_SenderAddressOverwrittenAfterReorgRefund covers the one
+// path that can legitimately call the quoted->funded write twice for the
+// same order: a reorg reverses funded->quoted (see transitionTable), and
+// a later re-detected deposit -- possibly from a different sender than
+// the one that got reorged out -- funds it again. The second value must
+// win; this is not "immutable" in the sense of "never changes", only in
+// the sense of "nothing but this one transition ever writes it".
+func TestTransition_SenderAddressOverwrittenAfterReorgRefund(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	order := newQuotedOrder(t, ctx, pool)
+
+	acc1, acc2 := twoTRXAccounts(t, ctx, pool)
+	firstEntry := simpleEntry(t, acc1, acc2)
+	firstSender := "0xFirstSender000000000000000000000000001"
+
+	var funded orders.Order
+	err := withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		funded, err = orders.Transition(ctx, tx, order.ID, orders.Funded, order.Version, orders.TransitionParams{
+			Actor: "test", Reason: "fund", OccurredAt: time.Now(),
+			Entry: &firstEntry, SenderAddress: &firstSender,
+		})
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, firstSender, *funded.SenderAddress)
+
+	// Reorg: funded -> quoted (reversal), requires an entry, not halt-blocked.
+	acc3, acc4 := twoTRXAccounts(t, ctx, pool)
+	reversalEntry := simpleEntry(t, acc3, acc4)
+	var reverted orders.Order
+	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		reverted, err = orders.Transition(ctx, tx, order.ID, orders.Quoted, funded.Version, orders.TransitionParams{
+			Actor: "test", Reason: "reorg", OccurredAt: time.Now(),
+			Entry: &reversalEntry,
+		})
+		return err
+	})
+	require.NoError(t, err)
+	// The reversal itself never touches sender_address -- only a
+	// quoted->funded transition ever writes this column.
+	require.NotNil(t, reverted.SenderAddress)
+	require.Equal(t, firstSender, *reverted.SenderAddress)
+
+	acc5, acc6 := twoTRXAccounts(t, ctx, pool)
+	secondEntry := simpleEntry(t, acc5, acc6)
+	secondSender := "0xSecondSender00000000000000000000000002"
+	var refunded orders.Order
+	err = withTx(t, pool, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		refunded, err = orders.Transition(ctx, tx, order.ID, orders.Funded, reverted.Version, orders.TransitionParams{
+			Actor: "test", Reason: "re-fund after reorg", OccurredAt: time.Now(),
+			Entry: &secondEntry, SenderAddress: &secondSender,
+		})
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, secondSender, *refunded.SenderAddress, "the second funding event's sender must win")
+}
+
+// ---------------------------------------------------------------------
+// ListByStateAfter / Cursor (added for C3/screening discovery -- §A of
+// docs/03-build/c3-screening-build-prompts.md).
+// ---------------------------------------------------------------------
+
+func TestListByStateAfter_FiltersByStateAndPaginates(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	// Three funded orders this test owns, created in a known order, plus
+	// one quoted order that must never appear in a state=funded query.
+	var funded []orders.Order
+	for i := 0; i < 3; i++ {
+		o := advanceToState(t, ctx, pool, orders.Funded)
+		funded = append(funded, o)
+		time.Sleep(2 * time.Millisecond) // force distinct updated_at for a stable order
+	}
+	quoted := newQuotedOrder(t, ctx, pool)
+
+	// Page 1: limit 2.
+	page1, err := orders.ListByStateAfter(ctx, pool, orders.Funded, nil, 2)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(page1), 1) // shared DB: other tests' funded orders may also be present, but ours must appear in order
+
+	for _, o := range page1 {
+		require.NotEqual(t, quoted.ID, o.ID, "a quoted order must never appear in a state=funded listing")
+	}
+
+	// Walk forward with the cursor until we've seen all three of ours,
+	// or run out of pages -- proves cursor pagination advances and never
+	// re-returns an already-seen row.
+	seen := map[int64]bool{}
+	var cursor *orders.Cursor
+	for pages := 0; pages < 100; pages++ {
+		page, err := orders.ListByStateAfter(ctx, pool, orders.Funded, cursor, 2)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		for _, o := range page {
+			require.False(t, seen[o.ID], "order %d returned twice across pages", o.ID)
+			seen[o.ID] = true
+		}
+		last := page[len(page)-1]
+		cursor = &orders.Cursor{UpdatedAt: last.UpdatedAt, ID: last.ID}
+	}
+	for _, o := range funded {
+		require.True(t, seen[o.ID], "order %d (state=funded) was never returned by any page", o.ID)
+	}
+}

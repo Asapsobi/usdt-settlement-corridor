@@ -56,6 +56,7 @@ func NewRouter(s *Server) http.Handler {
 		r.With(requireIdempotencyKey).Post("/entries/{id}/reversal", s.postReversal)
 
 		r.With(requireIdempotencyKey).Post("/orders", s.postOrder)
+		r.Get("/orders", s.getOrders)
 		r.Get("/orders/{external_id}", s.getOrder)
 		r.With(requireIdempotencyKey).Post("/orders/{external_id}/transitions", s.postTransition)
 		r.With(requireIdempotencyKey).Post("/orders/{external_id}/reorg", s.postReorg)

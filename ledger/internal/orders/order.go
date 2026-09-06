@@ -94,9 +94,17 @@ type Order struct {
 	FeeUnits         money.Amount
 	NetworkFeeUnits  money.Amount
 	RecipientAddress string
-	QuotedAt         time.Time
-	QuoteExpiresAt   time.Time
-	Version          int32
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// SenderAddress is the BSC address that funded this order's deposit
+	// -- nil until the quoted->funded transition sets it (see
+	// TransitionParams.SenderAddress), and never cleared by anything
+	// else afterward. Added for C3 (screening), which needs the
+	// deposit's sender to call a screening provider and has no chain
+	// access of its own to derive it -- see
+	// docs/03-build/c3-screening-build-prompts.md's "Read this first".
+	SenderAddress  *string
+	QuotedAt       time.Time
+	QuoteExpiresAt time.Time
+	Version        int32
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
