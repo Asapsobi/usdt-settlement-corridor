@@ -38,10 +38,11 @@ const highRiskThreshold = 0.95
 type MockProvider struct {
 	seed int64
 
-	mu        sync.RWMutex
-	flagged   map[string]bool
-	timeout   map[string]bool
-	malformed map[string]bool
+	mu         sync.RWMutex
+	flagged    map[string]bool
+	timeout    map[string]bool
+	malformed  map[string]bool
+	screenCall map[string]int
 }
 
 // NewMockProvider returns a MockProvider seeded with seed. Two
@@ -49,11 +50,22 @@ type MockProvider struct {
 // verdicts for identical addresses.
 func NewMockProvider(seed int64) *MockProvider {
 	return &MockProvider{
-		seed:      seed,
-		flagged:   make(map[string]bool),
-		timeout:   make(map[string]bool),
-		malformed: make(map[string]bool),
+		seed:       seed,
+		flagged:    make(map[string]bool),
+		timeout:    make(map[string]bool),
+		malformed:  make(map[string]bool),
+		screenCall: make(map[string]int),
 	}
+}
+
+// ScreenCallCount reports how many times Screen has been called for
+// address -- exported so a caller (internal/pipeline's own tests,
+// concretely) can assert a cache hit really did skip the vendor call
+// entirely, not just that the outcome looked right.
+func (m *MockProvider) ScreenCallCount(address string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.screenCall[address]
 }
 
 // ForceFlagged configures address to always classify as Flagged, on top
@@ -84,11 +96,12 @@ func (m *MockProvider) ForceMalformed(address string) {
 
 // Screen implements ScreeningProvider.
 func (m *MockProvider) Screen(ctx context.Context, address string) (Verdict, error) {
-	m.mu.RLock()
+	m.mu.Lock()
+	m.screenCall[address]++
 	forcedTimeout := m.timeout[address]
 	forcedMalformed := m.malformed[address]
 	forcedFlagged := m.flagged[address]
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	if forcedTimeout {
 		// Block on ctx alone -- never a fixed sleep, so a caller's

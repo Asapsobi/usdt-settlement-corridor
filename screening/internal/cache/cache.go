@@ -60,20 +60,34 @@ func (cfg TTLConfig) For(v provider.Verdict) time.Duration {
 	return cfg.Clean
 }
 
-// Get returns the freshest cached Verdict for (providerName, address)
+// Hit is a cache lookup result: the persisted Verdict plus the
+// screening_results row id it came from. The id matters beyond bare
+// lookup: invariant 3's idempotency-key format
+// ("screening:<verdict>:<order_id>:<screening_result_id>") ties a
+// reported transition to WHICH screening result produced it, not just
+// which order -- so a legitimate re-screen after Invalidate (a new row,
+// a new id) produces a genuinely different idempotency key rather than
+// deduping against a stale prior report. internal/ledgerclient's
+// ReportVerdict (C3.4) is the consumer that needs this.
+type Hit struct {
+	provider.Verdict
+	ID int64
+}
+
+// Get returns the freshest cached result for (providerName, address)
 // that is both unexpired and not covered by a later Invalidate call, or
 // nil if there is none. It never returns an expired or invalidated row --
 // callers that need history for audit purposes query screening_results
 // directly, this is the "is there something to reuse right now" answer
 // only.
-func Get(ctx context.Context, q Queryer, providerName, address string) (*provider.Verdict, error) {
+func Get(ctx context.Context, q Queryer, providerName, address string) (*Hit, error) {
 	invalidatedAt, err := latestInvalidation(ctx, q, providerName, address)
 	if err != nil {
 		return nil, err
 	}
 
 	row := q.QueryRow(ctx, `
-		SELECT risk_score, flagged, reason_codes, raw_response, checked_at
+		SELECT id, risk_score, flagged, reason_codes, raw_response, checked_at
 		FROM screening_results
 		WHERE provider_name = $1
 		  AND sender_address = $2
@@ -83,31 +97,32 @@ func Get(ctx context.Context, q Queryer, providerName, address string) (*provide
 		LIMIT 1
 	`, providerName, address, invalidatedAt)
 
-	var v provider.Verdict
+	var hit Hit
 	var raw []byte
-	if err := row.Scan(&v.RiskScore, &v.Flagged, &v.ReasonCodes, &raw, &v.CheckedAt); err != nil {
+	if err := row.Scan(&hit.ID, &hit.RiskScore, &hit.Flagged, &hit.ReasonCodes, &raw, &hit.CheckedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("cache: get: %w", err)
 	}
-	v.RawResponse = json.RawMessage(raw)
-	v.ProviderName = providerName
+	hit.RawResponse = json.RawMessage(raw)
+	hit.ProviderName = providerName
 
 	// "For which order" (the scenario catalog's own concern about a
 	// stale verdict propagating silently) is logged by the caller, which
 	// is the only layer that knows the order this Get was made on behalf
 	// of -- see internal/verdict/C3.4. This layer logs everything it
 	// itself knows: which cache key was reused, and from when.
-	slog.Info("cache: hit", "provider", providerName, "sender_address", address, "checked_at", v.CheckedAt)
-	return &v, nil
+	slog.Info("cache: hit", "provider", providerName, "sender_address", address, "screening_result_id", hit.ID, "checked_at", hit.CheckedAt)
+	return &hit, nil
 }
 
 // Put records v as a new screening_results row for (providerName,
 // address), never overwriting any prior row for the same key -- a fresh
 // check is always a new insert, preserving full history. expires_at is
-// v.CheckedAt (or, if that's zero, now) plus ttl.
-func Put(ctx context.Context, q Queryer, providerName, address string, v provider.Verdict, ttl time.Duration) error {
+// v.CheckedAt (or, if that's zero, now) plus ttl. Returns the new row's
+// id, for the same reason Get's Hit carries one.
+func Put(ctx context.Context, q Queryer, providerName, address string, v provider.Verdict, ttl time.Duration) (id int64, err error) {
 	checkedAt := v.CheckedAt
 	if checkedAt.IsZero() {
 		checkedAt = time.Now().UTC()
@@ -123,15 +138,16 @@ func Put(ctx context.Context, q Queryer, providerName, address string, v provide
 		reasonCodes = []string{}
 	}
 
-	_, err := q.Exec(ctx, `
+	row := q.QueryRow(ctx, `
 		INSERT INTO screening_results
 		  (provider_name, sender_address, risk_score, flagged, reason_codes, raw_response, checked_at, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id
 	`, providerName, address, v.RiskScore, v.Flagged, reasonCodes, []byte(raw), checkedAt, expiresAt)
-	if err != nil {
-		return fmt.Errorf("cache: put: %w", err)
+	if err := row.Scan(&id); err != nil {
+		return 0, fmt.Errorf("cache: put: %w", err)
 	}
-	return nil
+	return id, nil
 }
 
 // Invalidate marks every screening_results row for (providerName,

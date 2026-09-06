@@ -104,6 +104,65 @@ func listMissingSenderAddress(ctx context.Context, q Queryer) ([]QueueEntry, err
 	return out, nil
 }
 
+// ListReadyForScreening returns every PENDING row that already has a
+// resolved sender_address -- C3.4's own pipeline pulls from exactly this
+// list. A row still missing its address (see listMissingSenderAddress)
+// or already past PENDING (SCREENING or DONE) is never returned, so a
+// row already claimed by a still-in-flight tick isn't picked up again.
+func ListReadyForScreening(ctx context.Context, q Queryer) ([]QueueEntry, error) {
+	rows, err := q.Query(ctx, `
+		SELECT order_id, external_id, sender_address, status
+		FROM screening_queue
+		WHERE status = $1 AND sender_address IS NOT NULL
+		ORDER BY order_id
+	`, string(Pending))
+	if err != nil {
+		return nil, fmt.Errorf("discovery: listing orders ready for screening: %w", err)
+	}
+	defer rows.Close()
+
+	var out []QueueEntry
+	for rows.Next() {
+		var e QueueEntry
+		var status string
+		if err := rows.Scan(&e.OrderID, &e.ExternalID, &e.SenderAddress, &status); err != nil {
+			return nil, fmt.Errorf("discovery: listing orders ready for screening: %w", err)
+		}
+		e.Status = Status(status)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("discovery: listing orders ready for screening: %w", err)
+	}
+	return out, nil
+}
+
+// MarkScreening moves orderID from PENDING to SCREENING -- claimed by
+// this tick, so a concurrent or overlapping tick's own
+// ListReadyForScreening no longer returns it. Restarting mid-screening
+// (a row stuck in SCREENING) is safe to reprocess: internal/pipeline's
+// own ReportVerdict call is idempotent, so re-running it is a no-op on
+// C1's side, never a second conflicting transition.
+func MarkScreening(ctx context.Context, q Queryer, orderID int64) error {
+	if _, err := q.Exec(ctx, `UPDATE screening_queue SET status = $1, updated_at = now() WHERE order_id = $2`,
+		string(Screening), orderID); err != nil {
+		return fmt.Errorf("discovery: marking order %d SCREENING: %w", orderID, err)
+	}
+	return nil
+}
+
+// MarkDone moves orderID to DONE -- the pipeline's own terminal state,
+// reached either after a real verdict was successfully reported or after
+// C1 says the order already left funded (a legitimate race, not an
+// error -- see ledgerclient.ErrIllegalTransition).
+func MarkDone(ctx context.Context, q Queryer, orderID int64) error {
+	if _, err := q.Exec(ctx, `UPDATE screening_queue SET status = $1, updated_at = now() WHERE order_id = $2`,
+		string(Done), orderID); err != nil {
+		return fmt.Errorf("discovery: marking order %d DONE: %w", orderID, err)
+	}
+	return nil
+}
+
 // Get looks up one screening_queue row by order id -- exported for
 // callers (tests, and eventually C3.4/C3.9's HTTP surface) that need to
 // verify or consume what discovery has recorded.

@@ -6,16 +6,20 @@
 package ledgerclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"screening/internal/verdict"
 )
 
 // Client calls one C1 (ledger) instance, authenticating with a single
@@ -65,13 +69,30 @@ func decodeAPIError(status int, body []byte) *APIError {
 
 // do sends one request and returns its status and raw body -- every
 // method on Client goes through this, so request construction and error
-// reading is written exactly once.
-func (c *Client) do(ctx context.Context, method, path string) (status int, respBody []byte, err error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
+// reading is written exactly once. body is marshaled as JSON when
+// non-nil; idempotencyKey is sent as the Idempotency-Key header when
+// non-empty (C1.8 requires it on every write).
+func (c *Client) do(ctx context.Context, method, path, idempotencyKey string, body any) (status int, respBody []byte, err error) {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, fmt.Errorf("ledgerclient: encoding request body: %w", err)
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("ledgerclient: building request: %w", err)
 	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -97,7 +118,7 @@ type orderResp struct {
 
 // GetOrder fetches GET /v1/orders/{externalID}.
 func (c *Client) GetOrder(ctx context.Context, externalID string) (Order, error) {
-	status, body, err := c.do(ctx, http.MethodGet, "/v1/orders/"+externalID)
+	status, body, err := c.do(ctx, http.MethodGet, "/v1/orders/"+externalID, "", nil)
 	if err != nil {
 		return Order{}, err
 	}
@@ -173,7 +194,7 @@ func (c *Client) PollFundedOrders(ctx context.Context, cursor string) (refs []Or
 		path += "&updated_after=" + url.QueryEscape(cursor)
 	}
 
-	status, body, err := c.do(ctx, http.MethodGet, path)
+	status, body, err := c.do(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -198,3 +219,125 @@ func (c *Client) PollFundedOrders(ctx context.Context, cursor string) (refs []Or
 // nowhere close to this; it exists so a page is never unbounded, not
 // because the system is expected to approach it.
 const DefaultPollLimit = 100
+
+// ErrIllegalTransition means the order left `funded` before this report
+// reached C1. Two distinct real causes land here, both handled the same
+// safe way (never retried; the pipeline marks the queue row DONE and
+// moves on -- neither is an error in C3):
+//   - A legitimate race, e.g. a customer cancel landed first (the C3.4
+//     build spec's own named case).
+//   - A replay of a report that already succeeded: since funded->screened
+//     and funded->held post no journal entry, C1 has no idempotent replay
+//     path for them (see ReportVerdict's own doc comment) -- a repeated
+//     call after the order already moved on to screened/held surfaces
+//     identically to the race case above, and is absorbed the same way.
+var ErrIllegalTransition = errors.New("ledgerclient: order left funded before the verdict could be reported")
+
+// ErrUnexpectedHalt means C1 returned system_halted for a verdict
+// report. funded->screened and funded->held are NOT halt-blocked per
+// C1.5's transition table, so this should never happen -- unlike C2.7's
+// own deposit report, where system_halted IS expected for some calls and
+// handled with routine backoff, this is surfaced as a distinct sentinel
+// so the caller can alert loudly (a P1 signal) instead of silently
+// treating it as routine, matching the C3.4 build spec's own explicit
+// instruction not to copy C2.7's handler verbatim here.
+var ErrUnexpectedHalt = errors.New("ledgerclient: unexpected system_halted reporting a verdict (funded->screened/held is not halt-blocked)")
+
+// ReportVerdict posts C3's automatic pass/hold decision to C1: Pass
+// transitions funded->screened, Hold transitions funded->held. Neither
+// requires a journal entry (C1.5's table marks both RequiresEntry:
+// false) -- this never sends one.
+//
+// No actor field is sent: C1.8's transitions endpoint has none in its
+// request DTO and rejects unknown fields outright (DisallowUnknownFields)
+// -- actor is derived entirely from this client's own bearer token
+// identity on C1's side (confirmed against C1's actual handler, per
+// the C3 build spec's own instruction to verify this before C3.6 ships
+// rather than trust the spec's assumed reading). Deploying this service
+// with a token C1 maps to actor "screening-svc" is an ops/config
+// concern, not something this call can express in its request body.
+//
+// The Idempotency-Key follows invariant 3's exact format,
+// "screening:<verdict>:<order_id>:<screening_result_id>" -- tying the
+// key to WHICH screening result produced this decision
+// (decision.ScreeningResultID), not just which order, so a genuine
+// re-screen after a cache invalidation (a new screening_results row, a
+// new id) reports as a distinct event rather than colliding with a
+// stale prior report for the same order.
+//
+// That header is sent because C1.8 requires one on every write, NOT
+// because C1 actually deduplicates on it here: a real C1 was found,
+// while building this chunk, to only replay-detect a transition that
+// posts a journal entry (orders.Transition's own replayIfAlreadyPosted,
+// keyed by the entry's own idempotency key) -- funded->screened and
+// funded->held are both RequiresEntry: false, so there is nothing for
+// C1 to recognize a repeat by. A second call after the first already
+// succeeded gets illegal_transition (ErrIllegalTransition), not a
+// replayed 200 -- see ErrIllegalTransition's own doc comment for why
+// that is still safe in practice. This is a real gap between invariant
+// 3's stated guarantee and what C1 currently does for entry-less
+// transitions, worth raising with whoever owns C1, not something this
+// client can paper over on its own.
+//
+// reason is decision.ReasonCode verbatim (e.g. "screening_hold_flagged"),
+// not the "screening_hold:<reason_code>" template §A's worked example
+// shows: that template predates C3.2 fixing the actual reason code
+// strings, which are already self-namespaced with a "screening_hold_"
+// prefix -- concatenating both would just double the string for no
+// added information.
+func (c *Client) ReportVerdict(ctx context.Context, externalID string, decision verdict.Decision) error {
+	return c.reportVerdict(ctx, externalID, decision, true)
+}
+
+func (c *Client) reportVerdict(ctx context.Context, externalID string, decision verdict.Decision, allowVersionRetry bool) error {
+	order, err := c.GetOrder(ctx, externalID)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: report_verdict for %s: fetching current version: %w", externalID, err)
+	}
+
+	var toState string
+	switch decision.Classification {
+	case verdict.Pass:
+		toState = "screened"
+	case verdict.Hold:
+		toState = "held"
+	default:
+		return fmt.Errorf("ledgerclient: report_verdict for %s: unrecognized classification %v", externalID, decision.Classification)
+	}
+
+	idempotencyKey := fmt.Sprintf("screening:%s:%d:%d", decision.Classification, order.ID, decision.ScreeningResultID)
+	reqBody := map[string]any{
+		"to_state":         toState,
+		"expected_version": order.Version,
+		"reason":           decision.ReasonCode,
+		"occurred_at":      time.Now().UTC().Format(time.RFC3339),
+	}
+
+	status, body, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/v1/orders/%s/transitions", externalID), idempotencyKey, reqBody)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: report_verdict for %s: %w", externalID, err)
+	}
+	if status == http.StatusOK {
+		return nil
+	}
+
+	apiErr := decodeAPIError(status, body)
+	switch apiErr.Code {
+	case "version_conflict":
+		if !allowVersionRetry {
+			return fmt.Errorf("ledgerclient: report_verdict for %s: version_conflict persisted after one retry: %w",
+				externalID, apiErr)
+		}
+		slog.Warn("ledgerclient: report_verdict hit version_conflict, retrying once with a fresh version",
+			"external_id", externalID)
+		return c.reportVerdict(ctx, externalID, decision, false)
+	case "illegal_transition":
+		return fmt.Errorf("%w: %s: %w", ErrIllegalTransition, externalID, apiErr)
+	case "system_halted":
+		slog.Error("ledgerclient: P1 ALERT -- unexpected system_halted reporting a verdict; funded->screened/held is not halt-blocked per C1.5's table",
+			"external_id", externalID)
+		return fmt.Errorf("%w: %w", ErrUnexpectedHalt, apiErr)
+	default:
+		return apiErr
+	}
+}

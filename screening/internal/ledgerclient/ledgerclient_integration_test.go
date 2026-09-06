@@ -3,252 +3,32 @@
 // Requires a real, reachable Postgres 16 instance (LEDGER_TEST_DATABASE_URL)
 // AND a sibling checkout of the ledger module at ../../../ledger -- the
 // same usdt-settlement-corridor layout this whole project already uses.
-// This builds and runs the REAL ledgerd binary as a subprocess and drives
-// it purely over HTTP -- the C3.3 build spec's own final acceptance
-// criterion: "a live integration test against a real C1 instance
-// confirms a genuinely funded order appears within one poll interval and
-// its sender_address round-trips correctly from what C2 originally
-// observed." Mirrors depositwatcher's own
-// internal/ledgerclient/ledgerclient_integration_test.go harness exactly
-// -- duplicated rather than shared, since these are two separate Go
-// modules with no common internal package between them. Run via
-// `make test-integration` (build tag "integration").
+// Uses internal/testledger to build and run the REAL ledgerd binary as a
+// subprocess and drive it purely over HTTP -- the C3.3 build spec's own
+// final acceptance criterion: "a live integration test against a real
+// C1 instance confirms a genuinely funded order appears within one poll
+// interval and its sender_address round-trips correctly from what C2
+// originally observed." Run via `make test-integration` (build tag
+// "integration").
 package ledgerclient_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"screening/internal/ledgerclient"
+	"screening/internal/testledger"
+	"screening/internal/verdict"
 )
 
 const (
 	ledgerListenAddr = ":18436"
-	ledgerBaseURL    = "http://localhost:18436"
 	ledgerAPIToken   = "c33-integration-test-token"
 	ledgerActor      = "screening"
 )
-
-// liveLedger is a real ledgerd process, built and started fresh for this
-// test file, plus a raw SQL connection to the same database used ONLY
-// for account-creation fixture setup (see this file's own createAccount).
-type liveLedger struct {
-	t    *testing.T
-	pool *pgxpool.Pool
-}
-
-func startLiveLedger(t *testing.T) *liveLedger {
-	t.Helper()
-	dbURL := os.Getenv("LEDGER_TEST_DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("LEDGER_TEST_DATABASE_URL not set; skipping integration test")
-	}
-
-	ledgerRoot, err := filepath.Abs(filepath.Join("..", "..", "..", "ledger"))
-	if err != nil {
-		t.Fatalf("resolving ledger module path: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(ledgerRoot, "go.mod")); err != nil {
-		t.Skipf("no sibling ledger module found at %s; skipping (expects the usdt-settlement-corridor layout)", ledgerRoot)
-	}
-
-	tmpDir := t.TempDir()
-	migrateBin := filepath.Join(tmpDir, "migrate_bin")
-	ledgerdBin := filepath.Join(tmpDir, "ledgerd_bin")
-
-	build := func(out, pkg string) {
-		cmd := exec.Command("go", "build", "-o", out, pkg)
-		cmd.Dir = ledgerRoot
-		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("building %s: %v\n%s", pkg, err, output)
-		}
-	}
-	build(migrateBin, "./cmd/migrate")
-	build(ledgerdBin, "./cmd/ledgerd")
-
-	migrate := exec.Command(migrateBin, "up")
-	migrate.Dir = ledgerRoot // goose.Up uses a relative "migrations" path, resolved against the process's cwd
-	migrate.Env = append(os.Environ(), "LEDGER_DATABASE_URL="+dbURL)
-	if output, err := migrate.CombinedOutput(); err != nil {
-		t.Fatalf("running ledger migrations: %v\n%s", err, output)
-	}
-
-	pool, err := pgxpool.New(context.Background(), dbURL)
-	if err != nil {
-		t.Fatalf("connecting to ledger test database: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	ledgerd := exec.Command(ledgerdBin)
-	ledgerd.Dir = ledgerRoot
-	ledgerd.Env = append(os.Environ(),
-		"LEDGER_DATABASE_URL="+dbURL,
-		"LEDGER_API_TOKENS="+ledgerAPIToken+":"+ledgerActor,
-		"LEDGER_LISTEN_ADDR="+ledgerListenAddr,
-	)
-	var logs bytes.Buffer
-	ledgerd.Stdout = &logs
-	ledgerd.Stderr = &logs
-	if err := ledgerd.Start(); err != nil {
-		t.Fatalf("starting ledgerd: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = ledgerd.Process.Kill()
-		_ = ledgerd.Wait()
-		if t.Failed() {
-			t.Logf("ledgerd output:\n%s", logs.String())
-		}
-	})
-
-	ll := &liveLedger{t: t, pool: pool}
-	ll.waitHealthy()
-	return ll
-}
-
-func (ll *liveLedger) waitHealthy() {
-	ll.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(ledgerBaseURL + "/healthz")
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	ll.t.Fatalf("ledgerd never became healthy at %s within the deadline", ledgerBaseURL)
-}
-
-// createAccount mirrors accounts.Create's own INSERT exactly -- there is
-// no public HTTP endpoint for creating an account, so this is test
-// scaffolding only, never a claim that C3 itself can or should write to
-// C1's database directly.
-func (ll *liveLedger) createAccount(code, accountType, asset string, normalSide int) {
-	ll.t.Helper()
-	_, err := ll.pool.Exec(context.Background(), `
-		INSERT INTO accounts (code, type, asset, normal_side)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (code) DO NOTHING
-	`, code, accountType, asset, normalSide)
-	if err != nil {
-		ll.t.Fatalf("creating fixture account %q: %v", code, err)
-	}
-}
-
-type orderResp struct {
-	ID            int64   `json:"id"`
-	ExternalID    string  `json:"external_id"`
-	State         string  `json:"state"`
-	Version       int32   `json:"version"`
-	SenderAddress *string `json:"sender_address"`
-}
-
-func (ll *liveLedger) do(method, path string, idempotencyKey string, body any) (*http.Response, []byte) {
-	ll.t.Helper()
-	var reader *bytes.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			ll.t.Fatalf("encoding request body: %v", err)
-		}
-		reader = bytes.NewReader(b)
-	} else {
-		reader = bytes.NewReader(nil)
-	}
-	req, err := http.NewRequest(method, ledgerBaseURL+path, reader)
-	if err != nil {
-		ll.t.Fatalf("building request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+ledgerAPIToken)
-	if idempotencyKey != "" {
-		req.Header.Set("Idempotency-Key", idempotencyKey)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		ll.t.Fatalf("%s %s: %v", method, path, err)
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		ll.t.Fatalf("%s %s: reading response body: %v", method, path, err)
-	}
-	return resp, respBody
-}
-
-func (ll *liveLedger) createOrder(externalID, customerID string) orderResp {
-	ll.t.Helper()
-	now := time.Now().UTC()
-	resp, body := ll.do(http.MethodPost, "/v1/orders", "create:"+externalID, map[string]any{
-		"external_id":       externalID,
-		"customer_id":       customerID,
-		"tier":              "STANDARD",
-		"amount_in":         "3000.000000",
-		"amount_out":        "2990.700000",
-		"fee_units":         "7.500000",
-		"network_fee_units": "1.800000",
-		"recipient_address": "T-recipient-" + externalID,
-		"quoted_at":         now,
-		"quote_expires_at":  now.Add(10 * time.Minute),
-	})
-	if resp.StatusCode != http.StatusCreated {
-		ll.t.Fatalf("POST /v1/orders for %s: status %d: %s", externalID, resp.StatusCode, body)
-	}
-	var o orderResp
-	if err := json.Unmarshal(body, &o); err != nil {
-		ll.t.Fatalf("decoding order response: %v: %s", err, body)
-	}
-	return o
-}
-
-// fundOrder transitions order to funded exactly the way C2's own
-// ledgerclient.ReportDepositFinal does -- the real deposit_final entry
-// shape, plus sender_address sibling to entry.
-func (ll *liveLedger) fundOrder(order orderResp, customerID, senderAddress string) orderResp {
-	ll.t.Helper()
-	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
-	custBEP := "liability:customer:" + customerID
-	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
-	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
-
-	resp, body := ll.do(http.MethodPost, fmt.Sprintf("/v1/orders/%s/transitions", order.ExternalID),
-		"fund:"+order.ExternalID, map[string]any{
-			"to_state":         "funded",
-			"expected_version": order.Version,
-			"reason":           "bep20_deposit_final",
-			"occurred_at":      time.Now().UTC(),
-			"sender_address":   senderAddress,
-			"entry": map[string]any{
-				"entry_type":  "deposit_final",
-				"occurred_at": time.Now().UTC(),
-				"lines": []map[string]any{
-					{"account_code": depositAcc, "asset": "USDT_BEP20", "amount": "3000.000000"},
-					{"account_code": custBEP, "asset": "USDT_BEP20", "amount": "-3000.000000"},
-				},
-			},
-		})
-	if resp.StatusCode != http.StatusOK {
-		ll.t.Fatalf("POST /v1/orders/%s/transitions to funded: status %d: %s", order.ExternalID, resp.StatusCode, body)
-	}
-	var o orderResp
-	if err := json.Unmarshal(body, &o); err != nil {
-		ll.t.Fatalf("decoding transition response: %v: %s", err, body)
-	}
-	return o
-}
 
 // TestPollFundedOrdersAndGetSenderAddress_AgainstRealC1 is C3.3's own
 // final acceptance criterion: a genuinely funded order appears via
@@ -256,13 +36,13 @@ func (ll *liveLedger) fundOrder(order orderResp, customerID, senderAddress strin
 // that was reported at funding time -- against a real, running C1, not
 // a fake standing in for one.
 func TestPollFundedOrdersAndGetSenderAddress_AgainstRealC1(t *testing.T) {
-	ll := startLiveLedger(t)
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
 	externalID := "c33-discovery-" + fmt.Sprint(time.Now().UnixNano())
 	customerID := "c33-discovery-cust-" + fmt.Sprint(time.Now().UnixNano())
 	const sender = "0xAE2166bd7901Ea67c1E2Bc4179418fC228108F0"
 
-	order := ll.createOrder(externalID, customerID)
-	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	order := ll.CreateOrder(externalID, customerID)
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
 
 	// Before funding: not visible under state=funded at all.
 	refsBefore, _, err := client.PollFundedOrders(context.Background(), "")
@@ -275,7 +55,7 @@ func TestPollFundedOrdersAndGetSenderAddress_AgainstRealC1(t *testing.T) {
 		}
 	}
 
-	ll.fundOrder(order, customerID, sender)
+	ll.FundOrder(order, customerID, sender)
 
 	// Within one poll (no interval to wait on -- PollFundedOrders is a
 	// single synchronous call, not the loop): the order must now appear.
@@ -307,23 +87,22 @@ func TestPollFundedOrdersAndGetSenderAddress_AgainstRealC1(t *testing.T) {
 
 // TestPollFundedOrders_CursorNeverReturnsAnAlreadySeenOrder proves the
 // cursor this client threads through is genuinely forward-only against a
-// real C1: paging with limit=1 across several funded orders never
-// repeats one.
+// real C1: paging across several funded orders never repeats one.
 func TestPollFundedOrders_CursorNeverReturnsAnAlreadySeenOrder(t *testing.T) {
-	ll := startLiveLedger(t)
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
 	customerID := "c33-cursor-cust-" + fmt.Sprint(time.Now().UnixNano())
 	const sender = "0xAE2166bd7901Ea67c1E2Bc4179418fC228108F1"
 
 	var externalIDs []string
 	for i := 0; i < 3; i++ {
 		externalID := fmt.Sprintf("c33-cursor-%d-%d", time.Now().UnixNano(), i)
-		order := ll.createOrder(externalID, customerID)
-		ll.fundOrder(order, customerID, sender)
+		order := ll.CreateOrder(externalID, customerID)
+		ll.FundOrder(order, customerID, sender)
 		externalIDs = append(externalIDs, externalID)
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
 	seen := map[string]bool{}
 	cursor := ""
 	for pages := 0; pages < 50; pages++ {
@@ -347,5 +126,151 @@ func TestPollFundedOrders_CursorNeverReturnsAnAlreadySeenOrder(t *testing.T) {
 		if !seen[externalID] {
 			t.Fatalf("order %s (funded) was never returned by any page", externalID)
 		}
+	}
+}
+
+func TestReportVerdict_PassTransitionsToScreened(t *testing.T) {
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
+	externalID := "c34-pass-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c34-pass-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.CreateOrder(externalID, customerID)
+	ll.FundOrder(order, customerID, "0xSenderPass0000000000000000000001")
+
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
+	decision := verdict.Decision{Classification: verdict.Pass, ReasonCode: verdict.ReasonPass, ScreeningResultID: 1}
+	if err := client.ReportVerdict(context.Background(), externalID, decision); err != nil {
+		t.Fatalf("ReportVerdict: %v", err)
+	}
+
+	after := ll.GetOrder(externalID)
+	if after.State != "screened" {
+		t.Fatalf("order state after a Pass verdict = %q, want screened", after.State)
+	}
+}
+
+func TestReportVerdict_HoldTransitionsToHeld(t *testing.T) {
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
+	externalID := "c34-hold-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c34-hold-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.CreateOrder(externalID, customerID)
+	ll.FundOrder(order, customerID, "0xSenderHold0000000000000000000002")
+
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
+	decision := verdict.Decision{Classification: verdict.Hold, ReasonCode: verdict.ReasonHoldFlagged, ScreeningResultID: 2}
+	if err := client.ReportVerdict(context.Background(), externalID, decision); err != nil {
+		t.Fatalf("ReportVerdict: %v", err)
+	}
+
+	after := ll.GetOrder(externalID)
+	if after.State != "held" {
+		t.Fatalf("order state after a Hold verdict = %q, want held", after.State)
+	}
+}
+
+// TestReportVerdict_ReplaySurfacesIllegalTransitionSafely is C3.4's own
+// acceptance criterion ("replaying the same queue row... does not
+// attempt a second, conflicting transition"), verified against what a
+// real C1 actually does -- which is NOT the idempotent no-op invariant
+// 3 assumes.
+//
+// A real finding from this test: orders.Transition's own replay
+// detection (replayIfAlreadyPosted, ledger/internal/orders/store.go)
+// only fires "if toState == current.State && p.Entry != nil" -- it is
+// keyed off journal.GetEntryByIdempotencyKey, so it only ever applies to
+// transitions that post an entry. funded->screened and funded->held
+// (C1.5's own table) are BOTH RequiresEntry: false -- so there is no
+// entry for C1 to recognize a repeat by, and the Idempotency-Key header
+// this client sends is required by C1.8's middleware but never actually
+// consulted for these two transitions. A second identical ReportVerdict
+// call does not replay: it fails with illegal_transition, because the
+// order already left funded after the first call succeeded.
+//
+// This is still safe in practice, just for a different reason than
+// invariant 3 describes: illegal_transition is exactly the signal
+// internal/pipeline already treats as "done, no retry" for the
+// legitimate-race case (a customer cancel landing first) -- a replay
+// after a completed report is indistinguishable from that case at this
+// layer, and is absorbed the same safe way. But it is not the
+// idempotent dedup invariant 3 promises, and C1 has no mechanism today
+// to give it for an entry-less transition -- worth flagging to whoever
+// owns C1, not something this client can manufacture on its own.
+func TestReportVerdict_ReplaySurfacesIllegalTransitionSafely(t *testing.T) {
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
+	externalID := "c34-replay-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c34-replay-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.CreateOrder(externalID, customerID)
+	ll.FundOrder(order, customerID, "0xSenderReplay000000000000000003")
+
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
+	decision := verdict.Decision{Classification: verdict.Pass, ReasonCode: verdict.ReasonPass, ScreeningResultID: 3}
+
+	if err := client.ReportVerdict(context.Background(), externalID, decision); err != nil {
+		t.Fatalf("ReportVerdict (first): %v", err)
+	}
+	replayErr := client.ReportVerdict(context.Background(), externalID, decision)
+	if !errors.Is(replayErr, ledgerclient.ErrIllegalTransition) {
+		t.Fatalf("ReportVerdict (replay) = %v, want an error wrapping ledgerclient.ErrIllegalTransition (see this test's own doc comment)", replayErr)
+	}
+
+	// The important safety property: the replay did not corrupt or
+	// double-apply anything -- the order is exactly where the first,
+	// successful call left it.
+	after := ll.GetOrder(externalID)
+	if after.State != "screened" {
+		t.Fatalf("order state after a rejected replay = %q, want screened (unchanged from the first call)", after.State)
+	}
+}
+
+// TestReportVerdict_IllegalTransitionIsNotRetried proves the order
+// already having left funded (a legitimate race, e.g. cancelled first)
+// surfaces as ledgerclient.ErrIllegalTransition, distinguishable from
+// every other failure so the pipeline can mark the row DONE without
+// retry-storming.
+func TestReportVerdict_IllegalTransitionIsNotRetried(t *testing.T) {
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
+	externalID := "c34-illegal-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c34-illegal-cust-" + fmt.Sprint(time.Now().UnixNano())
+	// Deliberately never funded -- still `quoted`, so funded->screened
+	// is illegal from here.
+	ll.CreateOrder(externalID, customerID)
+
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
+	decision := verdict.Decision{Classification: verdict.Pass, ReasonCode: verdict.ReasonPass, ScreeningResultID: 4}
+	err := client.ReportVerdict(context.Background(), externalID, decision)
+	if !errors.Is(err, ledgerclient.ErrIllegalTransition) {
+		t.Fatalf("ReportVerdict = %v, want an error wrapping ledgerclient.ErrIllegalTransition", err)
+	}
+}
+
+// TestReportVerdict_SucceedsWhileHalted confirms, against a real C1,
+// what the C3.4 build spec itself predicted: funded->screened and
+// funded->held are NOT halt-blocked pairs in C1.5's transition table, so
+// halting the ledger has no effect on ReportVerdict at all -- it
+// succeeds normally. ErrUnexpectedHalt exists in this client as a
+// defensive belt-and-suspenders for a case that cannot currently be
+// triggered (there is no way to force C1 to return system_halted for
+// either of these transitions as the transition table stands today);
+// this test proves the actual, reachable behavior instead of asserting
+// something the real system structurally cannot produce.
+func TestReportVerdict_SucceedsWhileHalted(t *testing.T) {
+	ll := testledger.Start(t, ledgerListenAddr, ledgerAPIToken, ledgerActor)
+	externalID := "c34-halted-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c34-halted-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.CreateOrder(externalID, customerID)
+	ll.FundOrder(order, customerID, "0xSenderHalted00000000000000000004")
+
+	ll.SetHalt(true, "c34 test: confirming funded->screened ignores halt")
+	t.Cleanup(func() { ll.SetHalt(false, "") })
+
+	client := ledgerclient.New(ll.BaseURL(), ledgerAPIToken)
+	decision := verdict.Decision{Classification: verdict.Pass, ReasonCode: verdict.ReasonPass, ScreeningResultID: 5}
+
+	if err := client.ReportVerdict(context.Background(), externalID, decision); err != nil {
+		t.Fatalf("ReportVerdict while halted: %v (want success -- funded->screened is not halt-blocked)", err)
+	}
+
+	after := ll.GetOrder(externalID)
+	if after.State != "screened" {
+		t.Fatalf("order state after ReportVerdict while halted = %q, want screened", after.State)
 	}
 }

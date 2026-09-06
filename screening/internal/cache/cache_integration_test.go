@@ -78,8 +78,12 @@ func TestGet_UnexpiredRowIsReturned(t *testing.T) {
 	address := uniqueAddress(t)
 	v := sampleVerdict()
 
-	if err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
+	putID, err := cache.Put(ctx, pool, "mock", address, v, time.Hour)
+	if err != nil {
 		t.Fatalf("Put: %v", err)
+	}
+	if putID == 0 {
+		t.Fatal("Put returned id 0, want a real row id")
 	}
 
 	got, err := cache.Get(ctx, pool, "mock", address)
@@ -92,6 +96,9 @@ func TestGet_UnexpiredRowIsReturned(t *testing.T) {
 	if got.RiskScore != v.RiskScore || got.Flagged != v.Flagged {
 		t.Fatalf("Get returned %+v, want a match for %+v", got, v)
 	}
+	if got.ID != putID {
+		t.Fatalf("Get returned id %d, want the id Put reported (%d)", got.ID, putID)
+	}
 }
 
 func TestGet_ExpiredRowReturnsNilButIsNotDeleted(t *testing.T) {
@@ -101,7 +108,7 @@ func TestGet_ExpiredRowReturnsNilButIsNotDeleted(t *testing.T) {
 	v := sampleVerdict()
 	v.CheckedAt = time.Now().UTC().Add(-2 * time.Hour)
 
-	if err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
+	if _, err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -133,11 +140,16 @@ func TestPut_NeverOverwritesAlwaysInserts(t *testing.T) {
 	second.RiskScore = 0.9
 	second.CheckedAt = first.CheckedAt.Add(time.Second)
 
-	if err := cache.Put(ctx, pool, "mock", address, first, time.Hour); err != nil {
+	firstID, err := cache.Put(ctx, pool, "mock", address, first, time.Hour)
+	if err != nil {
 		t.Fatalf("Put (first): %v", err)
 	}
-	if err := cache.Put(ctx, pool, "mock", address, second, time.Hour); err != nil {
+	secondID, err := cache.Put(ctx, pool, "mock", address, second, time.Hour)
+	if err != nil {
 		t.Fatalf("Put (second): %v", err)
+	}
+	if firstID == secondID {
+		t.Fatalf("two Puts against the same key returned the same id (%d) -- each must be its own row", firstID)
 	}
 
 	var count int
@@ -163,7 +175,7 @@ func TestInvalidate_HidesResultWithoutDeletingHistory(t *testing.T) {
 	address := uniqueAddress(t)
 	v := sampleVerdict()
 
-	if err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
+	if _, err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if got, err := cache.Get(ctx, pool, "mock", address); err != nil || got == nil {
@@ -193,7 +205,7 @@ func TestInvalidate_HidesResultWithoutDeletingHistory(t *testing.T) {
 	// A fresh check after invalidation is trusted again.
 	fresh := sampleVerdict()
 	fresh.CheckedAt = time.Now().UTC()
-	if err := cache.Put(ctx, pool, "mock", address, fresh, time.Hour); err != nil {
+	if _, err := cache.Put(ctx, pool, "mock", address, fresh, time.Hour); err != nil {
 		t.Fatalf("Put (fresh, post-invalidation): %v", err)
 	}
 	got, err = cache.Get(ctx, pool, "mock", address)
@@ -225,7 +237,7 @@ func TestGet_ConcurrentReadsDuringInFlightPut(t *testing.T) {
 
 	// Seed one row so concurrent Gets have something to legitimately
 	// return, then hammer Get concurrently with a second Put in flight.
-	if err := cache.Put(ctx, pool, "mock", address, sampleVerdict(), time.Hour); err != nil {
+	if _, err := cache.Put(ctx, pool, "mock", address, sampleVerdict(), time.Hour); err != nil {
 		t.Fatalf("seed Put: %v", err)
 	}
 
@@ -237,7 +249,7 @@ func TestGet_ConcurrentReadsDuringInFlightPut(t *testing.T) {
 		defer wg.Done()
 		v := sampleVerdict()
 		v.CheckedAt = time.Now().UTC().Add(time.Millisecond)
-		if err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
+		if _, err := cache.Put(ctx, pool, "mock", address, v, time.Hour); err != nil {
 			errs <- fmt.Errorf("concurrent Put: %w", err)
 		}
 	}()
