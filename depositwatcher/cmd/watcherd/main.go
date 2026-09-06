@@ -1,15 +1,10 @@
-// Command watcherd serves C2, the deposit watcher, over HTTP.
-//
-// This wires up the HTTP boundary (C2.9) and address derivation (C2.0)
-// against a real database. It does NOT yet start the chain-ingestion
-// loop or the finality ticker (C2.3/C2.5) -- those need RPC provider
-// URLs, a ledgerclient base URL/token, and the USDT BEP20 contract
-// address/topic, none of which this codebase has an env-driven config
-// step for yet. Server.ChainPool and Server.Tracker are left nil:
-// GET /system/providers and the chain-derived fields of
-// GET /system/invariants degrade explicitly (see httpapi.Server's own
-// doc comment) rather than this command inventing that wiring
-// speculatively. Wiring the full engine in is a distinct, later step.
+// Command watcherd serves C2, the deposit watcher, over HTTP and, when
+// WATCHER_RPC_PROVIDERS is set, runs the live chain-watching engine too:
+// C2.3's ingestion loop and C2.10's candidate pipeline, reporting to a
+// real C1 via ledgerclient. See engine.go's own doc comment for exactly
+// which env vars that opts into, and httpapi.Server's for why running
+// without it (HTTP boundary only) is a legitimate, supported mode, not a
+// half-finished one.
 package main
 
 import (
@@ -65,11 +60,35 @@ func run() error {
 		return err
 	}
 
-	router := httpapi.NewRouter(&httpapi.Server{
+	// Built before NewRouter so Server.ChainPool/Tracker are already set
+	// by the time NewRouter builds its reactive Prometheus gauges --
+	// those read s.ChainPool at scrape time through a closure over the
+	// Server pointer, so it must be the real pool by then, not nil.
+	eng, err := newEngineFromEnv(pool)
+	if err != nil {
+		return err
+	}
+
+	server := &httpapi.Server{
 		Pool:      pool,
 		Auth:      auth,
 		BuildInfo: buildInfo,
-	})
+	}
+	if eng != nil {
+		server.ChainPool = eng.chainPool
+		server.Tracker = eng.tracker
+	}
+	router := httpapi.NewRouter(server)
+
+	if eng != nil {
+		engineCtx, stopEngine := context.WithCancel(context.Background())
+		defer stopEngine()
+		eng.run(engineCtx, pool)
+		slog.Info("watcherd: live chain-watching engine started",
+			"contract", eng.cfg.ContractAddress, "dust_floor", eng.cfg.DustFloor)
+	} else {
+		slog.Info("watcherd: WATCHER_RPC_PROVIDERS not set -- serving the HTTP boundary only, no live chain-watching engine")
+	}
 
 	srv := &http.Server{
 		Addr:    listenAddr(),
