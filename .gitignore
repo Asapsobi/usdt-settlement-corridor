@@ -40,3 +40,6 @@ venv/
 # Logs and local data
 *.log
 tmp/
+
+# Local-only demo scripts (see file headers)
+ledger/cmd/_demo/

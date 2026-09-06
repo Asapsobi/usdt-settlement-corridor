@@ -7,7 +7,7 @@ swap service but as **TRC20 payout infrastructure for businesses**.
 
 This repository is the working record of the evaluation, the architecture decisions
 that came out of it, and the build specifications derived from those decisions —
-and, as of 1 Sep 2026, the ledger core itself.
+and, as of 6 Sep 2026, the ledger core and the deposit watcher.
 
 ## Where things stand
 
@@ -18,8 +18,8 @@ and, as of 1 Sep 2026, the ledger core itself.
 | Margin engine | Wholesale TRON energy (25.7 sun blend vs 41 sun market) + batch multisend |
 | Contribution margin | 87.1% at a $3,000 ticket |
 | MVP scope | 6 services, one ledger, no smart contracts · ≈9–10 eng-weeks |
-| Build status | **C1 (ledger core) built and tested** — all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers. Scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs and C1.8 hadn't exposed. See `docs/03-build/c1-scenario-catalog.md`. |
-| Next action | **C2 — deposit watcher (BSC)** is specified (`docs/03-build/c2-deposit-watcher-build-prompts.md`), not yet built. Of its 4 prerequisites: the C1 reorg-endpoint gap is now closed (C1.11); a deposit-sweep entry type/owner and a policy for deposits landing after quote expiry are still open, but neither blocks starting C2.0; BSC finality timing has been re-derived (block time ~0.45s post-Fermi hard fork) and should be verified against your own RPC providers before it's trusted for customer-facing SLA copy. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc — not confirmed done as of this write-up. |
+| Build status | **C1 (ledger core) and C2 (deposit watcher) built and tested.** C1: all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers, scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs. C2: all chunks C2.0–C2.10 shipped, including the replay harness and HTTP boundary, wired to a live chain-watching engine and verified against real BSC. See `docs/03-build/c1-scenario-catalog.md` and `depositwatcher/`. |
+| Next action | **C3 — Screening** is next in the dependency graph (`docs/02-architecture/component-map.md`) — not yet specified or built. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc — not confirmed done as of this write-up — block starting C4 (energy broker). |
 
 ## Documents
 
@@ -56,18 +56,16 @@ and, as of 1 Sep 2026, the ledger core itself.
   C1.8 hadn't exposed it — see `ledger/` and `ledger/docs/errors.md`.
 - **[c1-scenario-catalog.md](docs/03-build/c1-scenario-catalog.md)** —
   the full scenario / risk catalog for the corridor: what's engineered and gated in
-  C1 today, what cross-component failure modes are still open (C2–C6, not yet built),
+  C1 today, what cross-component failure modes are still open (C3–C6, not yet built),
   and what's irreducible risk that has to be priced or insured rather than fixed.
   Audited against the real test suite on 1 Sep 2026.
 - **[c2-deposit-watcher-build-prompts.md](docs/03-build/c2-deposit-watcher-build-prompts.md)** —
   the deposit watcher, specified the same way C1 was: sequenced build chunks
   (C2.0 → C2.10) with acceptance criteria, written for an AI coding agent. Opened
   with four prerequisite gaps against the already-built C1; the endpoint gap is
-  now closed (C1.11) and the spec updated to match the shipped shape. Still open:
-  a deposit-sweep entry type/owner and a product decision for deposits arriving
-  after quote expiry (neither blocks starting), plus a re-derivation of BSC's
-  current finality timing worth verifying against real RPC providers before it's
-  trusted for SLA copy. Not yet built.
+  now closed (C1.11) and the spec updated to match the shipped shape. **Built** —
+  all chunks C2.0–C2.10 shipped, wired to a live chain-watching engine and
+  verified against real BSC — see `depositwatcher/`.
 
 ### `ledger/`
 
@@ -78,11 +76,19 @@ console at `docs/console.html`). Packages under `internal/`: `money`, `accounts`
 `journal`, `orders`, `recon`, `halt`, `httpapi`, `replay`. Operational docs live at
 `ledger/docs/`: `runbook.md`, `accounts.md`, `errors.md`, `openapi.yaml`.
 
+### `depositwatcher/`
+
+The built C2 service — Go + PostgreSQL, `pgx/v5`, `chi` routing, `goose` migrations.
+`cmd/watcherd` (the live chain-watching engine), `cmd/migrate`, `cmd/replay`.
+Packages under `internal/`: `addresses` (HD derivation), `chain` (ingestion,
+finality, reorg detection), `candidates`, `orphaned`, `finality`, `ledgerclient`,
+`httpapi`, `replay`, `money`. Operational docs at `depositwatcher/docs/openapi.yaml`.
+
 ## Reading order
 
 If you are new to this: **findings → architecture decisions → component map → C1 build
-prompts → scenario catalog → `ledger/`.** Each document assumes the previous one is
-settled and does not re-open it.
+prompts → scenario catalog → `ledger/` → C2 build prompts → `depositwatcher/`.** Each
+document assumes the previous one is settled and does not re-open it.
 
 ## Repository conventions
 
