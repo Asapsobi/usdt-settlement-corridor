@@ -53,7 +53,7 @@ func RunLoop(ctx context.Context, pool *db.Pool, poller FundedOrderPoller, sende
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	if err := runTick(ctx, pool, poller, senderLookup); err != nil {
+	if err := RunTick(ctx, pool, poller, senderLookup); err != nil {
 		slog.Error("discovery: initial tick failed", "error", err)
 	}
 	for {
@@ -61,14 +61,19 @@ func RunLoop(ctx context.Context, pool *db.Pool, poller FundedOrderPoller, sende
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := runTick(ctx, pool, poller, senderLookup); err != nil {
+			if err := RunTick(ctx, pool, poller, senderLookup); err != nil {
 				slog.Error("discovery: tick failed", "error", err)
 			}
 		}
 	}
 }
 
-func runTick(ctx context.Context, q Queryer, poller FundedOrderPoller, senderLookup provider.SenderAddressLookup) error {
+// RunTick runs one discovery pass: poll, enqueue, retry unresolved
+// addresses. Exported (matching pipeline.RunTick and rescreen.RunTick's
+// own convention in this module) so a caller that needs to drive a
+// single, deterministic tick -- a test, or C3.9's replay harness --
+// doesn't have to wait on RunLoop's own ticker.
+func RunTick(ctx context.Context, q Queryer, poller FundedOrderPoller, senderLookup provider.SenderAddressLookup) error {
 	cursor, err := getCursor(ctx, q)
 	if err != nil {
 		return err

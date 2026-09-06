@@ -183,10 +183,10 @@ func TestRunTick_CursorAdvancesAndOrdersAreNotFetchedTwiceAcrossRestart(t *testi
 		nextCursor: "cursor-b",
 	})
 
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (1st): %v", err)
 	}
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (2nd): %v", err)
 	}
 
@@ -213,7 +213,7 @@ func TestRunTick_CursorAdvancesAndOrdersAreNotFetchedTwiceAcrossRestart(t *testi
 	// has no page scripted for "cursor-b" so it returns an empty page --
 	// exactly the real C1 behavior once a poller has caught up -- and
 	// nothing about order 1 or 2 should be touched again.
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (post-restart): %v", err)
 	}
 	if got, err := getCursor(ctx, pool); err != nil || got != "cursor-b" {
@@ -241,7 +241,7 @@ func TestRunTick_SenderAddressLookupFailureIsRetriedNotDropped(t *testing.T) {
 		nextCursor: "cursor-a",
 	})
 
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (1st, lookup fails): %v", err)
 	}
 
@@ -260,7 +260,7 @@ func TestRunTick_SenderAddressLookupFailureIsRetriedNotDropped(t *testing.T) {
 	// re-poll C1's list endpoint again for an order it already knows
 	// about (the retry goes through screening_queue directly).
 	pollCallsBefore := len(poller.calls)
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (2nd, still failing): %v", err)
 	}
 	entry, err = Get(ctx, pool, 42)
@@ -277,7 +277,7 @@ func TestRunTick_SenderAddressLookupFailureIsRetriedNotDropped(t *testing.T) {
 	// Now let it succeed -- the very next tick must resolve it in place.
 	lookup.unfail("ext-flaky")
 	lookup.set("ext-flaky", "0xResolvedLate")
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick (3rd, now succeeds): %v", err)
 	}
 	entry, err = Get(ctx, pool, 42)
@@ -297,7 +297,7 @@ func TestRunTick_EmptyFirstPageAdvancesCursorToWhatItWasCalledWith(t *testing.T)
 	poller := newFakePoller() // no pages scripted at all
 	lookup := newFakeSenderLookup()
 
-	if err := runTick(ctx, pool, poller, lookup); err != nil {
+	if err := RunTick(ctx, pool, poller, lookup); err != nil {
 		t.Fatalf("runTick: %v", err)
 	}
 	got, err := getCursor(ctx, pool)
