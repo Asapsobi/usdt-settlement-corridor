@@ -29,6 +29,17 @@ import (
 // other internal package's convention in this module.
 type Queryer = db.Queryer
 
+// ErrEmptyReason and ErrEmptyActor guard Invalidate's own "a silent
+// invalidation with no attribution is not a legal call" rule. Exported
+// sentinels (not a bare errors.New each call), same reason
+// holds.ErrEmptyReviewer is exported: internal/httpapi needs to
+// errors.Is against them to map a 400 invalid_request, not a generic
+// 500.
+var (
+	ErrEmptyReason = errors.New("cache: invalidate requires a non-empty reason")
+	ErrEmptyActor  = errors.New("cache: invalidate requires a non-empty actor")
+)
+
 // TTLConfig is how long a cached verdict stays trusted, split by outcome
 // -- a flagged result and a clean result do not need the same lifetime.
 // These are placeholders pending a real product/compliance decision (see
@@ -72,6 +83,12 @@ func (cfg TTLConfig) For(v provider.Verdict) time.Duration {
 type Hit struct {
 	provider.Verdict
 	ID int64
+	// SenderAddress is the (provider, address) pair's address half --
+	// Verdict itself carries no address (Get/Put/LatestAny take it as a
+	// parameter, not a stored field), but a caller working from a bare
+	// Hit (C3.8's invalidate-by-id endpoint, concretely, which only has
+	// a screening_results id to start from) needs it to call Invalidate.
+	SenderAddress string
 }
 
 // Get returns the freshest cached result for (providerName, address)
@@ -107,6 +124,7 @@ func Get(ctx context.Context, q Queryer, providerName, address string) (*Hit, er
 	}
 	hit.RawResponse = json.RawMessage(raw)
 	hit.ProviderName = providerName
+	hit.SenderAddress = address
 
 	// "For which order" (the scenario catalog's own concern about a
 	// stale verdict propagating silently) is logged by the caller, which
@@ -146,7 +164,61 @@ func LatestAny(ctx context.Context, q Queryer, providerName, address string) (*H
 	}
 	hit.RawResponse = json.RawMessage(raw)
 	hit.ProviderName = providerName
+	hit.SenderAddress = address
 	return &hit, nil
+}
+
+// GetByID looks up a single screening_results row by its own id --
+// C3.8's invalidate-by-id endpoint needs this to learn which (provider,
+// address) pair a given row belongs to before calling Invalidate, which
+// operates on that pair, not a row id.
+func GetByID(ctx context.Context, q Queryer, id int64) (*Hit, error) {
+	row := q.QueryRow(ctx, `
+		SELECT id, provider_name, sender_address, risk_score, flagged, reason_codes, raw_response, checked_at
+		FROM screening_results WHERE id = $1
+	`, id)
+
+	var hit Hit
+	var raw []byte
+	if err := row.Scan(&hit.ID, &hit.ProviderName, &hit.SenderAddress, &hit.RiskScore, &hit.Flagged, &hit.ReasonCodes, &raw, &hit.CheckedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cache: get by id: %w", err)
+	}
+	hit.RawResponse = json.RawMessage(raw)
+	return &hit, nil
+}
+
+// ListByAddress returns every screening_results row ever recorded for
+// address across every provider, newest first -- the full audit
+// history C3.8's GET /screening-results?sender_address= exposes,
+// deliberately unfiltered by expiry or invalidation (unlike Get):
+// an auditor needs the whole story, not just what's currently trusted.
+func ListByAddress(ctx context.Context, q Queryer, address string) ([]Hit, error) {
+	rows, err := q.Query(ctx, `
+		SELECT id, provider_name, sender_address, risk_score, flagged, reason_codes, raw_response, checked_at
+		FROM screening_results WHERE sender_address = $1 ORDER BY checked_at DESC
+	`, address)
+	if err != nil {
+		return nil, fmt.Errorf("cache: listing results for %s: %w", address, err)
+	}
+	defer rows.Close()
+
+	var out []Hit
+	for rows.Next() {
+		var hit Hit
+		var raw []byte
+		if err := rows.Scan(&hit.ID, &hit.ProviderName, &hit.SenderAddress, &hit.RiskScore, &hit.Flagged, &hit.ReasonCodes, &raw, &hit.CheckedAt); err != nil {
+			return nil, fmt.Errorf("cache: listing results for %s: %w", address, err)
+		}
+		hit.RawResponse = json.RawMessage(raw)
+		out = append(out, hit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cache: listing results for %s: %w", address, err)
+	}
+	return out, nil
 }
 
 // Put records v as a new screening_results row for (providerName,
@@ -197,10 +269,10 @@ func Put(ctx context.Context, q Queryer, providerName, address string, v provide
 // anything here.
 func Invalidate(ctx context.Context, q Queryer, providerName, address, reason, actor string) error {
 	if reason == "" {
-		return errors.New("cache: invalidate requires a non-empty reason")
+		return ErrEmptyReason
 	}
 	if actor == "" {
-		return errors.New("cache: invalidate requires a non-empty actor")
+		return ErrEmptyActor
 	}
 
 	_, err := q.Exec(ctx, `

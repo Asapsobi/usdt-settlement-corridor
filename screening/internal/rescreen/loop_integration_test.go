@@ -257,13 +257,16 @@ func TestResolve_RequiresNonEmptyResolutionAndIsNotIdempotent(t *testing.T) {
 		t.Fatal("setup: flag for ext-resolve was not created")
 	}
 
-	if err := rescreen.Resolve(ctx, pool, flagID, ""); err == nil {
+	if err := rescreen.Resolve(ctx, pool, flagID, "", "operator:alice"); err == nil {
 		t.Fatal("expected an error resolving with an empty resolution")
 	}
-	if err := rescreen.Resolve(ctx, pool, flagID, "operator:alice confirmed clean, releasing manually via C3.6"); err != nil {
+	if err := rescreen.Resolve(ctx, pool, flagID, "confirmed clean, releasing manually via C3.6", ""); err == nil {
+		t.Fatal("expected an error resolving with an empty actor")
+	}
+	if err := rescreen.Resolve(ctx, pool, flagID, "confirmed clean, releasing manually via C3.6", "operator:alice"); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if err := rescreen.Resolve(ctx, pool, flagID, "second attempt"); err == nil {
+	if err := rescreen.Resolve(ctx, pool, flagID, "second attempt", "operator:bob"); err == nil {
 		t.Fatal("expected an error resolving an already-resolved flag a second time")
 	}
 
@@ -271,8 +274,11 @@ func TestResolve_RequiresNonEmptyResolutionAndIsNotIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.Resolution == nil || *got.Resolution != "operator:alice confirmed clean, releasing manually via C3.6" {
+	if got.Resolution == nil || *got.Resolution != "confirmed clean, releasing manually via C3.6" {
 		t.Fatalf("resolution = %v, want the first Resolve call's text", got.Resolution)
+	}
+	if got.ResolvedBy == nil || *got.ResolvedBy != "operator:alice" {
+		t.Fatalf("resolved_by = %v, want operator:alice", got.ResolvedBy)
 	}
 
 	stillUnresolved, err := rescreen.ListUnresolved(ctx, pool)

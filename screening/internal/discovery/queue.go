@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -181,4 +182,51 @@ func Get(ctx context.Context, q Queryer, orderID int64) (QueueEntry, error) {
 	}
 	e.Status = Status(status)
 	return e, nil
+}
+
+// QueueStats is screening_queue's own operator-facing summary --
+// C3.8's GET /v1/system/queue, and the reactive queue_depth /
+// queue_oldest_pending_age_seconds metrics it exposes.
+type QueueStats struct {
+	// DepthByStatus counts every row currently in each status. A status
+	// with zero rows is still present in the map (as 0), never omitted,
+	// so a caller never has to guess whether "missing" means zero or
+	// "wasn't checked".
+	DepthByStatus map[Status]int
+	// OldestPendingEnqueuedAt is the enqueued_at of the longest-waiting
+	// PENDING row, or nil if there are none.
+	OldestPendingEnqueuedAt *time.Time
+}
+
+// Stats computes the current QueueStats summary directly from
+// screening_queue -- always fresh at call time (a reactive read for a
+// metrics scrape or an operator's own GET, never a value that could
+// drift from what the table actually says between updates).
+func Stats(ctx context.Context, q Queryer) (QueueStats, error) {
+	stats := QueueStats{DepthByStatus: map[Status]int{Pending: 0, Screening: 0, Done: 0}}
+
+	rows, err := q.Query(ctx, `SELECT status, count(*) FROM screening_queue GROUP BY status`)
+	if err != nil {
+		return QueueStats{}, fmt.Errorf("discovery: computing queue depth: %w", err)
+	}
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			rows.Close()
+			return QueueStats{}, fmt.Errorf("discovery: computing queue depth: %w", err)
+		}
+		stats.DepthByStatus[Status(status)] = count
+	}
+	if err := rows.Err(); err != nil {
+		return QueueStats{}, fmt.Errorf("discovery: computing queue depth: %w", err)
+	}
+
+	var oldest *time.Time
+	err = q.QueryRow(ctx, `SELECT min(enqueued_at) FROM screening_queue WHERE status = $1`, string(Pending)).Scan(&oldest)
+	if err != nil {
+		return QueueStats{}, fmt.Errorf("discovery: computing oldest pending age: %w", err)
+	}
+	stats.OldestPendingEnqueuedAt = oldest
+	return stats, nil
 }

@@ -74,6 +74,17 @@ type Config struct {
 	// fresh result becomes the new latest, trusted row for this address,
 	// benefiting any future order from the same sender too.
 	TTL cache.TTLConfig
+	// Metrics is optional -- nil means no metrics are recorded, never a
+	// panic, the same convention every other pluggable dependency in
+	// this module uses. Backs C3.8's rescreen_flags_total.
+	Metrics MetricsRecorder
+}
+
+// MetricsRecorder is how this job reports rescreen_flags_total (C3.8's
+// own build spec): one call per flag actually recorded, per affected
+// order -- matching ListUnresolved/List's own per-row granularity.
+type MetricsRecorder interface {
+	FlagRecorded()
 }
 
 func (cfg Config) timeout() time.Duration {
@@ -88,6 +99,12 @@ func (cfg Config) thresholds() verdict.Thresholds {
 		return verdict.DefaultThresholds
 	}
 	return cfg.Thresholds
+}
+
+func (cfg Config) recordFlag() {
+	if cfg.Metrics != nil {
+		cfg.Metrics.FlagRecorded()
+	}
 }
 
 // RunLoop re-checks on an interval. Blocks until ctx is cancelled,
@@ -254,6 +271,7 @@ func rescreenAddress(ctx context.Context, pool *db.Pool, prov provider.Screening
 			if _, err := recordFlag(ctx, tx, o.ref.OrderID, o.ref.ExternalID, o.state, previous.ID, newID); err != nil {
 				return fmt.Errorf("recording flag for order %d (%s): %w", o.ref.OrderID, o.ref.ExternalID, err)
 			}
+			cfg.recordFlag()
 		}
 		return nil
 	})

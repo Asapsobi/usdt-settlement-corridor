@@ -1,7 +1,13 @@
-// Command screend serves C3, the screening service, over HTTP. This
-// chunk (C3.0) only stands up the process: connect to Postgres, serve
-// GET /healthz, shut down cleanly on SIGINT/SIGTERM. Verdicts, caching,
-// and the C1 client land in later chunks.
+// Command screend serves C3, the screening service, over HTTP: the
+// hold queue, screening-result audit lookups, and re-screen flags
+// (C3.8). It does NOT yet run the automatic pipeline, discovery, or
+// re-screen background loops (C3.4/C3.3/C3.7's own engines) -- that
+// wiring is deliberately out of this chunk's scope, the same way
+// depositwatcher's own watcherd engine wiring landed as a separate
+// effort from any single numbered C2 chunk. A deployment running this
+// binary today serves the manual-review and audit surface correctly;
+// it needs the engine wiring added separately before it screens
+// anything on its own.
 package main
 
 import (
@@ -17,6 +23,7 @@ import (
 
 	"screening/internal/db"
 	"screening/internal/httpapi"
+	"screening/internal/ledgerclient"
 )
 
 func main() {
@@ -43,9 +50,24 @@ func run() error {
 	}
 	defer pool.Close()
 
+	auth, err := httpapi.AuthConfigFromEnv()
+	if err != nil {
+		return err
+	}
+
+	ledgerBaseURL := os.Getenv("SCREENING_LEDGER_BASE_URL")
+	ledgerToken := os.Getenv("SCREENING_LEDGER_TOKEN")
+	if ledgerBaseURL == "" || ledgerToken == "" {
+		return errors.New("screend: SCREENING_LEDGER_BASE_URL and SCREENING_LEDGER_TOKEN are both required " +
+			"(POST /holds/{id}/release and /reject call C1 through this client)")
+	}
+	ledgerClient := ledgerclient.New(ledgerBaseURL, ledgerToken)
+
 	server := &httpapi.Server{
-		Pool:      pool,
-		BuildInfo: buildInfo,
+		Pool:         pool,
+		Auth:         auth,
+		LedgerClient: ledgerClient,
+		BuildInfo:    buildInfo,
 	}
 	router := httpapi.NewRouter(server)
 

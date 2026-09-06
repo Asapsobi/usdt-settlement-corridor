@@ -28,10 +28,20 @@ type Flag struct {
 	DetectedAt            time.Time
 	Resolution            *string
 	ResolvedAt            *time.Time
+	ResolvedBy            *string
 }
 
 // ErrNotFound means no rescreen_flags row exists with the given id.
 var ErrNotFound = errors.New("rescreen: no such flag")
+
+// ErrEmptyResolution and ErrEmptyActor guard Resolve's own validation.
+// Exported sentinels, not a bare errors.New each call, so
+// internal/httpapi can errors.Is against them to map a 400
+// invalid_request rather than a generic 500.
+var (
+	ErrEmptyResolution = errors.New("rescreen: resolution must not be empty")
+	ErrEmptyActor      = errors.New("rescreen: actor must not be empty")
+)
 
 // recordFlag inserts a new rescreen_flags row. Never called twice for
 // the same (order, mismatch): once a mismatch is recorded, the fresh
@@ -44,7 +54,7 @@ func recordFlag(ctx context.Context, q Queryer, orderID int64, externalID, state
 	row := q.QueryRow(ctx, `
 		INSERT INTO rescreen_flags (order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id)
 		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at
+		RETURNING id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
 	`, orderID, externalID, stateAtDetection, previousVerdictID, newVerdictID)
 	f, err := scanFlag(row)
 	if err != nil {
@@ -54,10 +64,10 @@ func recordFlag(ctx context.Context, q Queryer, orderID int64, externalID, state
 }
 
 // ListUnresolved returns every rescreen_flags row with no resolution
-// yet, oldest first.
+// yet, oldest first -- the natural order for an operator's own queue.
 func ListUnresolved(ctx context.Context, q Queryer) ([]Flag, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at
+		SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
 		FROM rescreen_flags WHERE resolution IS NULL ORDER BY detected_at ASC
 	`)
 	if err != nil {
@@ -79,10 +89,54 @@ func ListUnresolved(ctx context.Context, q Queryer) ([]Flag, error) {
 	return out, nil
 }
 
+// List returns flags filtered by resolution state: resolved == nil
+// returns every flag, true returns only resolved ones, false returns
+// only unresolved ones (same shape as C2's own orphaned.List) -- newest
+// first, the natural order for a general audit listing. Backs C3.8's
+// GET /v1/rescreen-flags?resolved= filter.
+func List(ctx context.Context, q Queryer, resolved *bool) ([]Flag, error) {
+	var rows pgx.Rows
+	var err error
+	switch {
+	case resolved == nil:
+		rows, err = q.Query(ctx, `
+			SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
+			FROM rescreen_flags ORDER BY detected_at DESC
+		`)
+	case *resolved:
+		rows, err = q.Query(ctx, `
+			SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
+			FROM rescreen_flags WHERE resolution IS NOT NULL ORDER BY detected_at DESC
+		`)
+	default:
+		rows, err = q.Query(ctx, `
+			SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
+			FROM rescreen_flags WHERE resolution IS NULL ORDER BY detected_at DESC
+		`)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("rescreen: listing flags: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Flag
+	for rows.Next() {
+		f, err := scanFlag(rows)
+		if err != nil {
+			return nil, fmt.Errorf("rescreen: listing flags: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rescreen: listing flags: %w", err)
+	}
+	return out, nil
+}
+
 // Get looks up one flag by id.
 func Get(ctx context.Context, q Queryer, id int64) (Flag, error) {
 	row := q.QueryRow(ctx, `
-		SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at
+		SELECT id, order_id, external_id, order_state_at_detection, previous_verdict_id, new_verdict_id, detected_at, resolution, resolved_at, resolved_by
 		FROM rescreen_flags WHERE id = $1
 	`, id)
 	f, err := scanFlag(row)
@@ -95,16 +149,19 @@ func Get(ctx context.Context, q Queryer, id int64) (Flag, error) {
 	return f, nil
 }
 
-// Resolve records how a human decided to handle flag id -- purely a
-// record of the decision (this package never acts on it, see this
-// chunk's own build spec: mechanism, not policy).
-func Resolve(ctx context.Context, q Queryer, id int64, resolution string) error {
+// Resolve records how a human decided to handle flag id, and who --
+// purely a record of the decision (this package never acts on it, see
+// this chunk's own build spec: mechanism, not policy).
+func Resolve(ctx context.Context, q Queryer, id int64, resolution, actor string) error {
 	if resolution == "" {
-		return errors.New("rescreen: resolution must not be empty")
+		return ErrEmptyResolution
+	}
+	if actor == "" {
+		return ErrEmptyActor
 	}
 	tag, err := q.Exec(ctx, `
-		UPDATE rescreen_flags SET resolution = $1, resolved_at = now() WHERE id = $2 AND resolution IS NULL
-	`, resolution, id)
+		UPDATE rescreen_flags SET resolution = $1, resolved_at = now(), resolved_by = $2 WHERE id = $3 AND resolution IS NULL
+	`, resolution, actor, id)
 	if err != nil {
 		return fmt.Errorf("rescreen: resolving flag %d: %w", id, err)
 	}
@@ -121,7 +178,7 @@ type scanRow interface {
 func scanFlag(row scanRow) (Flag, error) {
 	var f Flag
 	err := row.Scan(&f.ID, &f.OrderID, &f.ExternalID, &f.OrderStateAtDetection,
-		&f.PreviousVerdictID, &f.NewVerdictID, &f.DetectedAt, &f.Resolution, &f.ResolvedAt)
+		&f.PreviousVerdictID, &f.NewVerdictID, &f.DetectedAt, &f.Resolution, &f.ResolvedAt, &f.ResolvedBy)
 	if err != nil {
 		return Flag{}, err
 	}

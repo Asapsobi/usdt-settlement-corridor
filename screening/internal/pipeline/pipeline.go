@@ -42,15 +42,21 @@ type Reporter interface {
 	ReportVerdict(ctx context.Context, externalID string, decision verdict.Decision) error
 }
 
-// MetricsRecorder is how this pipeline reports
-// screening_vendor_unavailable_total (C3.5's own build spec): one call
-// per exhausted-retries event, regardless of which OutagePolicy is
-// configured, so an operator sees vendor degradation even when
-// FailOpen is masking it from the order pipeline's own behavior.
-// Optional -- nil means no metrics are recorded, never a panic, the
-// same convention every other pluggable dependency in this module uses.
+// MetricsRecorder is how this pipeline reports the metrics C3.5's and
+// C3.8's own build specs name: VendorUnavailable fires once per
+// exhausted-retries event regardless of which OutagePolicy is
+// configured (so an operator sees vendor degradation even when FailOpen
+// is masking it from the order pipeline's own behavior);
+// VerdictReported fires once per successfully-reported Decision, by
+// classification, backing verdicts_total{classification}; HoldOpened
+// fires once per new hold this pipeline opens, backing
+// holds_opened_total. Optional -- nil means no metrics are recorded,
+// never a panic, the same convention every other pluggable dependency
+// in this module uses.
 type MetricsRecorder interface {
 	VendorUnavailable()
+	VerdictReported(classification verdict.Classification)
+	HoldOpened()
 }
 
 // Config scopes what this pipeline screens against and how.
@@ -113,6 +119,18 @@ func (cfg Config) retries() int {
 func (cfg Config) recordVendorUnavailable() {
 	if cfg.Metrics != nil {
 		cfg.Metrics.VendorUnavailable()
+	}
+}
+
+func (cfg Config) recordVerdictReported(classification verdict.Classification) {
+	if cfg.Metrics != nil {
+		cfg.Metrics.VerdictReported(classification)
+	}
+}
+
+func (cfg Config) recordHoldOpened() {
+	if cfg.Metrics != nil {
+		cfg.Metrics.HoldOpened()
 	}
 }
 
@@ -256,6 +274,7 @@ func ScreenAndReport(ctx context.Context, pool db.Queryer, prov provider.Screeni
 		if _, err := holds.Open(ctx, pool, orderRef, decision); err != nil {
 			return fmt.Errorf("pipeline: opening hold for order %d (%s): %w", entry.OrderID, entry.ExternalID, err)
 		}
+		cfg.recordHoldOpened()
 	}
 
 	if err := reporter.ReportVerdict(ctx, entry.ExternalID, decision); err != nil {
@@ -266,6 +285,7 @@ func ScreenAndReport(ctx context.Context, pool db.Queryer, prov provider.Screeni
 		}
 		return fmt.Errorf("pipeline: reporting verdict for order %d (%s): %w", entry.OrderID, entry.ExternalID, err)
 	}
+	cfg.recordVerdictReported(decision.Classification)
 
 	return discovery.MarkDone(ctx, pool, entry.OrderID)
 }

@@ -247,12 +247,24 @@ func TestScreenAndReport_ProviderErrorFailsClosed(t *testing.T) {
 
 // fakeMetrics counts MetricsRecorder calls -- used to verify
 // screening_vendor_unavailable_total fires on every exhausted-retries
-// event regardless of OutagePolicy, per C3.5's own CONFIG section.
+// event regardless of OutagePolicy, per C3.5's own CONFIG section, and
+// (C3.8) that verdicts and hold-opens are counted by classification.
 type fakeMetrics struct {
 	vendorUnavailableCalls int
+	verdictsReported       map[verdict.Classification]int
+	holdOpenedCalls        int
 }
 
 func (m *fakeMetrics) VendorUnavailable() { m.vendorUnavailableCalls++ }
+
+func (m *fakeMetrics) VerdictReported(classification verdict.Classification) {
+	if m.verdictsReported == nil {
+		m.verdictsReported = make(map[verdict.Classification]int)
+	}
+	m.verdictsReported[classification]++
+}
+
+func (m *fakeMetrics) HoldOpened() { m.holdOpenedCalls++ }
 
 func TestScreenAndReport_FailOpenReportsAuditablePassAndReachesScreened(t *testing.T) {
 	pool := testPool(t)

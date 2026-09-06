@@ -277,6 +277,46 @@ func ListOpen(ctx context.Context, q Queryer) ([]Hold, error) {
 	return out, nil
 }
 
+// List returns holds matching status, or every hold (any status) if
+// status is nil -- newest first, the natural order for a general audit
+// listing (as opposed to ListOpen's oldest-first review-queue order).
+// Backs C3.8's GET /v1/holds?status= filter -- kept as its own function
+// rather than folded into ListOpen so ListOpen's existing oldest-first
+// contract (already relied on for the review-queue use case) never
+// silently changes order underneath an existing caller.
+func List(ctx context.Context, q Queryer, status *Status) ([]Hold, error) {
+	var rows pgx.Rows
+	var err error
+	if status != nil {
+		rows, err = q.Query(ctx, `
+			SELECT id, order_id, external_id, reason_code, screening_result_id, opened_at, status, resolved_by, resolved_at, resolution_note
+			FROM holds WHERE status = $1 ORDER BY opened_at DESC
+		`, string(*status))
+	} else {
+		rows, err = q.Query(ctx, `
+			SELECT id, order_id, external_id, reason_code, screening_result_id, opened_at, status, resolved_by, resolved_at, resolution_note
+			FROM holds ORDER BY opened_at DESC
+		`)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("holds: listing holds: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Hold
+	for rows.Next() {
+		h, err := scanHold(rows)
+		if err != nil {
+			return nil, fmt.Errorf("holds: listing holds: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("holds: listing holds: %w", err)
+	}
+	return out, nil
+}
+
 // Get looks up one hold by id.
 func Get(ctx context.Context, q Queryer, holdID int64) (Hold, error) {
 	row := q.QueryRow(ctx, `

@@ -1,26 +1,73 @@
-// Package httpapi exposes C3 as a service. This chunk (C3.0) wires only
-// /healthz -- the business endpoints (verdicts, hold queue, manual
-// review) land in later chunks once there is something for them to
-// expose.
+// Package httpapi exposes C3 as a service, mirroring C1.8's and C2.9's
+// shape and discipline: service-to-service bearer auth, a stable error
+// code per condition, an OpenAPI spec every route must appear in.
 package httpapi
 
 import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"screening/internal/db"
+	"screening/internal/ledgerclient"
 )
 
-// Server holds everything a handler needs.
+// Server holds everything a handler needs. LedgerClient is used by
+// Release/Reject (internal/holds' own Releaser/Rejecter interfaces) --
+// nil-safe callers aren't needed here, since every write route that
+// touches it requires auth and a real Server is always constructed with
+// one in cmd/screend.
 type Server struct {
-	Pool      *db.Pool
-	BuildInfo func() (version, commit string)
+	Pool         *db.Pool
+	Auth         AuthConfig
+	LedgerClient *ledgerclient.Client
+	Metrics      *Metrics
+	BuildInfo    func() (version, commit string)
 }
 
-// NewRouter builds the route table.
+// NewRouter builds the full route table. /healthz, /readyz, and
+// /metrics are deliberately unauthenticated -- operational endpoints
+// scraped by infrastructure, not part of the service-to-service
+// business API AUTH governs, same posture as C1.8/C2.9.
 func NewRouter(s *Server) http.Handler {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	if s.Metrics == nil {
+		s.Metrics = NewMetrics(registry)
+	} else {
+		registry.MustRegister(
+			s.Metrics.VerdictsTotal, s.Metrics.HoldsOpenedTotal, s.Metrics.HoldsReleasedTotal,
+			s.Metrics.HoldsRejectedTotal, s.Metrics.RescreenFlagsTotal, s.Metrics.ScreeningVendorUnavailableTotal,
+		)
+	}
+	for _, c := range newQueueGaugeCollectors(s.Pool) {
+		registry.MustRegister(c)
+	}
+
 	router := chi.NewRouter()
+	router.Use(corsMiddleware)
+
 	router.Get("/healthz", s.healthzHandler)
+	router.Get("/readyz", s.readyzHandler)
+	router.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	router.Route("/v1", func(r chi.Router) {
+		r.Use(authMiddleware(s.Auth))
+
+		r.Get("/holds", s.getHolds)
+		r.Post("/holds/{id}/release", s.postReleaseHold)
+		r.Post("/holds/{id}/reject", s.postRejectHold)
+
+		r.Get("/screening-results", s.getScreeningResults)
+		r.Post("/screening-results/{id}/invalidate", s.postInvalidateScreeningResult)
+
+		r.Get("/rescreen-flags", s.getRescreenFlags)
+		r.Post("/rescreen-flags/{id}/resolve", s.postResolveRescreenFlag)
+
+		r.Get("/system/queue", s.getSystemQueue)
+	})
+
 	return router
 }

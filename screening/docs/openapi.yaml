@@ -1,0 +1,356 @@
+openapi: 3.1.0
+info:
+  title: C3 Screening API
+  version: "1.0.0"
+  description: >
+    Service-to-service HTTP boundary for C3, the screening service. No
+    customer-facing auth -- the hold release/reject endpoints are called
+    by a human-facing ops tool, whose own auth establishes the reviewer
+    identity passed in the request body (`reviewer`), never this API's
+    own bearer token.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Process is up.
+
+  /readyz:
+    get:
+      summary: Readiness check (process up AND database reachable)
+      security: []
+      responses:
+        "200":
+          description: Ready to serve.
+        "503":
+          description: Not ready (database unreachable).
+
+  /metrics:
+    get:
+      summary: Prometheus exposition format
+      security: []
+      responses:
+        "200":
+          description: >
+            screening_verdicts_total{classification}, screening_holds_opened_total,
+            screening_holds_released_total, screening_holds_rejected_total,
+            screening_rescreen_flags_total, screening_vendor_unavailable_total,
+            screening_queue_depth{status}, screening_queue_oldest_pending_age_seconds,
+            plus standard Go/process metrics.
+
+  /v1/holds:
+    get:
+      summary: List holds
+      description: >
+        status omitted lists every hold (newest first); status=OPEN
+        filters to only open ones -- the human review queue.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [OPEN, RELEASED, REJECTED] }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HoldList" }
+
+  /v1/holds/{id}/release:
+    post:
+      summary: Release a hold (held -> screened on C1)
+      description: >
+        reviewer is required and never inferred or defaulted. The
+        reviewer's identity is recorded in this service's own
+        holds.resolved_by -- C1's own transition record shows this
+        service's bearer-token actor, not the reviewer, since C1's
+        transitions endpoint has no caller-supplied actor field.
+      parameters:
+        - $ref: "#/components/parameters/HoldID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveHoldRequest" }
+      responses:
+        "200":
+          description: Released.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Hold" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: hold_not_open -- already resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/holds/{id}/reject:
+    post:
+      summary: Reject a hold (held -> refunded on C1)
+      description: >
+        Currently returns 501 refund_entry_not_implemented for every
+        call: nothing yet owns constructing the physical BEP20 refund
+        entry held->refunded requires. The endpoint is fully wired and
+        correct, waiting on that ownership decision, not on more code.
+      parameters:
+        - $ref: "#/components/parameters/HoldID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveHoldRequest" }
+      responses:
+        "200":
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Hold" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: hold_not_open -- already resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "501":
+          description: refund_entry_not_implemented.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/screening-results:
+    get:
+      summary: Audit lookup of screening results for one sender address
+      description: >
+        Returns the FULL history for sender_address (unfiltered by
+        expiry or invalidation), newest first. sender_address is
+        required -- this is an audit endpoint over a table with no
+        natural upper bound, not a general browse-everything listing.
+      parameters:
+        - name: sender_address
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScreeningResultList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/screening-results/{id}/invalidate:
+    post:
+      summary: Invalidate every cached result for a screening result's (provider, sender_address) pair
+      description: >
+        The path names one row, but invalidation operates on the whole
+        (provider, sender_address) pair that row belongs to -- every
+        cached result for that pair stops being trusted, not just the
+        one row named here.
+      parameters:
+        - $ref: "#/components/parameters/ScreeningResultID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InvalidateRequest" }
+      responses:
+        "200":
+          description: Invalidated.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/rescreen-flags:
+    get:
+      summary: List re-screen flags
+      description: resolved omitted lists every flag (newest first); resolved=true/false filters.
+      parameters:
+        - name: resolved
+          in: query
+          required: false
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RescreenFlagList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/rescreen-flags/{id}/resolve:
+    post:
+      summary: Record how a human resolved a re-screen flag
+      description: >
+        Purely a record of the decision -- this service never acts on
+        it (mechanism, not policy; see C3.7's own build spec).
+      parameters:
+        - $ref: "#/components/parameters/RescreenFlagID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveRescreenFlagRequest" }
+      responses:
+        "200":
+          description: Resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RescreenFlag" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/system/queue:
+    get:
+      summary: screening_queue depth by status, plus oldest pending age
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QueueStats" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    HoldID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    ScreeningResultID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    RescreenFlagID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+  responses:
+    BadRequest:
+      description: invalid_request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: hold_not_found / screening_result_not_found / rescreen_flag_not_found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    Hold:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        order_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        reason_code: { type: string }
+        screening_result_id: { type: integer, format: int64, nullable: true }
+        opened_at: { type: string, format: date-time }
+        status: { type: string, enum: [OPEN, RELEASED, REJECTED] }
+        resolved_by: { type: string, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        resolution_note: { type: string, nullable: true }
+
+    HoldList:
+      type: object
+      properties:
+        holds:
+          type: array
+          items: { $ref: "#/components/schemas/Hold" }
+
+    ResolveHoldRequest:
+      type: object
+      required: [reviewer]
+      properties:
+        reviewer: { type: string, description: "Never inferred or defaulted -- required, non-empty." }
+        note: { type: string }
+
+    ScreeningResult:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        provider_name: { type: string }
+        sender_address: { type: string }
+        risk_score: { type: number }
+        flagged: { type: boolean }
+        reason_codes:
+          type: array
+          items: { type: string }
+        raw_response: { type: object }
+        checked_at: { type: string, format: date-time }
+
+    ScreeningResultList:
+      type: object
+      properties:
+        screening_results:
+          type: array
+          items: { $ref: "#/components/schemas/ScreeningResult" }
+
+    InvalidateRequest:
+      type: object
+      required: [reason, actor]
+      properties:
+        reason: { type: string }
+        actor: { type: string }
+
+    RescreenFlag:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        order_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        order_state_at_detection: { type: string }
+        previous_verdict_id: { type: integer, format: int64 }
+        new_verdict_id: { type: integer, format: int64 }
+        detected_at: { type: string, format: date-time }
+        resolution: { type: string, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        resolved_by: { type: string, nullable: true }
+
+    RescreenFlagList:
+      type: object
+      properties:
+        rescreen_flags:
+          type: array
+          items: { $ref: "#/components/schemas/RescreenFlag" }
+
+    ResolveRescreenFlagRequest:
+      type: object
+      required: [resolution, actor]
+      properties:
+        resolution: { type: string }
+        actor: { type: string }
+
+    QueueStats:
+      type: object
+      properties:
+        depth_by_status:
+          type: object
+          additionalProperties: { type: integer }
+        oldest_pending_age_seconds: { type: number, nullable: true }
