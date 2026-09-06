@@ -168,12 +168,17 @@ func (c *Client) GetSenderAddress(ctx context.Context, externalID string) (strin
 	return *order.SenderAddress, nil
 }
 
-// OrderRef is one row of a PollFundedOrders page: just enough to enqueue
-// it (internal/discovery.enqueueIfNew) without carrying the whole Order.
+// OrderRef is one row of an orders list page: just enough to enqueue it
+// (internal/discovery.enqueueIfNew) or re-screen its sender
+// (internal/rescreen) without carrying the whole Order. SenderAddress is
+// nil if C1 hasn't recorded one yet (never the case for `screened` or
+// `dispatching` orders, since sender_address is set atomically with
+// `funded`, which both states are always downstream of).
 type OrderRef struct {
-	OrderID    int64
-	ExternalID string
-	UpdatedAt  time.Time
+	OrderID       int64
+	ExternalID    string
+	UpdatedAt     time.Time
+	SenderAddress *string
 }
 
 type listOrdersResp struct {
@@ -181,15 +186,14 @@ type listOrdersResp struct {
 	NextCursor string      `json:"next_cursor"`
 }
 
-// PollFundedOrders calls GET /v1/orders?state=funded&updated_after=<cursor>
-// (C1's own §A addition, C3.3's discovery mechanism). cursor == ""
-// requests the first page (no updated_after). The returned newCursor is
-// always usable as the next call's cursor -- C1's own contract guarantees
-// it's returned even for an empty page (echoing the caller's cursor back),
-// so a poller never has to special-case "nothing new" versus "here's
-// where you were".
-func (c *Client) PollFundedOrders(ctx context.Context, cursor string) (refs []OrderRef, newCursor string, err error) {
-	path := "/v1/orders?state=funded&limit=" + strconv.Itoa(DefaultPollLimit)
+// ListOrdersByState calls GET /v1/orders?state=<state>&updated_after=<cursor>
+// (C1's own §A addition). cursor == "" requests the first page (no
+// updated_after). The returned newCursor is always usable as the next
+// call's cursor -- C1's own contract guarantees it's returned even for
+// an empty page (echoing the caller's cursor back), so a poller never
+// has to special-case "nothing new" versus "here's where you were".
+func (c *Client) ListOrdersByState(ctx context.Context, state, cursor string) (refs []OrderRef, newCursor string, err error) {
+	path := "/v1/orders?state=" + url.QueryEscape(state) + "&limit=" + strconv.Itoa(DefaultPollLimit)
 	if cursor != "" {
 		path += "&updated_after=" + url.QueryEscape(cursor)
 	}
@@ -209,9 +213,17 @@ func (c *Client) PollFundedOrders(ctx context.Context, cursor string) (refs []Or
 
 	refs = make([]OrderRef, len(resp.Orders))
 	for i, o := range resp.Orders {
-		refs[i] = OrderRef{OrderID: o.ID, ExternalID: o.ExternalID, UpdatedAt: o.UpdatedAt}
+		refs[i] = OrderRef{OrderID: o.ID, ExternalID: o.ExternalID, UpdatedAt: o.UpdatedAt, SenderAddress: o.SenderAddress}
 	}
 	return refs, resp.NextCursor, nil
+}
+
+// PollFundedOrders is ListOrdersByState("funded", cursor) -- C3.3's own
+// discovery mechanism, kept as its own named method since "polling for
+// newly funded orders" is a distinct enough concept from the generic
+// list-by-state call C3.7's re-screen job also needs.
+func (c *Client) PollFundedOrders(ctx context.Context, cursor string) ([]OrderRef, string, error) {
+	return c.ListOrdersByState(ctx, "funded", cursor)
 }
 
 // DefaultPollLimit caps how many orders PollFundedOrders asks for per

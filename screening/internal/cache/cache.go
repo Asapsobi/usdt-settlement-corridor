@@ -117,6 +117,38 @@ func Get(ctx context.Context, q Queryer, providerName, address string) (*Hit, er
 	return &hit, nil
 }
 
+// LatestAny returns the single most recent screening_results row for
+// (providerName, address) regardless of expiry or invalidation -- nil if
+// none exists at all. Unlike Get, this is not "is there something
+// trustworthy to reuse right now"; it answers "what was the last thing
+// this pair actually saw", which is what internal/rescreen (C3.7) needs
+// to compare a fresh re-check against: the verdict that let an order
+// through can legitimately have expired from Get's own trust window by
+// the time a re-screen runs (TTLs are hours to days; an order can sit in
+// screened/dispatching for a while), but it's still the exact fact a
+// re-screen needs to diff against, not a "no data" result.
+func LatestAny(ctx context.Context, q Queryer, providerName, address string) (*Hit, error) {
+	row := q.QueryRow(ctx, `
+		SELECT id, risk_score, flagged, reason_codes, raw_response, checked_at
+		FROM screening_results
+		WHERE provider_name = $1 AND sender_address = $2
+		ORDER BY checked_at DESC
+		LIMIT 1
+	`, providerName, address)
+
+	var hit Hit
+	var raw []byte
+	if err := row.Scan(&hit.ID, &hit.RiskScore, &hit.Flagged, &hit.ReasonCodes, &raw, &hit.CheckedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cache: latest any: %w", err)
+	}
+	hit.RawResponse = json.RawMessage(raw)
+	hit.ProviderName = providerName
+	return &hit, nil
+}
+
 // Put records v as a new screening_results row for (providerName,
 // address), never overwriting any prior row for the same key -- a fresh
 // check is always a new insert, preserving full history. expires_at is

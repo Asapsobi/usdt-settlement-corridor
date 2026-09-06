@@ -61,7 +61,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(context.Background(), `TRUNCATE holds, screening_queue, screening_results, screening_result_invalidations`); err != nil {
+	if _, err := pool.Exec(context.Background(), `TRUNCATE rescreen_flags, holds, screening_queue, screening_results, screening_result_invalidations`); err != nil {
 		t.Fatalf("truncating tables: %v", err)
 	}
 	return pool
