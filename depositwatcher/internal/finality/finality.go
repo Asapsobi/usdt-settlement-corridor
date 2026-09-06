@@ -82,6 +82,15 @@ type ObservedLog struct {
 	ExternalID string
 	CustomerID string
 	Amount     money.Amount
+	// SenderAddress is the Transfer log's `from`, EIP-55 checksummed
+	// (chain.ParseTransferLog + common.Address.Hex(), never re-derived
+	// here). C3 (screening) needs it and has no chain access of its own
+	// -- this is the one hop of that trip this package carries; C2.7's
+	// ledgerclient.ReportDepositFinal is what actually forwards it to
+	// C1. See docs/03-build/c3-screening-build-prompts.md's "Read this
+	// first" in the ledger repo's own build-prompts doc for the full
+	// path this closes.
+	SenderAddress string
 }
 
 func (o ObservedLog) key() candidateKey { return candidateKey{o.TxHash, o.LogIndex} }

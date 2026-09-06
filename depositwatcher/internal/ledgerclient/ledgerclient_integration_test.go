@@ -159,10 +159,11 @@ func (ll *liveLedger) createAccount(code, accountType, asset string, normalSide 
 }
 
 type orderResp struct {
-	ID         int64  `json:"id"`
-	ExternalID string `json:"external_id"`
-	State      string `json:"state"`
-	Version    int32  `json:"version"`
+	ID            int64   `json:"id"`
+	ExternalID    string  `json:"external_id"`
+	State         string  `json:"state"`
+	Version       int32   `json:"version"`
+	SenderAddress *string `json:"sender_address"`
 }
 
 type haltResp struct {
@@ -550,6 +551,47 @@ func TestReportDepositFinal_HappyPath(t *testing.T) {
 	custBalance := ll.accountBalance(custBEP)
 	if parseMinorUnits(t, custBalance) != -parseMinorUnits(t, testAmountIn) {
 		t.Errorf("customer liability balance = %s, want the negation of %s", custBalance, testAmountIn)
+	}
+}
+
+// TestReportDepositFinal_SenderAddressRoundTrips closes the loop this
+// session opened: chain.ParseTransferLog observes a Transfer's sender,
+// candidates.processLog now carries it onto finality.ObservedLog, and
+// this method sends it to C1 as the sender_address field ledger's own
+// build added (docs/03-build/c3-screening-build-prompts.md's "Read this
+// first"). Against a REAL ledgerd, not a fake -- the only way to prove
+// C1 actually persists and returns it, not just that this client sends
+// something with the right key name.
+func TestReportDepositFinal_SenderAddressRoundTrips(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-sender-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-sender-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+	if order.SenderAddress != nil {
+		t.Fatalf("a freshly quoted order must have a null sender_address, got %v", *order.SenderAddress)
+	}
+
+	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	const sender = "0xAE2166bd7901Ea67c1E2Bc4179418fC228108F0"
+	amount := money.Amount(3000_000000)
+	candidate := newDepositCandidate(order, customerID, amount)
+	candidate.SenderAddress = sender
+
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal: %v", err)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.SenderAddress == nil {
+		t.Fatal("sender_address is null after ReportDepositFinal, want the reported address")
+	}
+	if *after.SenderAddress != sender {
+		t.Fatalf("sender_address = %q, want %q", *after.SenderAddress, sender)
 	}
 }
 

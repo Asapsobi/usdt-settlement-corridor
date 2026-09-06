@@ -236,6 +236,15 @@ func (c *Client) ReportReorg(ctx context.Context, externalID, originalEntryKey s
 // every write handler requires the header regardless of whether the
 // operation underneath has its own idempotency semantics.
 //
+// sender_address rides alongside entry, sibling to it per §A of
+// docs/03-build/c3-screening-build-prompts.md (the ledger repo's own
+// build-prompts doc): the one hop of C2->C1->C3's sender-address relay
+// this method is responsible for. C1 only accepts it on a transition
+// into funded, which this call always is, and only ever writes it once
+// -- a second, later quoted->funded transition for the same order (a
+// reorg round-trip) legitimately overwrites it with whatever sender
+// funded it that time.
+//
 // expected_version is fetched fresh via GetOrder rather than threaded in
 // by candidate: the version at the moment this method actually calls C1
 // is the only one that matters, and a value carried on candidate since
@@ -293,6 +302,17 @@ func (c *Client) reportDepositFinal(ctx context.Context, candidate finality.Cand
 				{"account_code": customerAccount, "asset": "USDT_BEP20", "amount": (-candidate.Amount).Format()},
 			},
 		},
+	}
+
+	// Omitted entirely, never sent as an explicit "", when this
+	// candidate somehow carries no sender (should not happen for a real
+	// Transfer log -- every log candidates.processLog builds sets this --
+	// but a test fixture or a future caller might): C1's own
+	// TransitionParams rejects a present-but-empty sender_address rather
+	// than silently ignoring it, so sending "" would turn a harmless
+	// omission into a hard 400 on every single deposit report.
+	if candidate.SenderAddress != "" {
+		reqBody["sender_address"] = candidate.SenderAddress
 	}
 
 	status, body, err := c.do(ctx, http.MethodPost,

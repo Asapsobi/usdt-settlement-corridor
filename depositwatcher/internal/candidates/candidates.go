@@ -84,7 +84,7 @@ func ScanRange(ctx context.Context, pool *chain.Pool, database db.Queryer, quote
 
 func processLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
 	tracker *finality.Tracker, cfg Config, log types.Log, blockTimes map[uint64]time.Time) error {
-	_, to, amount, err := chain.ParseTransferLog(log)
+	from, to, amount, err := chain.ParseTransferLog(log)
 	if err != nil {
 		if errors.Is(err, chain.ErrWrongToken) {
 			slog.Warn("candidates: log does not match the Transfer shape, filtered before classification",
@@ -120,6 +120,7 @@ func processLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quot
 	observed := finality.ObservedLog{
 		TxHash: log.TxHash, LogIndex: uint(log.Index), Height: log.BlockNumber, BlockTime: blockTime,
 		OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID, Amount: amount,
+		SenderAddress: from.Hex(),
 	}
 	return tracker.OnLogObserved(ctx, observed, classification)
 }
