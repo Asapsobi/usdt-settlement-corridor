@@ -341,3 +341,121 @@ func (c *Client) reportVerdict(ctx context.Context, externalID string, decision 
 		return apiErr
 	}
 }
+
+// ReleaseHold posts held->screened for a hold a human reviewer has
+// decided to release (C3.6). Idempotency-Key is
+// "screening:release:<order_id>:<hold_id>", §A's own format. Like
+// ReportVerdict, no actor field is sent -- the reviewer's identity is
+// recorded in internal/holds' own resolved_by column, C1's side never
+// sees it (see ReportVerdict's own doc comment for why: no actor field
+// exists in C1's real request DTO, confirmed while building C3.4).
+//
+// held->screened is RequiresEntry: false and HaltBlocked: false per
+// C1.5's table -- same posture as ReportVerdict's funded->screened, so
+// the same three error cases apply the same way: version_conflict
+// retried once, illegal_transition wrapped in ErrIllegalTransition
+// (the hold's own order left held some other way first -- also covers
+// a replay of an already-succeeded release, for the identical
+// entry-less-transition reason ReportVerdict's doc comment explains),
+// and system_halted surfaced as ErrUnexpectedHalt (a P1 signal, since
+// this transition should never actually be halt-blocked).
+func (c *Client) ReleaseHold(ctx context.Context, externalID string, orderID, holdID int64) error {
+	return c.releaseHold(ctx, externalID, orderID, holdID, true)
+}
+
+func (c *Client) releaseHold(ctx context.Context, externalID string, orderID, holdID int64, allowVersionRetry bool) error {
+	order, err := c.GetOrder(ctx, externalID)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: release_hold for %s: fetching current version: %w", externalID, err)
+	}
+
+	idempotencyKey := fmt.Sprintf("screening:release:%d:%d", orderID, holdID)
+	reqBody := map[string]any{
+		"to_state":         "screened",
+		"expected_version": order.Version,
+		"reason":           "manual_release",
+		"occurred_at":      time.Now().UTC().Format(time.RFC3339),
+	}
+
+	status, body, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/v1/orders/%s/transitions", externalID), idempotencyKey, reqBody)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: release_hold for %s: %w", externalID, err)
+	}
+	if status == http.StatusOK {
+		return nil
+	}
+
+	apiErr := decodeAPIError(status, body)
+	switch apiErr.Code {
+	case "version_conflict":
+		if !allowVersionRetry {
+			return fmt.Errorf("ledgerclient: release_hold for %s: version_conflict persisted after one retry: %w", externalID, apiErr)
+		}
+		slog.Warn("ledgerclient: release_hold hit version_conflict, retrying once with a fresh version", "external_id", externalID)
+		return c.releaseHold(ctx, externalID, orderID, holdID, false)
+	case "illegal_transition":
+		return fmt.Errorf("%w: %s: %w", ErrIllegalTransition, externalID, apiErr)
+	case "system_halted":
+		slog.Error("ledgerclient: P1 ALERT -- unexpected system_halted releasing a hold; held->screened is not halt-blocked per C1.5's table",
+			"external_id", externalID)
+		return fmt.Errorf("%w: %w", ErrUnexpectedHalt, apiErr)
+	default:
+		return apiErr
+	}
+}
+
+// RejectHold posts held->refunded for a hold a human reviewer has
+// decided to reject (C3.6). Idempotency-Key is
+// "screening:reject:<order_id>:<hold_id>", §A's own format. Unlike
+// ReleaseHold, held->refunded IS RequiresEntry: true and HaltBlocked:
+// true per C1.5's table -- entry is required (internal/holds.Reject
+// builds it via a RefundEntryBuilder, stubbed until a real refund-entry
+// owner exists -- see §A's own "out of scope" note), and system_halted
+// here is EXPECTED and routine, exactly like C2.7's own halt-blocked
+// case: returned as a plain, retryable APIError, never wrapped in
+// ErrUnexpectedHalt.
+func (c *Client) RejectHold(ctx context.Context, externalID string, orderID, holdID int64, entry map[string]any) error {
+	return c.rejectHold(ctx, externalID, orderID, holdID, entry, true)
+}
+
+func (c *Client) rejectHold(ctx context.Context, externalID string, orderID, holdID int64, entry map[string]any, allowVersionRetry bool) error {
+	order, err := c.GetOrder(ctx, externalID)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: reject_hold for %s: fetching current version: %w", externalID, err)
+	}
+
+	idempotencyKey := fmt.Sprintf("screening:reject:%d:%d", orderID, holdID)
+	reqBody := map[string]any{
+		"to_state":         "refunded",
+		"expected_version": order.Version,
+		"reason":           "manual_reject",
+		"occurred_at":      time.Now().UTC().Format(time.RFC3339),
+		"entry":            entry,
+	}
+
+	status, body, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/v1/orders/%s/transitions", externalID), idempotencyKey, reqBody)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: reject_hold for %s: %w", externalID, err)
+	}
+	if status == http.StatusOK {
+		return nil
+	}
+
+	apiErr := decodeAPIError(status, body)
+	switch apiErr.Code {
+	case "version_conflict":
+		if !allowVersionRetry {
+			return fmt.Errorf("ledgerclient: reject_hold for %s: version_conflict persisted after one retry: %w", externalID, apiErr)
+		}
+		slog.Warn("ledgerclient: reject_hold hit version_conflict, retrying once with a fresh version", "external_id", externalID)
+		return c.rejectHold(ctx, externalID, orderID, holdID, entry, false)
+	case "illegal_transition":
+		return fmt.Errorf("%w: %s: %w", ErrIllegalTransition, externalID, apiErr)
+	case "system_halted":
+		slog.Info("ledgerclient: reject_hold deferred -- the ledger is halted (held->refunded is halt-blocked, this is expected), will retry",
+			"external_id", externalID)
+		return apiErr
+	default:
+		return apiErr
+	}
+}

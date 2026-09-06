@@ -114,6 +114,22 @@ func TestPipeline_EnqueuedOrderEndsUpHeldMatchingMockVerdict_AgainstRealC1(t *te
 	if after.State != "held" {
 		t.Fatalf("order state = %q, want held (flagged MockProvider verdict for %s)", after.State, flaggedSender)
 	}
+
+	// C3.6: the pipeline must open a holds row for this order so a human
+	// reviewer can actually see and act on it -- an order sitting in
+	// `held` at C1 with no corresponding holds row would be invisible to
+	// ListOpen.
+	var holdStatus, reasonCode string
+	if err := pool.QueryRow(context.Background(), `SELECT status, reason_code FROM holds WHERE order_id = $1`, funded.ID).
+		Scan(&holdStatus, &reasonCode); err != nil {
+		t.Fatalf("querying holds for order %d: %v", funded.ID, err)
+	}
+	if holdStatus != "OPEN" {
+		t.Fatalf("hold status = %q, want OPEN", holdStatus)
+	}
+	if reasonCode != verdict.ReasonHoldFlagged {
+		t.Fatalf("hold reason_code = %q, want %q", reasonCode, verdict.ReasonHoldFlagged)
+	}
 }
 
 // TestPipeline_RestartMidPipelineReplaysSafely simulates a C3 restart:

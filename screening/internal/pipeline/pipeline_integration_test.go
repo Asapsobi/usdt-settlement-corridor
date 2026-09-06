@@ -63,7 +63,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(context.Background(), `TRUNCATE screening_queue, screening_results, screening_result_invalidations`); err != nil {
+	if _, err := pool.Exec(context.Background(), `TRUNCATE holds, screening_queue, screening_results, screening_result_invalidations`); err != nil {
 		t.Fatalf("truncating tables: %v", err)
 	}
 	return pool
@@ -227,6 +227,21 @@ func TestScreenAndReport_ProviderErrorFailsClosed(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("a failed provider call should never write a screening_results row, found %d", count)
+	}
+
+	// C3.6: a Hold decision must open a holds row before it's ever
+	// reported to C1 -- see ScreenAndReport's own doc comment for why
+	// that ordering matters.
+	var holdCount int
+	var holdStatus string
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(status) FROM holds WHERE order_id = $1`, 20).Scan(&holdCount, &holdStatus); err != nil {
+		t.Fatalf("counting holds: %v", err)
+	}
+	if holdCount != 1 {
+		t.Fatalf("got %d holds rows for order 20, want exactly 1", holdCount)
+	}
+	if holdStatus != "OPEN" {
+		t.Fatalf("hold status = %q, want OPEN", holdStatus)
 	}
 }
 

@@ -279,6 +279,23 @@ func (l *Ledger) LatestTransitionReason(orderID int64) string {
 	return reason
 }
 
+// LatestTransitionActor returns the `actor` column of the most recent
+// order_transitions row for orderID -- used to confirm whose identity
+// C1 actually recorded (its own bearer-token-derived actor, never a
+// caller-supplied one -- see internal/holds' own live test for why this
+// matters).
+func (l *Ledger) LatestTransitionActor(orderID int64) string {
+	l.t.Helper()
+	var actor string
+	err := l.pool.QueryRow(context.Background(), `
+		SELECT actor FROM order_transitions WHERE order_id = $1 ORDER BY id DESC LIMIT 1
+	`, orderID).Scan(&actor)
+	if err != nil {
+		l.t.Fatalf("fetching latest transition actor for order %d: %v", orderID, err)
+	}
+	return actor
+}
+
 // GetOrder fetches GET /v1/orders/{externalID}.
 func (l *Ledger) GetOrder(externalID string) OrderResp {
 	l.t.Helper()

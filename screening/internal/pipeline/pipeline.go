@@ -1,6 +1,7 @@
-// Package pipeline is C3.4: it ties C3.1 (cache), C3.2 (classification),
-// and C3.3 (discovery) together into the thing that actually calls a
-// screening provider and reports the result to C1.
+// Package pipeline is C3.4 (extended by C3.6): it ties C3.1 (cache),
+// C3.2 (classification), C3.3 (discovery), and C3.6 (the hold queue)
+// together into the thing that actually calls a screening provider and
+// reports the result to C1.
 package pipeline
 
 import (
@@ -13,6 +14,7 @@ import (
 	"screening/internal/cache"
 	"screening/internal/db"
 	"screening/internal/discovery"
+	"screening/internal/holds"
 	"screening/internal/ledgerclient"
 	"screening/internal/provider"
 	"screening/internal/verdict"
@@ -230,6 +232,30 @@ func ScreenAndReport(ctx context.Context, pool db.Queryer, prov provider.Screeni
 	decision, err := screen(ctx, pool, prov, cfg, address)
 	if err != nil {
 		return err
+	}
+
+	if decision.Classification == verdict.Hold {
+		// Opened BEFORE reporting to C1, not after, and unconditionally
+		// on every attempt (idempotent via holds' own partial unique
+		// index -- a retry just returns the existing OPEN hold): the
+		// alternative order -- open only once ReportVerdict confirms
+		// success -- has a real failure window where C1 already knows
+		// the order is held but this call crashes or errors before
+		// recording that locally. A retry would then hit
+		// ledgerclient.ErrIllegalTransition (the order already left
+		// funded) and this function's own handling below marks the
+		// queue row DONE without ever creating a holds row -- a real
+		// order stuck in held with no human ever able to see it. Opening
+		// first means the worst case is a stale OPEN hold for an order
+		// that actually left held some OTHER way (a genuine race, not
+		// this pipeline's own report) -- self-correcting the moment a
+		// reviewer tries to act on it, since Release/Reject then surface
+		// the same ErrIllegalTransition instead of silently corrupting
+		// anything.
+		orderRef := ledgerclient.OrderRef{OrderID: entry.OrderID, ExternalID: entry.ExternalID}
+		if _, err := holds.Open(ctx, pool, orderRef, decision); err != nil {
+			return fmt.Errorf("pipeline: opening hold for order %d (%s): %w", entry.OrderID, entry.ExternalID, err)
+		}
 	}
 
 	if err := reporter.ReportVerdict(ctx, entry.ExternalID, decision); err != nil {
