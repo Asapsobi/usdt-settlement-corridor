@@ -7,7 +7,8 @@ swap service but as **TRC20 payout infrastructure for businesses**.
 
 This repository is the working record of the evaluation, the architecture decisions
 that came out of it, and the build specifications derived from those decisions —
-and, as of 6 Sep 2026, the ledger core and the deposit watcher.
+and, as of 7 Sep 2026, the ledger core, the deposit watcher, screening, and the
+energy broker, plus a payout-dispatcher build spec with no code behind it yet.
 
 ## Where things stand
 
@@ -18,8 +19,8 @@ and, as of 6 Sep 2026, the ledger core and the deposit watcher.
 | Margin engine | Wholesale TRON energy (25.7 sun blend vs 41 sun market) + batch multisend |
 | Contribution margin | 87.1% at a $3,000 ticket |
 | MVP scope | 6 services, one ledger, no smart contracts · ≈9–10 eng-weeks |
-| Build status | **C1 (ledger core) and C2 (deposit watcher) built and tested.** C1: all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers, scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs. C2: all chunks C2.0–C2.10 shipped, including the replay harness and HTTP boundary, wired to a live chain-watching engine and verified against real BSC. See `docs/03-build/c1-scenario-catalog.md` and `depositwatcher/`. |
-| Next action | **C3 — Screening** is next in the dependency graph (`docs/02-architecture/component-map.md`) — not yet specified or built. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc — not confirmed done as of this write-up — block starting C4 (energy broker). |
+| Build status | **C1 (ledger core), C2 (deposit watcher), C3 (screening), and C4 (energy broker) are built and tested; C5 (payout dispatcher) has a build spec but no code.** C1: all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers, scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs. C2: all chunks C2.0–C2.10 shipped, including the replay harness and HTTP boundary, wired to a live chain-watching engine and verified against real BSC. C3: all chunks C3.0–C3.9 shipped, including its own replay ship-gate harness — but `cmd/screend` does not yet wire the automatic pipeline/discovery/re-screen background loops into the production binary, only the manual-review and audit surface. C4: all chunks C4.0–C4.9 shipped, including its own replay ship-gate harness (9/9 scenarios, 6/6 final assertions passing against a real ledger and real Postgres); `cmd/brokerd` is now fully wired to production, including real Tronsell/Netts/CatFee HTTP integrations and a real TronGrid on-chain reader, added after discovering none of the three vendors' real APIs support the delegation-retargeting the original buffer design assumed — see the "Read this fourth" addendum in `docs/03-build/c4-energy-broker-build-prompts.md`. Going live still needs the real payout slot addresses, a confirmed Tronsell base URL, and a whitelisted Netts egress IP — all operator-supplied, none fabricated. C5: build prompts only (`docs/03-build/c5-payout-dispatcher-build-prompts.md`), no code — written against a proposed `SigningService` interface and a fake, since S1 (key custody/signing) does not exist anywhere in this repo, not even as a design. See `docs/03-build/c1-scenario-catalog.md`, `depositwatcher/`, `screening/`, and `energybroker/`. |
+| Next action | Three independent gaps, not one linear next step. **S1 (key custody/signing) has to exist before C5 can be built for real** — nothing in this repo can sign a TRON transaction today, by design, and C5's own spec stands in a fake for it. **C3's production engine wiring** (the pipeline/discovery/re-screen background loops) is the same kind of gap C4 had until this session closed it for C4. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc are still not confirmed — C4 now polls real vendor prices live, which removes the code-correctness risk, but not the open question of whether retail-tier pricing still clears the modeled margin. |
 
 ## Documents
 
@@ -66,6 +67,28 @@ and, as of 6 Sep 2026, the ledger core and the deposit watcher.
   now closed (C1.11) and the spec updated to match the shipped shape. **Built** —
   all chunks C2.0–C2.10 shipped, wired to a live chain-watching engine and
   verified against real BSC — see `depositwatcher/`.
+- **[c3-screening-build-prompts.md](docs/03-build/c3-screening-build-prompts.md)** —
+  screening, specified the same way as C1/C2: sequenced build chunks (C3.0 → C3.9)
+  with acceptance criteria. **Built** — all chunks shipped, including C3.9's own
+  replay ship-gate harness — see `screening/`. `cmd/screend` serves the manual-
+  review and audit HTTP surface only; the automatic pipeline/discovery/re-screen
+  background loops are not yet wired into the production binary.
+- **[c4-energy-broker-build-prompts.md](docs/03-build/c4-energy-broker-build-prompts.md)** —
+  the energy broker, specified the same way as C1–C3: sequenced build chunks
+  (C4.0 → C4.9) with acceptance criteria. **Built and production-wired** — all
+  chunks shipped, including C4.9's own replay ship-gate harness, and `cmd/brokerd`
+  is fully wired, including real Tronsell/Netts/CatFee HTTP clients and a real
+  TronGrid on-chain reader. The doc's own "Read this fourth" addendum records why
+  the original buffer design changed after those real vendor integrations were
+  built — none of the three vendors' APIs support retargeting an existing
+  delegation, which the first design assumed — see `energybroker/`.
+- **[c5-payout-dispatcher-build-prompts.md](docs/03-build/c5-payout-dispatcher-build-prompts.md)** —
+  the payout dispatcher, specified the same way as C1–C4: sequenced build chunks
+  (C5.0 → C5.11). **Not built.** Written against the real, shipped C1–C4 code
+  (not just their original specs, which had drifted) and against a *proposed*
+  `SigningService` interface plus a fake, since S1 (key custody/signing) does not
+  exist anywhere in this repo — not unfinished, never started. Also proposes a fix
+  for a real atomicity gap this document found in C1's dispatching→held path.
 
 ### `ledger/`
 
@@ -84,11 +107,32 @@ Packages under `internal/`: `addresses` (HD derivation), `chain` (ingestion,
 finality, reorg detection), `candidates`, `orphaned`, `finality`, `ledgerclient`,
 `httpapi`, `replay`, `money`. Operational docs at `depositwatcher/docs/openapi.yaml`.
 
+### `screening/`
+
+The built C3 service — Go + PostgreSQL, `pgx/v5`, `chi` routing, `goose`
+migrations. `cmd/screend` (the HTTP boundary — manual-review and audit surface
+only, see above), `cmd/migrate`, `cmd/replay` (C3.9's own ship-gate harness).
+Packages under `internal/`: `provider` (the vendor-agnostic AML interface),
+`cache`, `verdict`, `discovery`, `pipeline`, `holds`, `rescreen`, `ledgerclient`,
+`httpapi`, `replay`.
+
+### `energybroker/`
+
+The built, production-wired C4 service — Go + PostgreSQL, `pgx/v5`, `chi`
+routing, `goose` migrations. `cmd/brokerd` (the full production server: pricing,
+routing, the buffer, reservations, all wired), `cmd/migrate`, `cmd/replay`
+(C4.9's own ship-gate harness). Packages under `internal/`: `provider` (the
+vendor-agnostic interface plus real Tronsell/Netts/CatFee HTTP clients),
+`pricing`, `routing`, `buffer` (including the real `TronGridReader` on-chain
+verifier), `reservations`, `ledgerclient`, `httpapi`, `replay`.
+
 ## Reading order
 
 If you are new to this: **findings → architecture decisions → component map → C1 build
-prompts → scenario catalog → `ledger/` → C2 build prompts → `depositwatcher/`.** Each
-document assumes the previous one is settled and does not re-open it.
+prompts → scenario catalog → `ledger/` → C2 build prompts → `depositwatcher/` → C3
+build prompts → `screening/` → C4 build prompts → `energybroker/` → C5 build
+prompts.** Each document assumes the previous one is settled and does not re-open
+it.
 
 ## Repository conventions
 
