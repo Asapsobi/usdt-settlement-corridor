@@ -109,3 +109,12 @@ func (b *Buffer) Reserve(ctx context.Context, orderID, units int64) (*Allocation
 	}
 	return alloc, nil
 }
+
+// RowsByIDs resolves an Allocation's own RowIDs back into full Row
+// detail -- C4.4's fast path needs each row's provider_name and
+// delegation_id to know which vendor to ask to redirect which
+// delegation to the requested payout slot; Allocation itself carries
+// only bare ids, deliberately (see Allocation's own doc comment).
+func (b *Buffer) RowsByIDs(ctx context.Context, ids []int64) ([]Row, error) {
+	return rowsByIDs(ctx, b.pool, ids)
+}

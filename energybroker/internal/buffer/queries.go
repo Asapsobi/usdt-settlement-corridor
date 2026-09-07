@@ -89,6 +89,35 @@ func rowsNearingExpiry(ctx context.Context, q db.Queryer, lookahead time.Duratio
 	return out, rows.Err()
 }
 
+// rowsByIDs fetches energy_buffer rows by id, in no particular order --
+// Reserve's own Allocation.RowIDs is the only caller, resolving a claim
+// back into the provider_name/delegation_id each row needs for
+// C4.4's own fast-path re-delegation.
+func rowsByIDs(ctx context.Context, q db.Queryer, ids []int64) ([]Row, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := q.Query(ctx, `
+		SELECT id, provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status, allocation_id
+		FROM energy_buffer
+		WHERE id = ANY($1)
+	`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("buffer: fetching rows by id: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Row
+	for rows.Next() {
+		r, err := scanRowFields(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // markExpired transitions row ids to EXPIRED -- Reconcile's own
 // correction when on-chain reality no longer matches bookkeeping.
 func markExpired(ctx context.Context, q db.Queryer, ids []int64) error {

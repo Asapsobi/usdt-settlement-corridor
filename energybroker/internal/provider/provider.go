@@ -40,23 +40,38 @@ type Delegation struct {
 }
 
 // EnergyProvider is the one thing every vendor integration (real or
-// fake) must implement. Quote and Delegate must both respect ctx
-// cancellation/deadline -- a vendor call that ignores it and blocks past
-// a caller's timeout is a bug in the implementation, not something
+// fake) must implement. Quote, Delegate, and Redelegate must all respect
+// ctx cancellation/deadline -- a vendor call that ignores it and blocks
+// past a caller's timeout is a bug in the implementation, not something
 // callers should have to guard against separately.
 //
 // Verify is deliberately NOT part of this interface: on-chain
 // verification is provider-agnostic (it's a TRON resource query against
 // the target address, not something any vendor's own API reports back)
-// and belongs in internal/buffer instead, once that chunk exists. A
-// vendor claiming success in its own Delegate response and the
-// delegation actually landing on-chain are different facts -- invariant
-// 1 in this component's own build spec -- and this interface must not
-// make it easy to conflate them by offering a same-package "verify" call
-// that just re-asks the vendor.
+// and belongs in internal/buffer instead. A vendor claiming success in
+// its own Delegate/Redelegate response and the delegation actually
+// landing on-chain are different facts -- invariant 1 in this
+// component's own build spec -- and this interface must not make it easy
+// to conflate them by offering a same-package "verify" call that just
+// re-asks the vendor.
+//
+// Redelegate is C4.4's own resolution of that chunk's explicit open
+// question: buffer capacity is delegated to a broker-controlled staging
+// address (see internal/buffer's own Config.StagingAddress), not to any
+// specific payout slot, so it must be retargeted at reservation time
+// before C5 can use it. Real TRON delegated-resource state is not
+// transitively re-delegatable by whoever merely RECEIVED a delegation
+// (only the original staker can redirect it) -- so this is modeled as a
+// vendor-API call back to whichever provider originally issued
+// delegationID, asking them to redirect their own stake to newTarget,
+// never as broker-owned on-chain signing (which stays out of scope per
+// "Read this second"). This keeps the "no private keys, no TRON signing"
+// boundary intact for the three primary vendors exactly as before; only
+// which address their existing stake points at changes.
 type EnergyProvider interface {
 	Quote(ctx context.Context) (Quote, error)
 	Delegate(ctx context.Context, target string, units int64, duration time.Duration) (Delegation, error)
+	Redelegate(ctx context.Context, delegationID, newTarget string, units int64) (Delegation, error)
 }
 
 // Provider name constants -- the four named slots this component's own
@@ -99,5 +114,10 @@ func (NoOpProvider) Quote(ctx context.Context) (Quote, error) {
 
 // Delegate implements EnergyProvider.
 func (NoOpProvider) Delegate(ctx context.Context, target string, units int64, duration time.Duration) (Delegation, error) {
+	return Delegation{}, ErrManualFallbackRequired
+}
+
+// Redelegate implements EnergyProvider.
+func (NoOpProvider) Redelegate(ctx context.Context, delegationID, newTarget string, units int64) (Delegation, error) {
 	return Delegation{}, ErrManualFallbackRequired
 }

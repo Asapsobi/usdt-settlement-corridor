@@ -29,4 +29,12 @@ func TestNoOpProvider_AlwaysReturnsErrManualFallbackRequired(t *testing.T) {
 	if d != (Delegation{}) {
 		t.Fatalf("Delegate() = %+v, want the zero value", d)
 	}
+
+	rd, err := p.Redelegate(context.Background(), "some-delegation-id", "TFakeTargetAddress000000000000001", 1000)
+	if !errors.Is(err, ErrManualFallbackRequired) {
+		t.Fatalf("Redelegate() error = %v, want ErrManualFallbackRequired", err)
+	}
+	if rd != (Delegation{}) {
+		t.Fatalf("Redelegate() = %+v, want the zero value", rd)
+	}
 }

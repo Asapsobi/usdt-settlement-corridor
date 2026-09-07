@@ -146,3 +146,39 @@ func TestMockProvider_DelegateNeverSetsConfirmedAt(t *testing.T) {
 		t.Fatal("Delegation.ID is empty")
 	}
 }
+
+func TestMockProvider_RedelegateRetargetsAtZeroCost(t *testing.T) {
+	m := NewMockProvider(Tronsell, 1, 24.0)
+	d, err := m.Redelegate(context.Background(), "mock-tronsell-1", "TNewSlotAddress0000000000000001", 1000)
+	if err != nil {
+		t.Fatalf("Redelegate(): %v", err)
+	}
+	if d.TargetAddress != "TNewSlotAddress0000000000000001" {
+		t.Fatalf("TargetAddress = %q, want the new target", d.TargetAddress)
+	}
+	if d.EnergyUnits != 1000 {
+		t.Fatalf("EnergyUnits = %d, want 1000", d.EnergyUnits)
+	}
+	if d.CostTRX != 0 {
+		t.Fatalf("CostTRX = %v, want 0 -- retargeting already-paid-for capacity costs nothing further", d.CostTRX)
+	}
+	if d.ConfirmedAt != nil {
+		t.Fatal("ConfirmedAt must be nil -- on-chain verification is not this interface's job")
+	}
+}
+
+func TestMockProvider_RedelegateRespectsForcedTimeoutAndMalformed(t *testing.T) {
+	m := NewMockProvider(Tronsell, 1, 24.0)
+	m.ForceTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := m.Redelegate(ctx, "d1", "TNew0000000000000000000000000001", 1000); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Redelegate() error = %v, want context.DeadlineExceeded", err)
+	}
+
+	m2 := NewMockProvider(Netts, 1, 28.0)
+	m2.ForceMalformed()
+	if _, err := m2.Redelegate(context.Background(), "d1", "TNew0000000000000000000000000001", 1000); !errors.Is(err, ErrMalformedResponse) {
+		t.Fatalf("Redelegate() error = %v, want ErrMalformedResponse", err)
+	}
+}

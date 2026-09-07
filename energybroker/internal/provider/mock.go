@@ -37,13 +37,33 @@ type MockProvider struct {
 	name         string
 	basePriceSun float64
 
-	mu             sync.Mutex
-	rng            *rand.Rand
-	forcedPrice    *float64
-	forceTimeout   bool
-	forceMalformed bool
-	maxUnits       int64
-	delegationSeq  int64
+	mu              sync.Mutex
+	rng             *rand.Rand
+	forcedPrice     *float64
+	forceTimeout    bool
+	forceMalformed  bool
+	maxUnits        int64
+	delegationSeq   int64
+	delegateCalls   int
+	redelegateCalls int
+}
+
+// DelegateCallCount and RedelegateCallCount report how many times
+// Delegate/Redelegate have been called -- exported, mirroring C3's own
+// MockProvider.ScreenCallCount, so a caller (internal/reservations' own
+// fast-path tests, concretely) can assert a fast-path confirmation
+// really did skip Delegate entirely, not just that the outcome looked
+// right.
+func (m *MockProvider) DelegateCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.delegateCalls
+}
+
+func (m *MockProvider) RedelegateCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.redelegateCalls
 }
 
 // NewMockProvider returns a MockProvider named name (one of the
@@ -149,6 +169,7 @@ func (m *MockProvider) nextPrice(forcedPrice *float64) float64 {
 // doc comment.
 func (m *MockProvider) Delegate(ctx context.Context, target string, units int64, duration time.Duration) (Delegation, error) {
 	m.mu.Lock()
+	m.delegateCalls++
 	forceTimeout := m.forceTimeout
 	forceMalformed := m.forceMalformed
 	forcedPrice := m.forcedPrice
@@ -182,6 +203,44 @@ func (m *MockProvider) Delegate(ctx context.Context, target string, units int64,
 		TargetAddress: target,
 		EnergyUnits:   units,
 		CostTRX:       cost,
+		RequestedAt:   time.Now().UTC(),
+		ConfirmedAt:   nil,
+	}, nil
+}
+
+// Redelegate implements EnergyProvider. Retargeting an already-acquired
+// delegation to a new address costs nothing further -- the energy was
+// already paid for when it was first delegated -- so CostTRX is always
+// zero, distinct from Delegate's own real, non-zero cost.
+func (m *MockProvider) Redelegate(ctx context.Context, delegationID, newTarget string, units int64) (Delegation, error) {
+	m.mu.Lock()
+	m.redelegateCalls++
+	forceTimeout := m.forceTimeout
+	forceMalformed := m.forceMalformed
+	m.mu.Unlock()
+
+	if forceTimeout {
+		<-ctx.Done()
+		return Delegation{}, ctx.Err()
+	}
+	if forceMalformed {
+		return Delegation{}, fmt.Errorf("mock provider %s: %w", m.name, ErrMalformedResponse)
+	}
+	if err := ctx.Err(); err != nil {
+		return Delegation{}, err
+	}
+
+	m.mu.Lock()
+	m.delegationSeq++
+	seq := m.delegationSeq
+	m.mu.Unlock()
+
+	return Delegation{
+		ID:            fmt.Sprintf("mock-%s-redelegate-%d", m.name, seq),
+		ProviderName:  m.name,
+		TargetAddress: newTarget,
+		EnergyUnits:   units,
+		CostTRX:       0,
 		RequestedAt:   time.Now().UTC(),
 		ConfirmedAt:   nil,
 	}, nil
