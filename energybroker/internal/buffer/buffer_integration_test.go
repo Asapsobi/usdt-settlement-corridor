@@ -237,7 +237,7 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 	if err := poller.PollAll(ctx); err != nil {
 		t.Fatalf("PollAll: %v", err)
 	}
-	router := routing.NewRouter(poller, 1)
+	router := routing.NewRouter(poller, pool, 1)
 
 	reader := NewFakeTronReader()
 	reader.AutoConfirm(1_000_000) // every delegation this test makes verifies on-chain
@@ -303,7 +303,7 @@ func TestReplenish_NeverMarksAvailableWithoutOnChainConfirmation(t *testing.T) {
 	if err := poller.PollAll(ctx); err != nil {
 		t.Fatalf("PollAll: %v", err)
 	}
-	router := routing.NewRouter(poller, 1)
+	router := routing.NewRouter(poller, pool, 1)
 
 	// AutoConfirm defaults to 0 -- every delegation this test makes
 	// fails on-chain verification.

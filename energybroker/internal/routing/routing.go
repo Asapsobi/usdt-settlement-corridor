@@ -15,6 +15,7 @@ import (
 	"sort"
 	"sync"
 
+	"energybroker/internal/db"
 	"energybroker/internal/pricing"
 	"energybroker/internal/provider"
 )
@@ -91,8 +92,10 @@ type Selection struct {
 	Reason   string
 }
 
-// Router selects a provider for one reservation attempt. Stateful (an
-// injected PriceSource, and its own seeded PRNG) for the same reason
+// Router selects a provider for one reservation attempt, and (C4.6)
+// records/de-duplicates manual_fallback_events when it can't. Stateful
+// (an injected PriceSource, its own seeded PRNG, and now a database
+// connection for fallback.go's own table) for the same reason
 // pricing.Poller is stateful rather than a bag of free functions: a
 // live routing decision needs a live price feed, and a reproducible-in-
 // tests random draw needs its own owned generator, never math/rand's
@@ -100,16 +103,18 @@ type Selection struct {
 // be perturbing concurrently).
 type Router struct {
 	prices PriceSource
+	pool   *db.Pool
 
 	mu  sync.Mutex
 	rng *rand.Rand
 }
 
-// NewRouter returns a Router reading prices from prices, with its own
-// PRNG seeded by seed -- the same seeded, reproducible-sequence
-// discipline provider.MockProvider itself already uses.
-func NewRouter(prices PriceSource, seed int64) *Router {
-	return &Router{prices: prices, rng: rand.New(rand.NewSource(seed))}
+// NewRouter returns a Router reading prices from prices, recording
+// fallback events (C4.6) into pool, with its own PRNG seeded by seed --
+// the same seeded, reproducible-sequence discipline provider.MockProvider
+// itself already uses.
+func NewRouter(prices PriceSource, pool *db.Pool, seed int64) *Router {
+	return &Router{prices: prices, pool: pool, rng: rand.New(rand.NewSource(seed))}
 }
 
 // SelectProvider filters weights' three primaries to those that are (a)

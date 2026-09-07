@@ -153,10 +153,13 @@ type BufferReserver interface {
 	VerifyOnChain(ctx context.Context, d provider.Delegation) (bool, error)
 }
 
-// ProviderSelector is the one call the slow path needs from C4.2's own
-// Router.
+// ProviderSelector is the two calls the slow path needs from C4.2's own
+// Router: SelectProvider itself, and (C4.6) OnFallbackTriggered when it
+// can't select anything -- recorded/de-duplicated/alerted on, per
+// docs/runbook-energy-fallback.md, never an automated JustLendDAO call.
 type ProviderSelector interface {
 	SelectProvider(ctx context.Context, weights routing.RoutingWeights, ceiling float64) (routing.Selection, error)
+	OnFallbackTriggered(ctx context.Context, selectionReason string, orderID *int64) (routing.FallbackEvent, error)
 }
 
 // EnergyCostReporter is the one call this package needs from C1 for cost
@@ -178,6 +181,15 @@ type Config struct {
 	Weights            routing.RoutingWeights
 	Ceiling            float64
 	DelegationDuration time.Duration // how long the slow path's own fresh Delegate call leases capacity for
+	// FallbackPollInterval is how often the slow path re-checks
+	// SelectProvider while blocked on the manual fallback ladder
+	// (DefaultFallbackPollInterval if unset) -- an outage is often
+	// transient (a vendor recovers, a price spike passes), so a single
+	// bad SelectProvider result must not fail the reservation outright;
+	// only running out req.Deadline does (C4.6's own acceptance
+	// criterion: "the reservation still resolves to failed once its
+	// deadline elapses", not on the first fallback signal).
+	FallbackPollInterval time.Duration
 }
 
 // DefaultDelegationDuration matches internal/buffer's own default, when
@@ -189,6 +201,20 @@ func (cfg Config) delegationDuration() time.Duration {
 		return DefaultDelegationDuration
 	}
 	return cfg.DelegationDuration
+}
+
+// DefaultFallbackPollInterval is how often the slow path re-checks
+// SelectProvider while blocked on the fallback ladder, when
+// Config.FallbackPollInterval is unset -- short enough to notice a
+// recovery well within a realistic reservation deadline (tens of
+// seconds to a few minutes), not so short it hammers routing/pricing.
+const DefaultFallbackPollInterval = 2 * time.Second
+
+func (cfg Config) fallbackPollInterval() time.Duration {
+	if cfg.FallbackPollInterval <= 0 {
+		return DefaultFallbackPollInterval
+	}
+	return cfg.FallbackPollInterval
 }
 
 // Service is this package's own entry point -- §A's "With C5" contract,
@@ -343,6 +369,49 @@ func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation,
 	return joinVendorNames(vendorsSeen), totalCost, delegations, nil
 }
 
+// pollUntilSelectableOrDeadline retries routing.SelectProvider while it
+// keeps falling back to the manual ladder, on cfg.fallbackPollInterval(),
+// until either a real primary becomes selectable or slowCtx's own
+// deadline elapses -- C4.6's own acceptance criterion: an outage or a
+// price spike is often transient, so a single bad SelectProvider result
+// must not fail the reservation outright; only running out the caller's
+// own deadline does. The very first fallback signal is recorded once via
+// OnFallbackTriggered (de-duplicated against any already-open event of
+// the same reason -- see routing's own doc comment), not once per poll:
+// re-triggering on every 2-second tick of a single reservation's own
+// wait would defeat that de-duplication's whole purpose.
+func (s *Service) pollUntilSelectableOrDeadline(slowCtx context.Context, reservationID, orderID int64) (routing.Selection, error) {
+	var triggeredReason string
+	for {
+		sel, err := s.router.SelectProvider(slowCtx, s.cfg.Weights, s.cfg.Ceiling)
+		if err != nil {
+			slog.Error("reservations: slow path: selecting a provider failed", "reservation_id", reservationID, "error", err)
+			return routing.Selection{}, err
+		}
+		if sel.Provider != provider.JustLendManual {
+			return sel, nil
+		}
+
+		if sel.Reason != triggeredReason {
+			triggeredReason = sel.Reason
+			oid := orderID
+			event, err := s.router.OnFallbackTriggered(slowCtx, sel.Reason, &oid)
+			if err != nil {
+				slog.Error("reservations: slow path: recording the fallback event failed", "reservation_id", reservationID, "error", err)
+			}
+			slog.Warn("reservations: slow path: routing fell back to the manual ladder -- waiting for a resolution or the reservation's own deadline, see docs/runbook-energy-fallback.md",
+				"reservation_id", reservationID, "reason", sel.Reason, "fallback_event_id", event.ID)
+		}
+
+		select {
+		case <-slowCtx.Done():
+			slog.Error("reservations: slow path: deadline elapsed while blocked on the manual fallback ladder", "reservation_id", reservationID, "reason", sel.Reason)
+			return routing.Selection{}, slowCtx.Err()
+		case <-time.After(s.cfg.fallbackPollInterval()):
+		}
+	}
+}
+
 // slowPath is C4.4's own vendor-latency-carrying path: a live
 // routing.SelectProvider + a direct, synchronous Delegate, bounded by
 // req.Deadline. Metering how often this path is taken (versus the fast
@@ -352,14 +421,8 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 	slowCtx, cancel := context.WithDeadline(ctx, req.Deadline)
 	defer cancel()
 
-	sel, err := s.router.SelectProvider(slowCtx, s.cfg.Weights, s.cfg.Ceiling)
+	sel, err := s.pollUntilSelectableOrDeadline(slowCtx, reservation.ID, orderID)
 	if err != nil {
-		slog.Error("reservations: slow path: selecting a provider failed", "reservation_id", reservation.ID, "error", err)
-		return s.fail(ctx, reservation.ID)
-	}
-	if sel.Provider == provider.JustLendManual {
-		slog.Warn("reservations: slow path: routing fell back to the manual ladder -- no automatic delegation attempted, see C4.6's runbook",
-			"reservation_id", reservation.ID, "reason", sel.Reason)
 		return s.fail(ctx, reservation.ID)
 	}
 

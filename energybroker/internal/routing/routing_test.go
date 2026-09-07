@@ -72,7 +72,7 @@ func TestSelectProvider_AllHealthyMatchesConfiguredWeights(t *testing.T) {
 	prices.setPrice(provider.Netts, 24.0)
 	prices.setPrice(provider.Catfee, 24.0)
 
-	r := NewRouter(prices, 1)
+	r := NewRouter(prices, nil, 1)
 	counts := runSelections(t, r, defaultWeights(), ceiling, 10000)
 
 	assertWithinTolerance(t, counts, 10000, map[string]float64{
@@ -92,7 +92,7 @@ func TestSelectProvider_UnhealthyProviderIsRenormalizedNotZeroed(t *testing.T) {
 	prices.setPrice(provider.Netts, 24.0)
 	prices.setUnhealthy(provider.Catfee, errors.New("catfee: simulated outage"))
 
-	r := NewRouter(prices, 2)
+	r := NewRouter(prices, nil, 2)
 	counts := runSelections(t, r, defaultWeights(), ceiling, 10000)
 
 	if counts[provider.Catfee] != 0 {
@@ -117,7 +117,7 @@ func TestSelectProvider_AllUnhealthyAlwaysFallsBackToManualLadder(t *testing.T) 
 	prices.setUnhealthy(provider.Netts, errors.New("netts: simulated outage"))
 	prices.setUnhealthy(provider.Catfee, errors.New("catfee: simulated outage"))
 
-	r := NewRouter(prices, 3)
+	r := NewRouter(prices, nil, 3)
 	for i := 0; i < 1000; i++ {
 		sel, err := r.SelectProvider(context.Background(), defaultWeights(), ceiling)
 		if err != nil {
@@ -147,7 +147,7 @@ func TestSelectProvider_AllHealthyButAllOverCeilingIsDistinguishedFromOutage(t *
 	prices.setPrice(provider.Netts, 100.0)
 	prices.setPrice(provider.Catfee, 100.0)
 
-	r := NewRouter(prices, 4)
+	r := NewRouter(prices, nil, 4)
 	sel, err := r.SelectProvider(context.Background(), defaultWeights(), ceiling)
 	if err != nil {
 		t.Fatalf("SelectProvider: %v", err)
@@ -172,7 +172,7 @@ func TestSelectProvider_MixedUnhealthyAndOverCeilingStillReportsManualRequired(t
 	prices.setPrice(provider.Netts, 100.0)
 	prices.setPrice(provider.Catfee, 100.0)
 
-	r := NewRouter(prices, 5)
+	r := NewRouter(prices, nil, 5)
 	sel, err := r.SelectProvider(context.Background(), defaultWeights(), ceiling)
 	if err != nil {
 		t.Fatalf("SelectProvider: %v", err)
@@ -184,7 +184,7 @@ func TestSelectProvider_MixedUnhealthyAndOverCeilingStillReportsManualRequired(t
 
 func TestSelectProvider_RejectsInvalidWeights(t *testing.T) {
 	prices := newFakePriceSource()
-	r := NewRouter(prices, 1)
+	r := NewRouter(prices, nil, 1)
 
 	tests := []struct {
 		name    string

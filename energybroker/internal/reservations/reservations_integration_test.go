@@ -117,7 +117,7 @@ func newTestHarness(t *testing.T, pool *db.Pool, reader *buffer.FakeTronReader) 
 	if err := poller.PollAll(context.Background()); err != nil {
 		t.Fatalf("PollAll: %v", err)
 	}
-	router := routing.NewRouter(poller, 1)
+	router := routing.NewRouter(poller, pool, 1)
 
 	buf := buffer.NewBuffer(pool, providers, router, stubDemandObserver{}, reader, nil, buffer.Config{
 		StagingAddress: "TStagingReservations0000000001",
@@ -318,6 +318,12 @@ func TestCreate_SlowPath_RespectsTheCeilingAndNeverPaysThrough(t *testing.T) {
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 10, ExternalID: "order-ceiling-1"}}
 	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
+		// Short poll interval and deadline: the price stays above ceiling
+		// for the entire test, so the slow path's own retry loop (C4.6)
+		// polls a couple of times and then correctly fails once the
+		// deadline elapses -- no need for a multi-second test to prove
+		// that.
+		FallbackPollInterval: 20 * time.Millisecond,
 	})
 
 	req := reservations.Request{
@@ -326,7 +332,7 @@ func TestCreate_SlowPath_RespectsTheCeilingAndNeverPaysThrough(t *testing.T) {
 		TargetAddress:  "TPayoutSlot00000000000000000004",
 		EnergyUnits:    500,
 		Tier:           "STANDARD",
-		Deadline:       time.Now().Add(5 * time.Second),
+		Deadline:       time.Now().Add(150 * time.Millisecond),
 	}
 
 	res, err := svc.Create(ctx, req)
@@ -341,6 +347,77 @@ func TestCreate_SlowPath_RespectsTheCeilingAndNeverPaysThrough(t *testing.T) {
 		if got := p.(*provider.MockProvider).DelegateCallCount(); got != 0 {
 			t.Fatalf("provider %s: Delegate was called %d times, want 0 -- a price above ceiling must never be paid (invariant 3)", name, got)
 		}
+	}
+
+	// C4.6: a live reservation hitting the fallback ladder must record a
+	// manual_fallback_events row (via routing.OnFallbackTriggered), not
+	// just fail silently.
+	var eventCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM manual_fallback_events WHERE reason = 'all_over_ceiling' AND order_id = $1`, orders.order.ID).Scan(&eventCount); err != nil {
+		t.Fatalf("counting manual_fallback_events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("manual_fallback_events rows for order %d = %d, want exactly 1", orders.order.ID, eventCount)
+	}
+}
+
+// TestCreate_SlowPath_RecoversIfAVendorBecomesSelectableWithinDeadline is
+// this chunk's own central behavioral correction over C4.4: a single bad
+// SelectProvider result (every vendor over ceiling right now) must NOT
+// fail the reservation outright -- only running out the deadline does.
+// This proves the other half: if a vendor becomes selectable again
+// WHILE the reservation is still waiting, it must actually recover and
+// confirm, not just eventually time out anyway.
+func TestCreate_SlowPath_RecoversIfAVendorBecomesSelectableWithinDeadline(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	reader := buffer.NewFakeTronReader()
+	reader.AutoConfirm(1_000_000)
+	h := newTestHarness(t, pool, reader)
+
+	for _, p := range h.providers {
+		p.(*provider.MockProvider).ForcePrice(9999.0)
+	}
+	if err := h.poller.PollAll(ctx); err != nil {
+		t.Fatalf("PollAll (forcing everyone over ceiling): %v", err)
+	}
+
+	// After a short delay, tronsell comes back under ceiling -- a real
+	// vendor recovering mid-outage. The slow path's own retry loop
+	// should notice on its very next poll and proceed to Delegate,
+	// rather than having already given up.
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		h.providers[provider.Tronsell].(*provider.MockProvider).ForcePrice(24.0)
+		_ = h.poller.PollAll(context.Background())
+	}()
+
+	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 12, ExternalID: "order-recovers-1"}}
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+		Weights:              defaultWeights(),
+		Ceiling:              ceiling,
+		FallbackPollInterval: 20 * time.Millisecond,
+	})
+
+	req := reservations.Request{
+		IdempotencyKey: "dispatch:order-recovers-1:1",
+		ExternalID:     "order-recovers-1",
+		TargetAddress:  "TPayoutSlot00000000000000000008",
+		EnergyUnits:    500,
+		Tier:           "STANDARD",
+		Deadline:       time.Now().Add(2 * time.Second),
+	}
+
+	res, err := svc.Create(ctx, req)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Status != reservations.StatusConfirmed {
+		t.Fatalf("Status = %s, want CONFIRMED -- the slow path should have retried until tronsell recovered, well before the 2s deadline", res.Status)
+	}
+	if res.Vendor == nil || *res.Vendor != provider.Tronsell {
+		t.Fatalf("Vendor = %v, want tronsell (the one that recovered)", res.Vendor)
 	}
 }
 

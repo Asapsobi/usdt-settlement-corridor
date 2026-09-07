@@ -216,8 +216,17 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 			return fmt.Errorf("buffer: selecting a provider to replenish: %w", err)
 		}
 		if sel.Provider == provider.JustLendManual {
-			slog.Warn("buffer: replenish blocked -- every primary provider is unavailable or over ceiling, see C4.6's manual runbook",
-				"reason", sel.Reason, "shortfall_units", shortfall)
+			// orderID nil: this is the buffer's own background loop
+			// detecting the outage before any specific order needed the
+			// energy -- OnFallbackTriggered's own de-dup means a
+			// prolonged outage spanning many ticks still records exactly
+			// one open manual_fallback_events row, not one per tick.
+			event, err := b.router.OnFallbackTriggered(ctx, sel.Reason, nil)
+			if err != nil {
+				slog.Error("buffer: recording the fallback event failed", "reason", sel.Reason, "error", err)
+			}
+			slog.Warn("buffer: replenish blocked -- every primary provider is unavailable or over ceiling, see docs/runbook-energy-fallback.md",
+				"reason", sel.Reason, "shortfall_units", shortfall, "fallback_event_id", event.ID)
 			return nil
 		}
 
