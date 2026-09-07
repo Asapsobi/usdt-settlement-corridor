@@ -46,11 +46,10 @@ type MockProvider struct {
 	maxUnits        int64
 	delegationSeq   int64
 	delegateCalls   int
-	redelegateCalls int
 }
 
-// ForceChargedPriceSun configures every subsequent Delegate/Redelegate
-// call to compute CostTRX from sun, independent of whatever Quote (or
+// ForceChargedPriceSun configures every subsequent Delegate call to
+// compute CostTRX from sun, independent of whatever Quote (or
 // ForcePrice) reports -- C4.7's own adversarial scenario: a real vendor
 // integrity failure where the price quoted and the price actually
 // charged diverge. Without this knob, MockProvider always charges
@@ -63,22 +62,29 @@ func (m *MockProvider) ForceChargedPriceSun(sun float64) {
 	m.forcedChargeSun = &sun
 }
 
-// DelegateCallCount and RedelegateCallCount report how many times
-// Delegate/Redelegate have been called -- exported, mirroring C3's own
-// MockProvider.ScreenCallCount, so a caller (internal/reservations' own
-// fast-path tests, concretely) can assert a fast-path confirmation
-// really did skip Delegate entirely, not just that the outcome looked
-// right.
+// DelegateCallCount reports how many times Delegate has been called --
+// exported, mirroring C3's own MockProvider.ScreenCallCount, so a
+// caller (internal/reservations' own fast-path tests, concretely) can
+// assert a fast-path confirmation made zero vendor calls at all, not
+// just that the outcome looked right.
 func (m *MockProvider) DelegateCallCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.delegateCalls
 }
 
-func (m *MockProvider) RedelegateCallCount() int {
+// AdvanceDelegationSequence bumps this MockProvider's own internal
+// delegation-id sequence by n, without going through Delegate (so
+// DelegateCallCount and the shape of any real Delegate call are both
+// left untouched). A test harness that needs a reproducible, disjoint
+// id range per instance -- e.g. internal/replay's own rig warmup, so two
+// different rigs sharing one long-lived real ledger database never mint
+// colliding "mock-<name>-<seq>" ids -- calls this rather than making
+// throwaway real Delegate calls just to advance the counter.
+func (m *MockProvider) AdvanceDelegationSequence(n int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.redelegateCalls
+	m.delegationSeq += n
+	m.mu.Unlock()
 }
 
 // NewMockProvider returns a MockProvider named name (one of the
@@ -220,51 +226,20 @@ func (m *MockProvider) Delegate(ctx context.Context, target string, units int64,
 	seq := m.delegationSeq
 	m.mu.Unlock()
 
+	requestedAt := time.Now().UTC()
 	return Delegation{
 		ID:            fmt.Sprintf("mock-%s-%d", m.name, seq),
 		ProviderName:  m.name,
 		TargetAddress: target,
 		EnergyUnits:   units,
 		CostTRX:       cost,
-		RequestedAt:   time.Now().UTC(),
-		ConfirmedAt:   nil,
-	}, nil
-}
-
-// Redelegate implements EnergyProvider. Retargeting an already-acquired
-// delegation to a new address costs nothing further -- the energy was
-// already paid for when it was first delegated -- so CostTRX is always
-// zero, distinct from Delegate's own real, non-zero cost.
-func (m *MockProvider) Redelegate(ctx context.Context, delegationID, newTarget string, units int64) (Delegation, error) {
-	m.mu.Lock()
-	m.redelegateCalls++
-	forceTimeout := m.forceTimeout
-	forceMalformed := m.forceMalformed
-	m.mu.Unlock()
-
-	if forceTimeout {
-		<-ctx.Done()
-		return Delegation{}, ctx.Err()
-	}
-	if forceMalformed {
-		return Delegation{}, fmt.Errorf("mock provider %s: %w", m.name, ErrMalformedResponse)
-	}
-	if err := ctx.Err(); err != nil {
-		return Delegation{}, err
-	}
-
-	m.mu.Lock()
-	m.delegationSeq++
-	seq := m.delegationSeq
-	m.mu.Unlock()
-
-	return Delegation{
-		ID:            fmt.Sprintf("mock-%s-redelegate-%d", m.name, seq),
-		ProviderName:  m.name,
-		TargetAddress: newTarget,
-		EnergyUnits:   units,
-		CostTRX:       0,
-		RequestedAt:   time.Now().UTC(),
-		ConfirmedAt:   nil,
+		RequestedAt:   requestedAt,
+		// MockProvider always grants exactly the requested duration --
+		// unlike CatFee/Netts, which cap every real order at 1 hour
+		// regardless of what's asked for (see Delegation's own doc
+		// comment). A test that needs to exercise a vendor granting less
+		// than requested should not rely on this mock for that.
+		ExpiresAt:   requestedAt.Add(duration),
+		ConfirmedAt: nil,
 	}, nil
 }

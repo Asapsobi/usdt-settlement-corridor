@@ -2,38 +2,32 @@
 // the chunk C5 will actually be built against once it exists.
 //
 // This chunk also resolves C4.4's own explicit OPEN QUESTION (energy
-// delegated to internal/buffer's own staging address is not
+// delegated to internal/buffer's own holding address is not
 // automatically usable by the specific TRON slot address a reservation
 // names, since TRON resource delegation always targets one address).
-// This package picks design (b) from that question: one shared buffer,
-// with Create performing a fast RE-delegation from the buffer's holding
-// address to the requested slot at reservation time, rather than design
-// (a) (six parallel buffers, one pre-delegated per known payout slot).
+// This package originally picked design (b) from that question: one
+// shared buffer against a single staging address, with Create performing
+// a fast RE-delegation to the requested slot at reservation time. That
+// design assumed a real vendor could retarget an already-issued
+// delegation to a new address on request, at no further cost -- an
+// assumption that turned out to be false against all three real
+// vendors' actual APIs (Tronsell, Netts, CatFee each only expose "buy a
+// new, fixed-receiver order," never "retarget an existing one" -- see
+// internal/provider.EnergyProvider's own doc comment). A same-shaped
+// "Redelegate" against any of them could only mean a second live
+// purchase, which would put vendor latency back in the fast path's own
+// critical path (exactly what internal/buffer's staging design exists
+// to avoid) and pay for the same energy twice.
 //
-// Why (b), concretely: internal/buffer (C4.3) already ships as a single
-// pool against one configured StagingAddress -- (a) would mean reworking
-// already-built, already-tested replenishment/reservation logic into six
-// independently-sized, independently-replenished pools, a much larger
-// change than this chunk's own scope, for a payoff ((a)'s "zero
-// re-delegation latency") that is only worth that cost if a real
-// re-delegation call turns out to be too slow in practice. (b) is also
-// the natural, incremental fit for what C4.3 already built: Reserve's
-// own claim never changes, only what happens to a claimed allocation
-// immediately afterward.
-//
-// The chunk's own text is explicit that real re-delegation latency
-// should be "confirmed on testnet before committing" -- the same
-// discipline C2.4 applied to its own BSC contract address. This
-// environment has no reachable TRON node (testnet or otherwise) to make
-// that call against; TestFastPath_ConfirmsWellWithinDeadline (this
-// package's own test suite) proves the FAST PATH'S OWN LOGIC completes
-// well within a tight deadline against a fake vendor with a configurable
-// synthetic delay, which is the testable assertion this chunk's own
-// acceptance criteria ask for -- it is NOT a substitute for the real,
-// unclosed action item: confirming actual on-chain re-delegation latency
-// against a real TRON testnet before this ships to production. Whoever
-// owns that verification should treat design (a) as the documented
-// fallback if real latency turns out to be too high.
+// This package now uses design (a) instead: internal/buffer keeps one
+// independently-sized, independently-replenished pool per known payout
+// slot address (buffer.Config.SlotAddresses), each pre-acquired already
+// pointed at its own final destination. Reserve's own claim query filters
+// on the requested target address directly, so a fast-path confirmation
+// (confirmFastPath, below) is a pure database transition against
+// already-verified rows -- zero vendor calls, zero re-verification,
+// genuinely "zero re-delegation latency" because there is no
+// re-delegation step left at all.
 package reservations
 
 import (
@@ -107,10 +101,10 @@ func (req Request) validate() error {
 // path, the fresh Delegate call's own cost; for the fast path, the SUM
 // of whatever the underlying energy_buffer row(s) originally cost when
 // Replenish first bought them (buffer.Row.CostTRX, carried through
-// unchanged) -- retargeting them via Redelegate is itself free, but the
-// energy was never free, and this field is "what did securing this
-// order's energy cost," not "what did the redelegation call itself
-// cost." Getting this right mattered enough to fix here in C4.5: an
+// unchanged) -- claiming an already-provisioned row is itself free (a
+// pure database transition), but the energy it holds never was, and
+// this field is "what did securing this order's energy cost." Getting
+// this right mattered enough to fix here in C4.5: an
 // earlier version of this package (C4.4) hardcoded the fast path's own
 // CostTRX to 0, which would have meant no cost ever attributed to C1 for
 // energy consumed via the fast path at all. See ledgerclient's own
@@ -135,8 +129,9 @@ type Reservation struct {
 	CreatedAt      time.Time
 	// FastPath is nil until CONFIRMED (a PENDING or FAILED reservation
 	// never resolved to either path), true for a fast-path (buffer
-	// Reserve + Redelegate) confirmation, false for a slow-path (live
-	// Delegate) one. C4.8's own GET /v1/system/invariants and the
+	// Reserve against an already-provisioned slot) confirmation, false
+	// for a slow-path (live Delegate) one. C4.8's own GET
+	// /v1/system/invariants and the
 	// reservations_total{fast_path,slow_path,failed} metric both read
 	// this.
 	FastPath *bool
@@ -154,9 +149,15 @@ type OrderResolver interface {
 // BufferReserver is the three calls this package needs from C4.3's own
 // Buffer -- an interface, not a concrete *buffer.Buffer, so this
 // package's own tests can exercise the fast path without a real
-// Postgres-backed buffer behind it.
+// Postgres-backed buffer behind it. Only the slow path still calls
+// VerifyOnChain: a row Reserve returns for the fast path was already
+// independently verified on-chain once, when Replenish first acquired
+// it (invariant 1) -- claiming it is a pure bookkeeping transition that
+// changes nothing on-chain, so re-verifying it again at reservation
+// time would be redundant, not safer. The slow path's fresh Delegate
+// result has no such prior verification, so it still needs one.
 type BufferReserver interface {
-	Reserve(ctx context.Context, orderID, units int64) (*buffer.Allocation, error)
+	Reserve(ctx context.Context, orderID int64, targetAddress string, units int64) (*buffer.Allocation, error)
 	RowsByIDs(ctx context.Context, ids []int64) ([]buffer.Row, error)
 	VerifyOnChain(ctx context.Context, d provider.Delegation) (bool, error)
 }
@@ -277,8 +278,28 @@ func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router 
 // RecentReservedUnits implements buffer.DemandObserver (C4.3): the
 // interface that chunk was built against before this package -- the
 // thing that actually creates reservations -- existed to answer it.
-func (s *Service) RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error) {
-	return recentReservedUnits(ctx, s.pool, window)
+// Scoped to targetAddress, matching each slot's own independent target
+// level (design (a) -- see this package's own doc comment).
+func (s *Service) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
+	return recentReservedUnits(ctx, s.pool, window, targetAddress)
+}
+
+// DemandObserver implements buffer.DemandObserver directly off a *db.Pool,
+// with no dependency on a constructed *Service. This exists to break a
+// real circular constructor dependency in production wiring:
+// buffer.NewBuffer needs a DemandObserver, but the only thing that
+// naturally answers "how much was recently reserved" is this package's
+// own reservations table -- which NewService also needs a *buffer.Buffer
+// to construct. Every query this type runs is byte-for-byte the same one
+// Service.RecentReservedUnits runs; this is not a second implementation
+// to keep in sync, only a second entry point to the same one.
+type DemandObserver struct {
+	Pool *db.Pool
+}
+
+// RecentReservedUnits implements buffer.DemandObserver.
+func (o DemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
+	return recentReservedUnits(ctx, o.Pool, window, targetAddress)
 }
 
 // Get fetches a reservation by id.
@@ -295,11 +316,11 @@ func (s *Service) Get(ctx context.Context, id int64) (Reservation, error) {
 
 // Create implements §A's own POST /v1/reservations: idempotent on
 // req.IdempotencyKey, resolving req.ExternalID to C1's own internal
-// order id, then the fast path (buffer.Reserve + Redelegate) or, on
-// ErrBufferExhausted, the slow path (routing.SelectProvider +
-// provider.Delegate, bounded by req.Deadline) -- see this package's own
-// doc comment for why re-delegation, not a cold vendor call, is the fast
-// path's own confirmation step.
+// order id, then the fast path (buffer.Reserve against req.TargetAddress's
+// own pre-provisioned slot) or, on ErrBufferExhausted, the slow path
+// (routing.SelectProvider + provider.Delegate, bounded by req.Deadline)
+// -- see this package's own doc comment for why a database claim, not a
+// cold vendor call, is the fast path's own confirmation step.
 func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) {
 	if err := req.validate(); err != nil {
 		return Reservation{}, err
@@ -332,21 +353,24 @@ func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) 
 		return Reservation{}, err
 	}
 
-	alloc, err := s.buf.Reserve(ctx, order.ID, req.EnergyUnits)
+	alloc, err := s.buf.Reserve(ctx, order.ID, req.TargetAddress, req.EnergyUnits)
 	if err == nil {
-		vendor, cost, delegations, fastErr := s.confirmFastPath(ctx, alloc, req.TargetAddress)
+		vendor, cost, delegations, fastErr := s.confirmFastPath(ctx, alloc)
 		if fastErr == nil {
 			return s.confirmAndReport(ctx, reservation.ID, order.ID, vendor, cost, delegations, true)
 		}
 		// The buffer already committed this allocation (Reserve's own
-		// transaction succeeded) before re-delegation failed -- those
+		// transaction succeeded) before confirmFastPath failed -- those
 		// energy_buffer rows are RESERVED against an allocation this
 		// reservation will never actually use. Flagged loudly, not
 		// silently retried or auto-released: same reconciliation posture
 		// screening's own holds.Release takes when its local write fails
 		// after a successful remote call, just mirrored (the remote call
-		// failed here, not the local write).
-		slog.Error("reservations: fast-path re-delegation failed after the buffer already reserved capacity -- the underlying allocation needs manual reconciliation",
+		// failed here, not the local write). In practice this should only
+		// ever be a configuration error (a buffer row references a
+		// provider name with no wired EnergyProvider) -- there is no
+		// vendor call left in this path to fail transiently.
+		slog.Error("reservations: fast-path confirmation failed after the buffer already reserved capacity -- the underlying allocation needs manual reconciliation",
 			"reservation_id", reservation.ID, "allocation_id", alloc.ID, "order_id", order.ID, "error", fastErr)
 		return s.fail(ctx, reservation.ID)
 	}
@@ -357,18 +381,21 @@ func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) 
 	return s.slowPath(ctx, *reservation, req, order.ID)
 }
 
-// confirmFastPath redirects every energy_buffer row alloc claimed to
-// targetAddress, verifying each one on-chain before trusting it. Zero
-// calls to any EnergyProvider.Delegate -- only Redelegate -- per this
-// chunk's own acceptance criterion. Returns one provider.Delegation per
-// underlying row (reconstructed from that row's own original
-// acquisition -- provider name, delegation id, units, and cost --  with
-// TargetAddress updated to where it was just redirected), for
+// confirmFastPath turns alloc's claimed energy_buffer rows directly into
+// the Delegations confirmAndReport needs to post to the ledger. Zero
+// vendor calls of any kind -- every row Reserve claimed was pre-acquired
+// by Replenish already pointed at the reservation's own target address
+// (buffer.Buffer keeps one independently-sized pool per known payout
+// slot, see internal/provider.EnergyProvider's own doc comment for why),
+// and was already independently verified on-chain once, at Replenish
+// time (invariant 1) -- claiming it here is a pure database transition
+// that changes nothing on-chain, so there is nothing left to call or
+// re-verify. Returns one provider.Delegation per underlying row, for
 // confirmAndReport to post an E4 entry against each: a fast-path
 // allocation spanning rows from more than one original acquisition
 // genuinely has more than one delegation, and each needs its own,
 // separately idempotency-keyed entry (invariant 4).
-func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation, targetAddress string) (vendor string, totalCost money.Amount, delegations []provider.Delegation, err error) {
+func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation) (vendor string, totalCost money.Amount, delegations []provider.Delegation, err error) {
 	rows, err := s.buf.RowsByIDs(ctx, alloc.RowIDs)
 	if err != nil {
 		return "", 0, nil, err
@@ -376,28 +403,14 @@ func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation,
 
 	vendorsSeen := map[string]bool{}
 	for _, row := range rows {
-		prov, ok := s.providers[row.ProviderName]
-		if !ok {
+		if _, ok := s.providers[row.ProviderName]; !ok {
 			return "", 0, nil, fmt.Errorf("reservations: buffer row %d references provider %q with no wired EnergyProvider", row.ID, row.ProviderName)
-		}
-
-		fresh, err := prov.Redelegate(ctx, row.DelegationID, targetAddress, row.Units)
-		if err != nil {
-			return "", 0, nil, fmt.Errorf("redelegating row %d (%s, delegation %s): %w", row.ID, row.ProviderName, row.DelegationID, err)
-		}
-
-		confirmed, err := s.buf.VerifyOnChain(ctx, fresh)
-		if err != nil {
-			return "", 0, nil, fmt.Errorf("verifying redelegated row %d on-chain: %w", row.ID, err)
-		}
-		if !confirmed {
-			return "", 0, nil, fmt.Errorf("redelegated row %d did not verify on-chain", row.ID)
 		}
 
 		vendorsSeen[row.ProviderName] = true
 		totalCost += row.CostTRX
 		delegations = append(delegations, provider.Delegation{
-			ID: row.DelegationID, ProviderName: row.ProviderName, TargetAddress: targetAddress,
+			ID: row.DelegationID, ProviderName: row.ProviderName, TargetAddress: row.SlotAddress,
 			EnergyUnits: row.Units, CostTRX: row.CostTRX, RequestedAt: row.AcquiredAt,
 		})
 	}

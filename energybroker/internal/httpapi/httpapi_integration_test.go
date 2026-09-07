@@ -96,7 +96,7 @@ func defaultWeights() routing.RoutingWeights {
 
 type stubDemandObserver struct{}
 
-func (stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error) {
+func (stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
 	return 0, nil
 }
 
@@ -141,8 +141,8 @@ func testServer(t *testing.T, orders reservations.OrderResolver) (baseURL string
 	reader := buffer.NewFakeTronReader()
 	reader.AutoConfirm(1_000_000)
 	buf, err := buffer.NewBuffer(wrapped, providers, router, stubDemandObserver{}, reader, nil, buffer.Config{
-		StagingAddress: "TStagingHTTPTest00000000000001",
-		Ceiling:        ceiling,
+		SlotAddresses: []string{"TSlotHTTPTest0000000000000001"},
+		Ceiling:       ceiling,
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -176,17 +176,18 @@ func testServer(t *testing.T, orders reservations.OrderResolver) (baseURL string
 	return ts.URL, wrapped, server
 }
 
-// seedAvailableRow inserts an AVAILABLE energy_buffer row directly --
-// these tests care about the HTTP boundary's own translation, not about
-// how a warm buffer got that way (internal/buffer's and
-// internal/reservations' own tests already cover Replenish/Create
-// exhaustively).
-func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID string, units, costTRX int64) {
+// seedAvailableRow inserts an AVAILABLE energy_buffer row directly,
+// slotted under slotAddress -- these tests care about the HTTP
+// boundary's own translation, not about how a warm buffer got that way
+// (internal/buffer's and internal/reservations' own tests already cover
+// Replenish/Create exhaustively). A row only serves Reserve for a
+// reservation whose own target_address matches slotAddress exactly.
+func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID, slotAddress string, units, costTRX int64) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(), `
-		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, now(), $4, now() + interval '1 hour', 'AVAILABLE')
-	`, providerName, delegationID, units, costTRX)
+		INSERT INTO energy_buffer (provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status)
+		VALUES ($1, $2, $3, $4, now(), $5, now() + interval '1 hour', 'AVAILABLE')
+	`, providerName, delegationID, slotAddress, units, costTRX)
 	if err != nil {
 		t.Fatalf("seeding available row: %v", err)
 	}
@@ -326,7 +327,7 @@ func TestPostReservation_RequiresIdempotencyKey(t *testing.T) {
 
 func TestPostReservation_FastPath_ThenGetReservation(t *testing.T) {
 	baseURL, pool, _ := testServer(t, fakeOrderResolver{order: ledgerclient.Order{ID: 501, ExternalID: "http-fast-1"}})
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-http-1", 500, 1_200000)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-http-1", "TPayoutHTTPTest0000000000001", 500, 1_200000)
 
 	resp := doRequestWithIdempotencyKey(t, http.MethodPost, baseURL+"/v1/reservations", testToken, "dispatch:http-fast-1:1", map[string]any{
 		"external_id":    "http-fast-1",
@@ -387,7 +388,7 @@ func TestGetReservation_NotFound(t *testing.T) {
 
 func TestGetBuffer(t *testing.T) {
 	baseURL, pool, _ := testServer(t, nil)
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-buf-1", 300, 700000)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-buf-1", "TPayoutHTTPBuf00000000000001", 300, 700000)
 
 	resp := doRequest(t, http.MethodGet, baseURL+"/v1/buffer", testToken, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -516,7 +517,7 @@ func TestGetSystemPrices(t *testing.T) {
 
 func TestGetSystemInvariants(t *testing.T) {
 	baseURL, pool, _ := testServer(t, fakeOrderResolver{order: ledgerclient.Order{ID: 900, ExternalID: "http-inv-1"}})
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-inv-1", 500, 1_000000)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-inv-1", "TPayoutHTTPInvariants000000001", 500, 1_000000)
 
 	resp := doRequestWithIdempotencyKey(t, http.MethodPost, baseURL+"/v1/reservations", testToken, "dispatch:http-inv-1:1", map[string]any{
 		"external_id":    "http-inv-1",
@@ -562,7 +563,7 @@ func TestPostReservation_AgainstRealC1(t *testing.T) {
 	customerID := "c48-http-live-cust-" + fmt.Sprint(time.Now().UnixNano())
 	order := ll.CreateOrder(externalID, customerID)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-live-1", 500, 1_200000)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-live-1", "TPayoutHTTPLive00000000000001", 500, 1_200000)
 
 	resp := doRequestWithIdempotencyKey(t, http.MethodPost, baseURL+"/v1/reservations", testToken, "dispatch:"+externalID+":1", map[string]any{
 		"external_id":    externalID,

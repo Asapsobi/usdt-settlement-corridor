@@ -28,6 +28,7 @@ type Row struct {
 	ID           int64
 	ProviderName string
 	DelegationID string
+	SlotAddress  string
 	Units        int64
 	AcquiredAt   time.Time
 	CostTRX      money.Amount
@@ -36,13 +37,22 @@ type Row struct {
 	AllocationID *int64
 }
 
-// availableTotal sums every currently-AVAILABLE row's units -- the
-// "current" half of Replenish's own "compare against TargetLevel" check.
-func availableTotal(ctx context.Context, q db.Queryer) (int64, error) {
+// availableTotal sums every currently-AVAILABLE row's units, optionally
+// scoped to one slot address -- the "current" half of replenishSlot's
+// own "compare against that slot's own target level" check. An empty
+// slotAddress means "every slot" (AvailableTotal's own system-wide use).
+func availableTotal(ctx context.Context, q db.Queryer, slotAddress string) (int64, error) {
 	var total int64
-	err := q.QueryRow(ctx, `
-		SELECT COALESCE(SUM(units), 0) FROM energy_buffer WHERE status = $1
-	`, string(StatusAvailable)).Scan(&total)
+	var err error
+	if slotAddress == "" {
+		err = q.QueryRow(ctx, `
+			SELECT COALESCE(SUM(units), 0) FROM energy_buffer WHERE status = $1
+		`, string(StatusAvailable)).Scan(&total)
+	} else {
+		err = q.QueryRow(ctx, `
+			SELECT COALESCE(SUM(units), 0) FROM energy_buffer WHERE status = $1 AND slot_address = $2
+		`, string(StatusAvailable), slotAddress).Scan(&total)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("buffer: summing available units: %w", err)
 	}
@@ -80,16 +90,20 @@ func totalsByProvider(ctx context.Context, q db.Queryer) ([]ProviderTotal, error
 	return out, rows.Err()
 }
 
-// insertAvailable records d as a new, AVAILABLE energy_buffer row --
-// called only once VerifyOnChain has independently confirmed it, per
-// invariant 1; a vendor's own 200 response alone never reaches this
-// function.
-func insertAvailable(ctx context.Context, q db.Queryer, d provider.Delegation, expiresAt time.Time) (Row, error) {
+// insertAvailable records d as a new, AVAILABLE energy_buffer row,
+// slotted under d.TargetAddress (Replenish always calls Delegate with
+// a configured slot address as the target, so the two are always the
+// same value at this call site) and expiring at d.ExpiresAt -- the
+// vendor's own real-granted expiry, never independently recomputed by
+// this caller (see Delegation's own doc comment on why). Called only
+// once VerifyOnChain has independently confirmed it, per invariant 1; a
+// vendor's own 200 response alone never reaches this function.
+func insertAvailable(ctx context.Context, q db.Queryer, d provider.Delegation) (Row, error) {
 	row := q.QueryRow(ctx, `
-		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status, allocation_id
-	`, d.ProviderName, d.ID, d.EnergyUnits, d.RequestedAt, int64(d.CostTRX), expiresAt, string(StatusAvailable))
+		INSERT INTO energy_buffer (provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status, allocation_id
+	`, d.ProviderName, d.ID, d.TargetAddress, d.EnergyUnits, d.RequestedAt, int64(d.CostTRX), d.ExpiresAt, string(StatusAvailable))
 	return scanRow(row)
 }
 
@@ -98,7 +112,7 @@ func insertAvailable(ctx context.Context, q db.Queryer, d provider.Delegation, e
 // set.
 func rowsNearingExpiry(ctx context.Context, q db.Queryer, lookahead time.Duration) ([]Row, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status, allocation_id
+		SELECT id, provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status, allocation_id
 		FROM energy_buffer
 		WHERE status IN ($1, $2)
 		  AND expires_at <= now() + $3::interval
@@ -122,14 +136,15 @@ func rowsNearingExpiry(ctx context.Context, q db.Queryer, lookahead time.Duratio
 
 // rowsByIDs fetches energy_buffer rows by id, in no particular order --
 // Reserve's own Allocation.RowIDs is the only caller, resolving a claim
-// back into the provider_name/delegation_id each row needs for
-// C4.4's own fast-path re-delegation.
+// back into the provider_name/delegation_id/slot_address each row needs
+// for confirmFastPath (internal/reservations) to attribute cost and
+// report each underlying delegation to C1.
 func rowsByIDs(ctx context.Context, q db.Queryer, ids []int64) ([]Row, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 	rows, err := q.Query(ctx, `
-		SELECT id, provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status, allocation_id
+		SELECT id, provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status, allocation_id
 		FROM energy_buffer
 		WHERE id = ANY($1)
 	`, ids)
@@ -182,7 +197,7 @@ func scanRow(row scannable) (Row, error) {
 func scanRowFields(row scannable) (Row, error) {
 	var r Row
 	var costTRX int64
-	if err := row.Scan(&r.ID, &r.ProviderName, &r.DelegationID, &r.Units, &r.AcquiredAt, &costTRX, &r.ExpiresAt, &r.Status, &r.AllocationID); err != nil {
+	if err := row.Scan(&r.ID, &r.ProviderName, &r.DelegationID, &r.SlotAddress, &r.Units, &r.AcquiredAt, &costTRX, &r.ExpiresAt, &r.Status, &r.AllocationID); err != nil {
 		return Row{}, err
 	}
 	r.CostTRX = money.Amount(costTRX)

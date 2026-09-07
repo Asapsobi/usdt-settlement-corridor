@@ -178,13 +178,17 @@ func newReactiveGaugeCollectors(s *Server) []prometheus.Collector {
 
 		collectors = append(collectors, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "broker_buffer_target",
-			Help: "Current TargetLevel the buffer is replenishing toward.",
+			Help: "Sum, across every configured payout slot, of the level the buffer is replenishing toward.",
 		}, func() float64 {
-			target, err := s.Buffer.TargetLevel(context.Background())
+			targets, err := s.Buffer.TargetLevels(context.Background())
 			if err != nil {
 				return 0
 			}
-			return float64(target)
+			var total int64
+			for _, t := range targets {
+				total += t
+			}
+			return float64(total)
 		}))
 	}
 

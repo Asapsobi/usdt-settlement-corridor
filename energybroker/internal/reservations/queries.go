@@ -128,15 +128,16 @@ func PathCounts(ctx context.Context, q db.Queryer) (fastCount, slowCount int64, 
 }
 
 // recentReservedUnits sums energy_units for every non-FAILED reservation
-// created within the last window -- internal/buffer's own DemandObserver
-// interface (C4.3), finally given a real implementation now that this
-// chunk's own reservations table exists.
-func recentReservedUnits(ctx context.Context, q db.Queryer, window time.Duration) (int64, error) {
+// created within the last window against targetAddress -- internal/buffer's
+// own DemandObserver interface (C4.3), scoped per slot address now that
+// each slot maintains its own independent target level (design (a) --
+// see this package's own doc comment).
+func recentReservedUnits(ctx context.Context, q db.Queryer, window time.Duration, targetAddress string) (int64, error) {
 	var total int64
 	err := q.QueryRow(ctx, `
 		SELECT COALESCE(SUM(energy_units), 0) FROM reservations
-		WHERE created_at > now() - $1::interval AND status <> $2
-	`, window.String(), string(StatusFailed)).Scan(&total)
+		WHERE created_at > now() - $1::interval AND status <> $2 AND target_address = $3
+	`, window.String(), string(StatusFailed), targetAddress).Scan(&total)
 	if err != nil {
 		return 0, fmt.Errorf("reservations: summing recent reserved units: %w", err)
 	}

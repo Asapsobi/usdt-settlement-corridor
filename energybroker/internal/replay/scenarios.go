@@ -29,8 +29,13 @@ func defaultWeights() routing.RoutingWeights {
 
 // newRequest builds one POST /v1/reservations-equivalent Request against
 // a freshly created real C1 order -- every scenario below needs exactly
-// this, differing only in energyUnits/deadline/tier.
-func (h *harness) newRequest(prefix string, energyUnits int64, deadline time.Duration, tier string) (order fixtureOrder, req reservations.Request, err error) {
+// this, differing only in targetAddress/energyUnits/deadline/tier.
+// targetAddress is always the caller's own choice, never invented here:
+// a fast-path scenario must pass its rig's own slotAddress (the only
+// address that rig's buffer ever pre-provisions against), while a
+// slow-path-only scenario (never touches the buffer at all) can pass any
+// address, unique or not.
+func (h *harness) newRequest(prefix, targetAddress string, energyUnits int64, deadline time.Duration, tier string) (order fixtureOrder, req reservations.Request, err error) {
 	order, err = h.createOrder(prefix)
 	if err != nil {
 		return fixtureOrder{}, reservations.Request{}, err
@@ -38,7 +43,7 @@ func (h *harness) newRequest(prefix string, energyUnits int64, deadline time.Dur
 	req = reservations.Request{
 		IdempotencyKey: h.nextID(prefix + "-idem"),
 		ExternalID:     order.ExternalID,
-		TargetAddress:  fmt.Sprintf("TReplayTarget%016d", order.ID),
+		TargetAddress:  targetAddress,
 		EnergyUnits:    energyUnits,
 		Tier:           tier,
 		Deadline:       time.Now().Add(deadline),
@@ -86,7 +91,7 @@ func (h *harness) scenarioCleanFastPathMajority() Result {
 	}
 
 	for i := 0; i < orders; i++ {
-		_, req, err := h.newRequest("cleanfast", perOrder, 5*time.Second, "STANDARD")
+		_, req, err := h.newRequest("cleanfast", rig.slotAddress, perOrder, 5*time.Second, "STANDARD")
 		if err != nil {
 			return fail(name, err)
 		}
@@ -128,13 +133,13 @@ func (h *harness) scenarioBufferExhaustionDemandBurstSlowPath() Result {
 	if err != nil {
 		return fail(name, err)
 	}
-	if err := h.seedAvailableRow(provider.Tronsell, h.nextID("exhaustion-seed"), 150, 3750, time.Hour); err != nil {
+	if err := h.seedAvailableRow(provider.Tronsell, h.nextID("exhaustion-seed"), rig.slotAddress, 150, 3750, time.Hour); err != nil {
 		return fail(name, err)
 	}
 
 	var fastCount, slowCount int
 	for i := 0; i < 3; i++ {
-		_, req, err := h.newRequest("exhaustion", 100, 5*time.Second, "STANDARD")
+		_, req, err := h.newRequest("exhaustion", rig.slotAddress, 100, 5*time.Second, "STANDARD")
 		if err != nil {
 			return fail(name, err)
 		}
@@ -234,7 +239,7 @@ func (h *harness) scenarioAllProvidersUnhealthyManualFallback() Result {
 		return fail(name, err)
 	}
 
-	order, req, err := h.newRequest("allunhealthy", 100, 1500*time.Millisecond, "STANDARD")
+	order, req, err := h.newRequest("allunhealthy", rig.slotAddress, 100, 1500*time.Millisecond, "STANDARD")
 	if err != nil {
 		return fail(name, err)
 	}
@@ -256,7 +261,7 @@ func (h *harness) scenarioAllProvidersUnhealthyManualFallback() Result {
 	if got := rig.catfee.DelegateCallCount(); got != 0 {
 		return fail(name, fmt.Errorf("catfee.DelegateCallCount = %d, want 0", got))
 	}
-	_ = baseline // Delegate is never warmed up (only Redelegate is), so 0 is the true baseline too
+	_ = baseline // warmup advances the delegation-id sequence directly (AdvanceDelegationSequence), never via a real Delegate call, so 0 is the true baseline too
 
 	events, err := routing.ListFallbackEvents(h.ctx, h.pool, boolPtr(false))
 	if err != nil {
@@ -297,7 +302,7 @@ func (h *harness) scenarioPriceSpikeAboveCeilingAllProviders() Result {
 		return fail(name, err)
 	}
 
-	order, req, err := h.newRequest("pricespike", 100, 1500*time.Millisecond, "STANDARD")
+	order, req, err := h.newRequest("pricespike", rig.slotAddress, 100, 1500*time.Millisecond, "STANDARD")
 	if err != nil {
 		return fail(name, err)
 	}
@@ -345,7 +350,7 @@ func (h *harness) scenarioVendorChargedMoreThanQuoted() Result {
 	rig.tronsell.ForceChargedPriceSun(35.0)
 	predictedID := rig.nextDelegationID(provider.Tronsell)
 
-	order, req, err := h.newRequest("overcharge", 500, 5*time.Second, "STANDARD")
+	order, req, err := h.newRequest("overcharge", rig.slotAddress, 500, 5*time.Second, "STANDARD")
 	if err != nil {
 		return fail(name, err)
 	}
@@ -414,7 +419,7 @@ func (h *harness) scenarioDelegationNeverLandedOnChain() Result {
 		return fail(name, err)
 	}
 
-	_, req, err := h.newRequest("neverlanded", 300, 5*time.Second, "STANDARD")
+	_, req, err := h.newRequest("neverlanded", rig.slotAddress, 300, 5*time.Second, "STANDARD")
 	if err != nil {
 		return fail(name, err)
 	}
@@ -474,21 +479,21 @@ func (h *harness) scenarioReconciliationCatchesEarlyRevokedDelegation() Result {
 	// narrowly-different instance around shared real dependencies"
 	// pattern this harness already uses for rig isolation itself.
 	reconcileBuf, err := buffer.NewBuffer(h.pool, rig.providers, rig.router, stubDemandObserver{}, h.reader, spy, buffer.Config{
-		StagingAddress: rig.stagingAddress,
-		Ceiling:        rig.ceiling,
+		SlotAddresses: []string{rig.slotAddress},
+		Ceiling:       rig.ceiling,
 	})
 	if err != nil {
 		return fail(name, err)
 	}
 
 	delegationID := h.nextID("revoked")
-	if err := h.seedAvailableRow(provider.Tronsell, delegationID, 400, 25*400, 5*time.Minute); err != nil {
+	if err := h.seedAvailableRow(provider.Tronsell, delegationID, rig.slotAddress, 400, 25*400, 5*time.Minute); err != nil {
 		return fail(name, err)
 	}
 	// Revoked on-chain: the reader now reports 0 units for this exact
 	// (address, delegationID) pair, even though bookkeeping still shows
 	// it AVAILABLE.
-	h.reader.inner.SetUnits(rig.stagingAddress, delegationID, 0)
+	h.reader.inner.SetUnits(rig.slotAddress, delegationID, 0)
 
 	beforeAvailable, err := reconcileBuf.AvailableTotal(h.ctx)
 	if err != nil {
@@ -546,7 +551,7 @@ func (h *harness) scenarioConcurrentReservationsRacingBuffer() Result {
 	// first winner claim the entire thing, starving the other n-1 --
 	// exactly the "plenty" case must not do.
 	for i := 0; i < nPlenty; i++ {
-		if err := h.seedAvailableRow(provider.Tronsell, h.nextID("plenty-seed"), perOrder, 25*perOrder, time.Hour); err != nil {
+		if err := h.seedAvailableRow(provider.Tronsell, h.nextID("plenty-seed"), plentyRig.slotAddress, perOrder, 25*perOrder, time.Hour); err != nil {
 			return fail(name, err)
 		}
 	}
@@ -579,7 +584,7 @@ func (h *harness) scenarioConcurrentReservationsRacingBuffer() Result {
 		return fail(name, err)
 	}
 	for i := 0; i < kFast; i++ {
-		if err := h.seedAvailableRow(provider.Tronsell, h.nextID("scarce-seed"), perOrder, 25*perOrder, time.Hour); err != nil {
+		if err := h.seedAvailableRow(provider.Tronsell, h.nextID("scarce-seed"), scarceRig.slotAddress, perOrder, 25*perOrder, time.Hour); err != nil {
 			return fail(name, err)
 		}
 	}
@@ -618,7 +623,7 @@ func (h *harness) scenarioConcurrentReservationsRacingBuffer() Result {
 func (h *harness) runConcurrentCreates(rig *rig, prefix string, n int, energyUnits int64) ([]reservations.Reservation, error) {
 	reqs := make([]reservations.Request, n)
 	for i := 0; i < n; i++ {
-		_, req, err := h.newRequest(fmt.Sprintf("%s%d", prefix, i), energyUnits, 5*time.Second, "STANDARD")
+		_, req, err := h.newRequest(fmt.Sprintf("%s%d", prefix, i), rig.slotAddress, energyUnits, 5*time.Second, "STANDARD")
 		if err != nil {
 			return nil, err
 		}

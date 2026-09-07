@@ -34,8 +34,12 @@ type Allocation struct {
 }
 
 // Reserve atomically claims at least units worth of AVAILABLE
-// energy_buffer rows for orderID, oldest-expiry-first (so soon-to-expire
-// capacity is used up rather than stranded), and marks them RESERVED.
+// energy_buffer rows already slotted under targetAddress, for orderID,
+// oldest-expiry-first (so soon-to-expire capacity is used up rather than
+// stranded), and marks them RESERVED. Only rows already pre-provisioned
+// against targetAddress are eligible -- see internal/provider's own
+// EnergyProvider doc comment for why a claimed row is never retargeted
+// to a different address after the fact.
 //
 // Concurrency safety is `FOR UPDATE SKIP LOCKED`, not an application-
 // level mutex -- but claimed ONE ROW PER QUERY, in a loop, not in a
@@ -52,24 +56,27 @@ type Allocation struct {
 // Claiming exactly one row per query, excluding rows already claimed
 // earlier in this same transaction, means this call never locks a
 // single row more than it actually ends up using.
-func (b *Buffer) Reserve(ctx context.Context, orderID, units int64) (*Allocation, error) {
+func (b *Buffer) Reserve(ctx context.Context, orderID int64, targetAddress string, units int64) (*Allocation, error) {
 	if units <= 0 {
 		return nil, fmt.Errorf("buffer: Reserve called with non-positive units %d", units)
+	}
+	if targetAddress == "" {
+		return nil, fmt.Errorf("buffer: Reserve called with an empty targetAddress")
 	}
 
 	var alloc *Allocation
 	err := db.Tx(ctx, b.pool, func(ctx context.Context, tx pgx.Tx) error {
-		claimed := []int64{} // never nil -- see the `= ANY($2)` exclusion below
+		claimed := []int64{} // never nil -- see the `= ANY($3)` exclusion below
 		var total int64
 		for total < units {
 			var id, rowUnits int64
 			err := tx.QueryRow(ctx, `
 				SELECT id, units FROM energy_buffer
-				WHERE status = $1 AND expires_at > now() AND NOT (id = ANY($2))
+				WHERE status = $1 AND slot_address = $2 AND expires_at > now() AND NOT (id = ANY($3))
 				ORDER BY expires_at ASC
 				LIMIT 1
 				FOR UPDATE SKIP LOCKED
-			`, string(StatusAvailable), claimed).Scan(&id, &rowUnits)
+			`, string(StatusAvailable), targetAddress, claimed).Scan(&id, &rowUnits)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					break // nothing left anywhere -- exhausted

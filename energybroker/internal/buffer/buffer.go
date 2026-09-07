@@ -27,8 +27,10 @@ import (
 // gap (SenderAddressLookup) before C1 actually exposed one.
 type DemandObserver interface {
 	// RecentReservedUnits reports how many energy units were reserved
-	// across the last window of wall-clock time.
-	RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error)
+	// for targetAddress across the last window of wall-clock time --
+	// scoped per slot address (not a system-wide total) now that each
+	// slot maintains its own independent target level.
+	RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error)
 }
 
 // Config scopes how this Buffer sizes and replenishes itself.
@@ -58,19 +60,20 @@ type Config struct {
 	// as "nearing" it for Reconcile's own purposes (DefaultReconcileLookahead
 	// if unset) -- see verify.go.
 	ReconcileLookahead time.Duration
-	// StagingAddress is the broker-controlled TRON address buffer
-	// capacity is delegated to during Replenish, before any specific
-	// order is known to need it. This is a real, flagged design
-	// decision this chunk makes, not something the build spec states
-	// outright: TRON energy delegation always targets a specific
-	// address, but a standing buffer is deliberately order-independent
-	// (the whole point of "Read this third" is acquiring capacity
-	// BEFORE a payout needs it) -- so this component needs an address of
-	// its own to hold that capacity against, pending re-delegation to
-	// the actual payout slot once C4.4 exists to do it. Whoever owns S1
-	// should confirm this is the right address to use in production;
-	// see this chunk's own commit message.
-	StagingAddress string
+	// SlotAddresses is the known roster of real payout slot addresses
+	// (component-map's own "six slots capped at $50k/5,000 tx each") this
+	// Buffer keeps pre-provisioned capacity against, one independent
+	// target level per address. This is C4.4's own design (a), adopted
+	// in place of a single broker-controlled staging address that gets
+	// retargeted per order at reservation time (design (b), this
+	// package's original choice): none of Tronsell/Netts/CatFee's real
+	// APIs support retargeting an existing delegation to a new address,
+	// so a standing buffer can only ever be useful if it is already
+	// pointed at the address a reservation will actually need -- see
+	// internal/provider.EnergyProvider's own doc comment for the full
+	// account of why. Whoever owns the payout wallet roster (S1) must
+	// supply the real addresses here; this package never invents one.
+	SlotAddresses []string
 }
 
 func (cfg Config) lookback() time.Duration {
@@ -171,10 +174,16 @@ func (b *Buffer) recordReplenishCost(providerName string, costTRX money.Amount) 
 // permanently fallback-ladder (routing.UnderCeiling's own `<=`
 // comparison already can't flip into "always pays anything" for a bad
 // ceiling, but "always refuses" is still a silent misconfiguration this
-// constructor should catch loudly instead).
+// constructor should catch loudly instead). Also returns an error if
+// cfg.SlotAddresses is empty -- a Buffer with nothing to pre-provision
+// would silently never replenish anything, the same "refuse to start
+// loudly" posture as the ceiling check.
 func NewBuffer(pool *db.Pool, providers map[string]provider.EnergyProvider, router *routing.Router, demand DemandObserver, reader TronEnergyReader, alerter Alerter, cfg Config) (*Buffer, error) {
 	if cfg.Ceiling <= 0 {
 		return nil, fmt.Errorf("buffer: %w: Config.Ceiling must be positive, got %v", routing.ErrInvalidCeiling, cfg.Ceiling)
+	}
+	if len(cfg.SlotAddresses) == 0 {
+		return nil, errors.New("buffer: Config.SlotAddresses must not be empty")
 	}
 	return &Buffer{
 		pool:      pool,
@@ -187,18 +196,18 @@ func NewBuffer(pool *db.Pool, providers map[string]provider.EnergyProvider, rout
 	}, nil
 }
 
-// TargetLevel is how many units this buffer should hold right now: the
-// recent demand rate (DemandObserver, over Config.LookbackWindow)
-// projected across Config.LookaheadWindow, floored at
-// Config.MinimumFloor. Never a hardcoded number -- see Config's own doc
-// comment on why.
-func (b *Buffer) TargetLevel(ctx context.Context) (int64, error) {
-	recent, err := b.demand.RecentReservedUnits(ctx, b.cfg.lookback())
+// targetLevelFor is how many units one slot address's own buffer should
+// hold right now: that address's own recent demand rate (DemandObserver,
+// over Config.LookbackWindow) projected across Config.LookaheadWindow,
+// floored at Config.MinimumFloor. Never a hardcoded number -- see
+// Config's own doc comment on why.
+func (b *Buffer) targetLevelFor(ctx context.Context, slotAddress string) (int64, error) {
+	recent, err := b.demand.RecentReservedUnits(ctx, b.cfg.lookback(), slotAddress)
 	if err != nil {
-		return 0, fmt.Errorf("buffer: sampling recent demand: %w", err)
+		return 0, fmt.Errorf("buffer: sampling recent demand for %s: %w", slotAddress, err)
 	}
 	if recent < 0 {
-		return 0, fmt.Errorf("buffer: DemandObserver reported a negative recent-units value %d", recent)
+		return 0, fmt.Errorf("buffer: DemandObserver reported a negative recent-units value %d for %s", recent, slotAddress)
 	}
 
 	rate := float64(recent) / b.cfg.lookback().Seconds()
@@ -211,11 +220,25 @@ func (b *Buffer) TargetLevel(ctx context.Context) (int64, error) {
 	return target, nil
 }
 
-// AvailableTotal is the current AVAILABLE unit total across every
-// provider -- the other half of TargetLevel's own comparison, exported
-// for C4.8's own GET /v1/system/invariants.
+// TargetLevels reports every configured slot address's own current
+// target level (see targetLevelFor), keyed by address.
+func (b *Buffer) TargetLevels(ctx context.Context) (map[string]int64, error) {
+	out := make(map[string]int64, len(b.cfg.SlotAddresses))
+	for _, addr := range b.cfg.SlotAddresses {
+		target, err := b.targetLevelFor(ctx, addr)
+		if err != nil {
+			return nil, err
+		}
+		out[addr] = target
+	}
+	return out, nil
+}
+
+// AvailableTotal is the current AVAILABLE unit total across every slot
+// address and provider -- the other half of TargetLevels's own
+// comparison, exported for C4.8's own GET /v1/system/invariants.
 func (b *Buffer) AvailableTotal(ctx context.Context) (int64, error) {
-	return availableTotal(ctx, b.pool)
+	return availableTotal(ctx, b.pool, "")
 }
 
 // ProviderTotal is one provider's own current AVAILABLE/RESERVED split --
@@ -265,21 +288,31 @@ func (b *Buffer) RunLoop(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-// Replenish tops the buffer up toward TargetLevel, one provider-chunk at
-// a time via routing.SelectProvider, bounded by each provider's own
+// Replenish tops up every configured slot address toward its own
+// TargetLevels entry, one provider-chunk at a time via
+// routing.SelectProvider, bounded by each provider's own
 // MaxUnitsAvailable. A step that can't proceed right now -- routing
 // falls back to justlend_manual, a re-quote fails, Delegate fails, or
-// VerifyOnChain doesn't confirm -- logs and returns nil rather than
-// erroring the whole tick: the next scheduled tick (RunLoop) or the next
-// explicit caller tries again, the same "log and continue, never a
-// retry storm within one call" discipline every other loop-owning
-// package in this project uses.
+// VerifyOnChain doesn't confirm -- logs and moves on to the next slot
+// rather than erroring the whole tick: the next scheduled tick (RunLoop)
+// or the next explicit caller tries again, the same "log and continue,
+// never a retry storm within one call" discipline every other
+// loop-owning package in this project uses.
 func (b *Buffer) Replenish(ctx context.Context) error {
-	target, err := b.TargetLevel(ctx)
+	for _, slotAddress := range b.cfg.SlotAddresses {
+		if err := b.replenishSlot(ctx, slotAddress); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Buffer) replenishSlot(ctx context.Context, slotAddress string) error {
+	target, err := b.targetLevelFor(ctx, slotAddress)
 	if err != nil {
 		return err
 	}
-	current, err := availableTotal(ctx, b.pool)
+	current, err := availableTotal(ctx, b.pool, slotAddress)
 	if err != nil {
 		return err
 	}
@@ -288,7 +321,7 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 	for shortfall > 0 {
 		sel, err := b.router.SelectProvider(ctx, b.cfg.Weights, b.cfg.Ceiling)
 		if err != nil {
-			return fmt.Errorf("buffer: selecting a provider to replenish: %w", err)
+			return fmt.Errorf("buffer: selecting a provider to replenish %s: %w", slotAddress, err)
 		}
 		if sel.Provider == provider.JustLendManual {
 			// orderID nil: this is the buffer's own background loop
@@ -301,7 +334,7 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 				slog.Error("buffer: recording the fallback event failed", "reason", sel.Reason, "error", err)
 			}
 			slog.Warn("buffer: replenish blocked -- every primary provider is unavailable or over ceiling, see docs/runbook-energy-fallback.md",
-				"reason", sel.Reason, "shortfall_units", shortfall, "fallback_event_id", event.ID)
+				"slot_address", slotAddress, "reason", sel.Reason, "shortfall_units", shortfall, "fallback_event_id", event.ID)
 			return nil
 		}
 
@@ -312,7 +345,7 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 
 		quote, err := prov.Quote(ctx)
 		if err != nil {
-			slog.Warn("buffer: re-quoting the just-selected provider failed, will retry next cycle", "provider", sel.Provider, "error", err)
+			slog.Warn("buffer: re-quoting the just-selected provider failed, will retry next cycle", "slot_address", slotAddress, "provider", sel.Provider, "error", err)
 			return nil
 		}
 
@@ -321,9 +354,9 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 			chunk = quote.MaxUnitsAvailable
 		}
 
-		delegation, err := prov.Delegate(ctx, b.cfg.StagingAddress, chunk, b.cfg.delegationDuration())
+		delegation, err := prov.Delegate(ctx, slotAddress, chunk, b.cfg.delegationDuration())
 		if err != nil {
-			slog.Error("buffer: delegate call failed", "provider", sel.Provider, "error", err)
+			slog.Error("buffer: delegate call failed", "slot_address", slotAddress, "provider", sel.Provider, "error", err)
 			return nil
 		}
 
@@ -336,25 +369,27 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 		recon := pricing.ReconcileCharge(quote.PricePerUnitSun, delegation, b.cfg.Ceiling)
 		if err := b.router.RecordVendorOvercharge(ctx, recon, delegation.ID, delegation.EnergyUnits, nil); err != nil {
 			if errors.Is(err, routing.ErrChargedAboveCeiling) {
-				slog.Error("buffer: refusing to add over-ceiling-charged capacity to the buffer", "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
+				slog.Error("buffer: refusing to add over-ceiling-charged capacity to the buffer", "slot_address", slotAddress, "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
 				return nil
 			}
-			slog.Error("buffer: recording the vendor overcharge event failed", "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
+			slog.Error("buffer: recording the vendor overcharge event failed", "slot_address", slotAddress, "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
 		}
 
 		confirmed, err := b.VerifyOnChain(ctx, delegation)
 		if err != nil {
-			slog.Error("buffer: on-chain verification errored, NOT marking available", "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
+			slog.Error("buffer: on-chain verification errored, NOT marking available", "slot_address", slotAddress, "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
 			return nil
 		}
 		if !confirmed {
 			slog.Error("buffer: delegation did not verify on-chain, NOT marking available -- a vendor's own 200 response is never trusted alone (invariant 1)",
-				"provider", sel.Provider, "delegation_id", delegation.ID, "units", chunk)
+				"slot_address", slotAddress, "provider", sel.Provider, "delegation_id", delegation.ID, "units", chunk)
 			return nil
 		}
 
-		expiresAt := delegation.RequestedAt.Add(b.cfg.delegationDuration())
-		if _, err := insertAvailable(ctx, b.pool, delegation, expiresAt); err != nil {
+		if delegation.ExpiresAt.IsZero() {
+			return fmt.Errorf("buffer: provider %q returned a Delegation with a zero ExpiresAt -- every real implementation must report what it actually granted, never leave this to the caller to assume", sel.Provider)
+		}
+		if _, err := insertAvailable(ctx, b.pool, delegation); err != nil {
 			return fmt.Errorf("buffer: recording replenished capacity: %w", err)
 		}
 		b.recordReplenishCost(sel.Provider, delegation.CostTRX)

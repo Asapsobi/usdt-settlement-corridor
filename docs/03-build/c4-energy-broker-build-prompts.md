@@ -45,6 +45,23 @@ If your own read of "pre-order lead time" in component-map differs from this, th
 
 ---
 
+## Read this fourth — real vendor APIs settled the "how does the fast path retarget the buffer" question (added after building C4's real vendor integrations)
+
+C4.4's own design comment picked design (b) for how the fast path turns pre-provisioned buffer capacity into a delegation at the reservation's own target address: one shared buffer against a broker-controlled staging address, retargeted per reservation via an `EnergyProvider.Redelegate` call, deferring design (a) ("six parallel buffers, one pre-delegated per known payout slot") as the documented fallback "if real re-delegation latency turns out to be too high."
+
+Building real, HTTP-calling `EnergyProvider` implementations against Tronsell's, Netts's, and CatFee's actual current APIs (not the retail-survey summaries in "Read this first") answered that question differently than latency: **none of the three expose anything that retargets an already-issued delegation to a new address at all.** Each vendor's own API is strictly "buy a new, fixed-receiver, vendor-priced order" (CatFee: `POST /v1/order`, only `duration=1h`; Netts: `POST /order1h`/`POST /order5m`; Tronsell: `POST /v1/order/rent`/`useRent`, with a genuinely custom `leaseDurationSecond`). A same-shaped `Redelegate` against any of them could only mean a second, live, full-price purchase — which would put vendor latency straight back into the fast path's own critical path (the exact thing this section exists to keep out) and pay for the same energy twice.
+
+This document now adopts **design (a)**, not as a latency fallback but as the only one buildable against real vendor capability: `internal/buffer.Buffer` keeps one independently-sized, independently-replenished pool per known payout slot address (`Config.SlotAddresses`, sourced from whoever owns the payout wallet roster — never fabricated by C4 itself), each pre-acquired already pointed at its own final destination. A fast-path reservation is a pure database claim against an already-verified row — no vendor call, no retarget, ever. `EnergyProvider.Redelegate` has been removed from the interface entirely: every real vendor client (and `MockProvider`) now implements only `Quote` and `Delegate`, matching exactly what the vendors themselves offer.
+
+Two further real constraints this same integration work surfaced, both handled in `internal/provider`, not worth their own top-level section:
+
+- **Delegation duration isn't uniform across vendors.** Only Tronsell accepts an arbitrary lease length; CatFee and Netts's automated-failover product are both fixed at 1 hour. `provider.Delegation` now carries its own `ExpiresAt`, set by each vendor client to what it actually granted — `internal/buffer` records that real expiry, never a value it recomputes from the caller's own requested duration.
+- **Tronsell has no free price-quote endpoint.** Unlike CatFee's `GET /v1/estimate` or Netts's `GET /pricing`, Tronsell's public API has nothing that answers "what does energy cost right now" without placing a real, paid order. `TronsellProvider.Quote` reports the price observed on the most recent real `Delegate` call and errors before one has happened, rather than spending real TRX as a side effect of a routine ~1-minute price poll — see `provider.ErrTronsellNoPriceObserved`'s own doc comment.
+
+`internal/buffer.TronGridReader` is this same work's answer to `TronEnergyReader`'s own "ships no real TRON RPC client" gap noted in C4.3 below: a real, minimal client against TronGrid's public `getaccountresource` endpoint (the same one both CatFee's and Tronsell's own docs point integrators at for independent verification), wired into `cmd/brokerd` alongside the three vendor clients.
+
+---
+
 ## §0 — Standing context (paste once)
 
 ```

@@ -63,17 +63,20 @@ func testPool(t *testing.T) *db.Pool {
 	return pool
 }
 
+const integrationTestSlotAddress = "TSlotBuffer0000000000000000001"
+
 // seedAvailableRow inserts an AVAILABLE energy_buffer row directly,
-// bypassing Replenish -- Reserve's own tests care about claim
-// correctness against a known set of rows, not about how they got there.
+// slotted under integrationTestSlotAddress, bypassing Replenish -- Reserve's own
+// tests care about claim correctness against a known set of rows, not
+// about how they got there.
 func seedAvailableRow(t *testing.T, pool *db.Pool, providerName string, delegationID string, units int64, expiresAt time.Time) int64 {
 	t.Helper()
 	var id int64
 	err := pool.QueryRow(context.Background(), `
-		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, now(), 0, $4, $5)
+		INSERT INTO energy_buffer (provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status)
+		VALUES ($1, $2, $3, $4, now(), 0, $5, $6)
 		RETURNING id
-	`, providerName, delegationID, units, expiresAt, string(StatusAvailable)).Scan(&id)
+	`, providerName, delegationID, integrationTestSlotAddress, units, expiresAt, string(StatusAvailable)).Scan(&id)
 	if err != nil {
 		t.Fatalf("seeding available row: %v", err)
 	}
@@ -92,7 +95,7 @@ func rowStatus(t *testing.T, pool *db.Pool, id int64) Status {
 func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000, SlotAddresses: []string{integrationTestSlotAddress}})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
 	}
@@ -101,7 +104,7 @@ func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 	id1 := seedAvailableRow(t, pool, provider.Tronsell, "d1", 300, future)
 	id2 := seedAvailableRow(t, pool, provider.Netts, "d2", 200, future)
 
-	alloc, err := b.Reserve(ctx, 42, 500)
+	alloc, err := b.Reserve(ctx, 42, integrationTestSlotAddress, 500)
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
@@ -115,7 +118,7 @@ func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 		t.Fatal("both seeded rows must be RESERVED")
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}
@@ -127,7 +130,7 @@ func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 func TestReserve_ExhaustedBufferTouchesZeroRows(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000, SlotAddresses: []string{integrationTestSlotAddress}})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
 	}
@@ -135,7 +138,7 @@ func TestReserve_ExhaustedBufferTouchesZeroRows(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	id1 := seedAvailableRow(t, pool, provider.Tronsell, "d1", 100, future)
 
-	_, err = b.Reserve(ctx, 42, 500)
+	_, err = b.Reserve(ctx, 42, integrationTestSlotAddress, 500)
 	if !errors.Is(err, ErrBufferExhausted) {
 		t.Fatalf("Reserve error = %v, want ErrBufferExhausted", err)
 	}
@@ -162,7 +165,7 @@ func TestReserve_ExhaustedBufferTouchesZeroRows(t *testing.T) {
 func TestReserve_50ConcurrentCallsNeverOverOrUnderClaim(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000, SlotAddresses: []string{integrationTestSlotAddress}})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
 	}
@@ -186,7 +189,7 @@ func TestReserve_50ConcurrentCallsNeverOverOrUnderClaim(t *testing.T) {
 		wg.Add(1)
 		go func(orderID int64) {
 			defer wg.Done()
-			alloc, err := b.Reserve(ctx, orderID, perOrder)
+			alloc, err := b.Reserve(ctx, orderID, integrationTestSlotAddress, perOrder)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -215,7 +218,7 @@ func TestReserve_50ConcurrentCallsNeverOverOrUnderClaim(t *testing.T) {
 		}
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}
@@ -251,13 +254,13 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 	reader := NewFakeTronReader()
 	reader.AutoConfirm(1_000_000) // every delegation this test makes verifies on-chain
 
-	const stagingAddress = "TStagingBuffer0000000000000001"
+	const slotAddress = "TSlotBuffer0000000000000000001"
 	const target = 2200 // not a multiple of 500 -- the last chunk must cover the remainder exactly
 
 	buf, err := NewBuffer(pool, providers, router, fakeDemandObserver{recent: target}, reader, nil, Config{
 		MinimumFloor:    0,
 		LookbackWindow:  time.Hour,
-		LookaheadWindow: time.Hour, // equal windows: TargetLevel == recent demand exactly
+		LookaheadWindow: time.Hour, // equal windows: targetLevelFor == recent demand exactly
 		Weights: routing.RoutingWeights{
 			provider.Tronsell: 0.60,
 			provider.Netts:    0.35,
@@ -265,7 +268,7 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 		},
 		Ceiling:            1000, // generous -- this test is about chunking, not ceiling rejection
 		DelegationDuration: 24 * time.Hour,
-		StagingAddress:     stagingAddress,
+		SlotAddresses:      []string{slotAddress},
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -275,7 +278,7 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 		t.Fatalf("Replenish: %v", err)
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}
@@ -295,7 +298,7 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 	if err := buf.Replenish(ctx); err != nil {
 		t.Fatalf("Replenish (2nd, already at target): %v", err)
 	}
-	total2, err := availableTotal(ctx, pool)
+	total2, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal (2nd): %v", err)
 	}
@@ -328,7 +331,7 @@ func TestReplenish_NeverMarksAvailableWithoutOnChainConfirmation(t *testing.T) {
 		Weights:            routing.RoutingWeights{provider.Tronsell: 1.0},
 		Ceiling:            1000,
 		DelegationDuration: 24 * time.Hour,
-		StagingAddress:     "TStagingBuffer0000000000000002",
+		SlotAddresses:      []string{integrationTestSlotAddress},
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -338,7 +341,7 @@ func TestReplenish_NeverMarksAvailableWithoutOnChainConfirmation(t *testing.T) {
 		t.Fatalf("Replenish: %v", err)
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}
@@ -366,11 +369,10 @@ func TestReconcile_CorrectsAnEarlyRevocationAndAlerts(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	const stagingAddress = "TStagingBuffer0000000000000003"
 	reader := NewFakeTronReader()
 	alerter := &recordingAlerter{}
 	buf, err := NewBuffer(pool, nil, nil, nil, reader, alerter, Config{
-		StagingAddress:     stagingAddress,
+		SlotAddresses:      []string{integrationTestSlotAddress},
 		ReconcileLookahead: time.Hour,
 		Ceiling:            1000,
 	})
@@ -387,9 +389,9 @@ func TestReconcile_CorrectsAnEarlyRevocationAndAlerts(t *testing.T) {
 	// A row NOT nearing expiry -- must never even be queried.
 	notNearID := seedAvailableRow(t, pool, provider.Tronsell, "not-near-1", 1000, time.Now().Add(48*time.Hour))
 
-	reader.SetUnits(stagingAddress, "revoked-1", 0) // the vendor's own dashboard revoked it early
-	reader.SetUnits(stagingAddress, "still-good-1", 3000)
-	reader.SetUnits(stagingAddress, "not-near-1", 0) // if this were ever queried, it would (wrongly) look revoked too
+	reader.SetUnits(integrationTestSlotAddress, "revoked-1", 0) // the vendor's own dashboard revoked it early
+	reader.SetUnits(integrationTestSlotAddress, "still-good-1", 3000)
+	reader.SetUnits(integrationTestSlotAddress, "not-near-1", 0) // if this were ever queried, it would (wrongly) look revoked too
 
 	if err := buf.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -463,7 +465,7 @@ func TestReplenish_VendorChargedMoreThanQuotedButUnderCeiling_FlaggedAndAccepted
 	buf, err := NewBuffer(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
 		MinimumFloor: 0, LookbackWindow: time.Hour, LookaheadWindow: time.Hour,
 		Weights: routing.RoutingWeights{provider.Tronsell: 1.0}, Ceiling: 25.7,
-		DelegationDuration: 24 * time.Hour, StagingAddress: "TStagingOvercharge0000000001",
+		DelegationDuration: 24 * time.Hour, SlotAddresses: []string{integrationTestSlotAddress},
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -473,7 +475,7 @@ func TestReplenish_VendorChargedMoreThanQuotedButUnderCeiling_FlaggedAndAccepted
 		t.Fatalf("Replenish: %v", err)
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}
@@ -518,7 +520,7 @@ func TestReplenish_VendorChargedAboveCeiling_FlaggedAndRefused(t *testing.T) {
 	buf, err := NewBuffer(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
 		MinimumFloor: 0, LookbackWindow: time.Hour, LookaheadWindow: time.Hour,
 		Weights: routing.RoutingWeights{provider.Tronsell: 1.0}, Ceiling: 25.7,
-		DelegationDuration: 24 * time.Hour, StagingAddress: "TStagingOvercharge0000000002",
+		DelegationDuration: 24 * time.Hour, SlotAddresses: []string{integrationTestSlotAddress},
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -528,7 +530,7 @@ func TestReplenish_VendorChargedAboveCeiling_FlaggedAndRefused(t *testing.T) {
 		t.Fatalf("Replenish: %v", err)
 	}
 
-	total, err := availableTotal(ctx, pool)
+	total, err := availableTotal(ctx, pool, "")
 	if err != nil {
 		t.Fatalf("availableTotal: %v", err)
 	}

@@ -86,10 +86,14 @@ func (s *Server) getSystemInvariants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	target, err := s.Buffer.TargetLevel(r.Context())
+	targets, err := s.Buffer.TargetLevels(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	var target int64
+	for _, t := range targets {
+		target += t
 	}
 
 	var lag *float64

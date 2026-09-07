@@ -54,7 +54,7 @@ type harness struct {
 	mu          sync.Mutex
 	seq         int64
 	costReports []costReport
-	stagingSeq  int64
+	slotSeq     int64
 	rigSeq      int64
 }
 
@@ -91,7 +91,7 @@ func newHarness(ctx context.Context, cfg Config, pool *db.Pool, ledgerPool *pgxp
 		// payload (a different order id, a different occurred_at) --
 		// a genuine, spurious idempotency conflict, not a safe replay.
 		// Bounded to keep newRig's own warmup loop (which must actually
-		// call Redelegate this many times) fast.
+		// call Delegate this many times) fast.
 		runIDOffsetRigs: rand.New(rand.NewSource(time.Now().UnixNano())).Int63n(1000),
 	}
 }
@@ -104,32 +104,34 @@ func (h *harness) nextID(prefix string) string {
 	return fmt.Sprintf("replay-%s-%d-%d", prefix, time.Now().UnixNano(), seq)
 }
 
-// nextStagingAddress hands out a fresh, unique TRON address for one
-// rig's own Buffer.Config.StagingAddress -- unique per rig so the shared
+// nextSlotAddress hands out a fresh, unique TRON address for one rig's
+// own Buffer.Config.SlotAddresses (this harness gives every rig exactly
+// one slot, since no scenario needs to exercise more than one
+// independently-sized slot at once) -- unique per rig so the shared
 // FakeTronReader (keyed by address+delegationID) never sees a key
 // collision between two different scenarios' otherwise-identically-
 // numbered MockProvider delegation ids (each fresh MockProvider restarts
 // its own delegation id sequence at 1).
-func (h *harness) nextStagingAddress() string {
+func (h *harness) nextSlotAddress() string {
 	h.mu.Lock()
-	h.stagingSeq++
-	seq := h.stagingSeq
+	h.slotSeq++
+	seq := h.slotSeq
 	h.mu.Unlock()
-	return fmt.Sprintf("TReplayStaging%016d", seq)
+	return fmt.Sprintf("TReplaySlot%016d", seq)
 }
 
-// rigIDSpace is how many Delegate/Redelegate ids newRig's own warmup
-// reserves per provider, per rig -- see newRig's own doc comment on why
-// this needs to exist at all: MockProvider's delegation id sequence is
-// per-instance and always starts at 1, but this harness's own
-// ReportEnergyCost calls post real, idempotency-keyed entries
-// ("broker:energy_cost:<delegation.ID>") against ONE real C1 database
-// that outlives any single run (see runIDOffsetRigs's own doc comment) --
-// two different rigs' otherwise-identically-sequenced ids would collide
-// there. No single scenario in this harness makes anywhere close to 20
-// real Delegate/Redelegate calls, so a disjoint 20-wide id space per rig
-// per provider leaves a comfortable margin while keeping newRig's own
-// warmup loop (bounded by runIDOffsetRigs, up to ~1000 rig-slots) fast.
+// rigIDSpace is how many Delegate ids newRig's own warmup reserves per
+// provider, per rig -- see newRig's own doc comment on why this needs to
+// exist at all: MockProvider's delegation id sequence is per-instance and
+// always starts at 1, but this harness's own ReportEnergyCost calls post
+// real, idempotency-keyed entries ("broker:energy_cost:<delegation.ID>")
+// against ONE real C1 database that outlives any single run (see
+// runIDOffsetRigs's own doc comment) -- two different rigs' otherwise-
+// identically-sequenced ids would collide there. No single scenario in
+// this harness makes anywhere close to 20 real Delegate calls, so a
+// disjoint 20-wide id space per rig per provider leaves a comfortable
+// margin while keeping newRig's own warmup loop (bounded by
+// runIDOffsetRigs, up to ~1000 rig-slots) fast.
 const rigIDSpace = 20
 
 func (h *harness) nextRigIDBase() int64 {
@@ -227,14 +229,13 @@ type rig struct {
 	buffer *buffer.Buffer
 	svc    *reservations.Service
 
-	stagingAddress string
-	ceiling        float64
-	idBase         int64
+	slotAddress string
+	ceiling     float64
+	idBase      int64
 }
 
-// nextDelegationID predicts the delegation id providerName's own Delegate
-// or Redelegate call will produce THE NEXT TIME it is called on this
-// rig's own provider instance -- MockProvider's own id format
+// nextDelegationID predicts the delegation id providerName's own next
+// Delegate call will produce -- MockProvider's own id format
 // ("mock-<name>-<seq>") is deterministic and documented, so a scenario
 // that needs to pre-register the shared FakeTronReader for one specific,
 // not-yet-made call (see scenarioDelegationNeverLandedOnChain) can
@@ -248,7 +249,7 @@ func (r *rig) nextDelegationID(providerName string) string {
 
 type stubDemandObserver struct{ floor int64 }
 
-func (s stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error) {
+func (s stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
 	return 0, nil
 }
 
@@ -274,16 +275,14 @@ func (h *harness) newRig(weights routing.RoutingWeights, ceiling float64, minimu
 
 	// Reserve this rig's own disjoint delegation-id range on every
 	// provider before anything else touches them -- see rigIDSpace's own
-	// doc comment. Redelegate is a pure in-memory, no-I/O call on a
-	// freshly constructed MockProvider (no ForceTimeout/ForceMalformed
-	// has been set yet), so warming up rigIDSpace ids on all three costs
-	// microseconds, not a real chain or HTTP call.
+	// doc comment. AdvanceDelegationSequence is a pure in-memory counter
+	// bump, deliberately NOT a real Delegate call: scenarios assert exact
+	// DelegateCallCount values (e.g. "0 automated attempts against an
+	// unhealthy primary"), which a throwaway warmup call would corrupt.
 	idBase := h.nextRigIDBase()
-	for i := int64(0); i < idBase; i++ {
-		_, _ = tronsell.Redelegate(context.Background(), "warmup", "Twarmup", 1)
-		_, _ = netts.Redelegate(context.Background(), "warmup", "Twarmup", 1)
-		_, _ = catfee.Redelegate(context.Background(), "warmup", "Twarmup", 1)
-	}
+	tronsell.AdvanceDelegationSequence(idBase)
+	netts.AdvanceDelegationSequence(idBase)
+	catfee.AdvanceDelegationSequence(idBase)
 
 	poller := pricing.NewPoller(h.pool, providers, time.Hour)
 	if err := poller.PollAll(h.ctx); err != nil {
@@ -291,12 +290,12 @@ func (h *harness) newRig(weights routing.RoutingWeights, ceiling float64, minimu
 	}
 	router := routing.NewRouter(poller, h.pool, seed())
 
-	stagingAddress := h.nextStagingAddress()
+	slotAddress := h.nextSlotAddress()
 	buf, err := buffer.NewBuffer(h.pool, providers, router, stubDemandObserver{floor: minimumFloor}, h.reader, nil, buffer.Config{
-		StagingAddress: stagingAddress,
-		Weights:        weights,
-		Ceiling:        ceiling,
-		MinimumFloor:   minimumFloor,
+		SlotAddresses: []string{slotAddress},
+		Weights:       weights,
+		Ceiling:       ceiling,
+		MinimumFloor:  minimumFloor,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replay: NewBuffer: %w", err)
@@ -313,7 +312,7 @@ func (h *harness) newRig(weights routing.RoutingWeights, ceiling float64, minimu
 	return &rig{
 		tronsell: tronsell, netts: netts, catfee: catfee, providers: providers,
 		poller: poller, router: router, buffer: buf, svc: svc,
-		stagingAddress: stagingAddress, ceiling: ceiling, idBase: idBase,
+		slotAddress: slotAddress, ceiling: ceiling, idBase: idBase,
 	}, nil
 }
 
@@ -326,12 +325,6 @@ func (h *harness) createOrder(prefix string) (fixtureOrder, error) {
 	return h.ledger.createOrder(h.ctx, externalID, "cust-"+externalID)
 }
 
-// seedAvailableRow inserts an AVAILABLE energy_buffer row directly
-// against rig's own staging address -- for scenarios that need a warm
-// buffer without going through a full Replenish cycle first (the same
-// direct-seed discipline this module's own reservations/buffer
-// integration tests already use). delegationID must be unique across
-// the whole run (h.nextID handles that).
 // drainBuffer marks every currently-AVAILABLE energy_buffer row EXPIRED
 // directly -- energy_buffer is one continuous, real table shared by
 // every rig this whole run ever builds (a Buffer object is scoped per
@@ -350,10 +343,16 @@ func (h *harness) drainBuffer() error {
 	return err
 }
 
-func (h *harness) seedAvailableRow(providerName, delegationID string, units int64, costTRX money.Amount, expiresIn time.Duration) error {
+// seedAvailableRow inserts an AVAILABLE energy_buffer row directly
+// against slotAddress -- for scenarios that need a warm buffer without
+// going through a full Replenish cycle first (the same direct-seed
+// discipline this module's own reservations/buffer integration tests
+// already use). delegationID must be unique across the whole run
+// (h.nextID handles that).
+func (h *harness) seedAvailableRow(providerName, delegationID, slotAddress string, units int64, costTRX money.Amount, expiresIn time.Duration) error {
 	_, err := h.pool.Exec(h.ctx, `
-		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, now(), $4, $5, 'AVAILABLE')
-	`, providerName, delegationID, units, int64(costTRX), time.Now().UTC().Add(expiresIn))
+		INSERT INTO energy_buffer (provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status)
+		VALUES ($1, $2, $3, $4, now(), $5, $6, 'AVAILABLE')
+	`, providerName, delegationID, slotAddress, units, int64(costTRX), time.Now().UTC().Add(expiresIn))
 	return err
 }

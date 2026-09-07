@@ -73,12 +73,12 @@ func testPool(t *testing.T) *db.Pool {
 // sums exactly this value to attribute the fast path's own real cost, so
 // a test seeding 0 here would silently hide a cost-attribution
 // regression rather than catch one.
-func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID string, units, costTRX int64) {
+func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID, slotAddress string, units, costTRX int64) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(), `
-		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, now(), $4, now() + interval '1 hour', 'AVAILABLE')
-	`, providerName, delegationID, units, costTRX)
+		INSERT INTO energy_buffer (provider_name, delegation_id, slot_address, units, acquired_at, cost_trx, expires_at, status)
+		VALUES ($1, $2, $3, $4, now(), $5, now() + interval '1 hour', 'AVAILABLE')
+	`, providerName, delegationID, slotAddress, units, costTRX)
 	if err != nil {
 		t.Fatalf("seeding available row: %v", err)
 	}
@@ -120,8 +120,8 @@ func newTestHarness(t *testing.T, pool *db.Pool, reader *buffer.FakeTronReader) 
 	router := routing.NewRouter(poller, pool, 1)
 
 	buf, err := buffer.NewBuffer(pool, providers, router, stubDemandObserver{}, reader, nil, buffer.Config{
-		StagingAddress: "TStagingReservations0000000001",
-		Ceiling:        ceiling,
+		SlotAddresses: []string{"TSlotReservations00000000000001"},
+		Ceiling:       ceiling,
 	})
 	if err != nil {
 		t.Fatalf("NewBuffer: %v", err)
@@ -132,7 +132,7 @@ func newTestHarness(t *testing.T, pool *db.Pool, reader *buffer.FakeTronReader) 
 
 type stubDemandObserver struct{}
 
-func (stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error) {
+func (stubDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
 	return 0, nil
 }
 
@@ -151,10 +151,11 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 	ctx := context.Background()
 
 	reader := buffer.NewFakeTronReader()
-	reader.AutoConfirm(1_000_000) // every Redelegate this test makes verifies on-chain
+	reader.AutoConfirm(1_000_000) // the seeded row below is treated as already verified on-chain, matching what Replenish would have confirmed before ever marking it AVAILABLE
 	h := newTestHarness(t, pool, reader)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
+	const targetAddress = "TPayoutSlot00000000000000000001"
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", targetAddress, 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 7, ExternalID: "order-fast-1"}}
 	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
@@ -167,7 +168,7 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 	req := reservations.Request{
 		IdempotencyKey: "dispatch:order-fast-1:1",
 		ExternalID:     "order-fast-1",
-		TargetAddress:  "TPayoutSlot00000000000000000001",
+		TargetAddress:  targetAddress,
 		EnergyUnits:    500,
 		Tier:           "STANDARD",
 		Deadline:       time.Now().Add(5 * time.Second),
@@ -187,7 +188,7 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 		t.Fatalf("Vendor = %v, want tronsell", res.Vendor)
 	}
 	if res.CostTRX == nil || *res.CostTRX != 1_200000 {
-		t.Fatalf("CostTRX = %v, want 1200000 -- the seeded buffer row's own original acquisition cost, attributed to this order (redelegation itself is free, but the energy never was)", res.CostTRX)
+		t.Fatalf("CostTRX = %v, want 1200000 -- the seeded buffer row's own original acquisition cost, attributed to this order", res.CostTRX)
 	}
 	// A tight, explicit wall-clock bound -- the fast path against fakes
 	// with no artificial delay should complete in well under a second,
@@ -198,10 +199,7 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 
 	mock := h.providers[provider.Tronsell].(*provider.MockProvider)
 	if got := mock.DelegateCallCount(); got != 0 {
-		t.Fatalf("Delegate was called %d times on the fast path, want 0", got)
-	}
-	if got := mock.RedelegateCallCount(); got != 1 {
-		t.Fatalf("Redelegate was called %d times, want exactly 1", got)
+		t.Fatalf("Delegate was called %d times on the fast path, want 0 -- the row was already pre-provisioned against this exact target address, so there is no vendor call left to make", got)
 	}
 }
 
@@ -213,7 +211,8 @@ func TestCreate_IdempotentReplayReturnsOriginalReservationNeverASecondDelegation
 	reader.AutoConfirm(1_000_000)
 	h := newTestHarness(t, pool, reader)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
+	const targetAddress = "TPayoutSlot00000000000000000002"
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", targetAddress, 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 8, ExternalID: "order-idem-1"}}
 	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
@@ -226,7 +225,7 @@ func TestCreate_IdempotentReplayReturnsOriginalReservationNeverASecondDelegation
 	req := reservations.Request{
 		IdempotencyKey: "dispatch:order-idem-1:1",
 		ExternalID:     "order-idem-1",
-		TargetAddress:  "TPayoutSlot00000000000000000002",
+		TargetAddress:  targetAddress,
 		EnergyUnits:    500,
 		Tier:           "STANDARD",
 		Deadline:       time.Now().Add(5 * time.Second),
@@ -249,8 +248,8 @@ func TestCreate_IdempotentReplayReturnsOriginalReservationNeverASecondDelegation
 	}
 
 	mock := h.providers[provider.Tronsell].(*provider.MockProvider)
-	if got := mock.RedelegateCallCount(); got != 1 {
-		t.Fatalf("Redelegate was called %d times across both Create calls, want exactly 1 -- a replay must never delegate twice", got)
+	if got := mock.DelegateCallCount(); got != 0 {
+		t.Fatalf("Delegate was called %d times across both Create calls, want 0 -- the fast path never calls a vendor, and a replay must not either", got)
 	}
 
 	var count int
@@ -555,7 +554,8 @@ func TestCreate_ReportsCostToC1AfterConfirming(t *testing.T) {
 	reader.AutoConfirm(1_000_000)
 	h := newTestHarness(t, pool, reader)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-cost-1", 500, 1_200000)
+	const targetAddress = "TPayoutSlot00000000000000000007"
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-cost-1", targetAddress, 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 99, ExternalID: "order-cost-1"}}
 	reporter := &recordingCostReporter{}
@@ -569,7 +569,7 @@ func TestCreate_ReportsCostToC1AfterConfirming(t *testing.T) {
 	req := reservations.Request{
 		IdempotencyKey: "dispatch:order-cost-1:1",
 		ExternalID:     "order-cost-1",
-		TargetAddress:  "TPayoutSlot00000000000000000007",
+		TargetAddress:  targetAddress,
 		EnergyUnits:    500,
 		Tier:           "STANDARD",
 		Deadline:       time.Now().Add(5 * time.Second),
@@ -750,7 +750,7 @@ func TestConcurrent_ReplenishAndSlowPathReservation_NeitherAcceptsAnOverCeilingC
 	bufCfg := buffer.Config{
 		MinimumFloor: 500, LookbackWindow: time.Hour, LookaheadWindow: time.Hour,
 		Weights: routing.RoutingWeights{provider.Tronsell: 1.0}, Ceiling: ceiling,
-		DelegationDuration: 24 * time.Hour, StagingAddress: "TStagingConcurrentOvercharge01",
+		DelegationDuration: 24 * time.Hour, SlotAddresses: []string{"TSlotConcurrentOvercharge0001"},
 	}
 	buf, err := buffer.NewBuffer(pool, h.providers, h.router, stubDemandObserver{}, reader, nil, bufCfg)
 	if err != nil {

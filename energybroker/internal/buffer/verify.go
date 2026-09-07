@@ -111,7 +111,7 @@ func (b *Buffer) Reconcile(ctx context.Context) error {
 
 	var toExpire []int64
 	for _, row := range rows {
-		actual, err := b.reader.DelegationUnits(ctx, b.cfg.StagingAddress, row.DelegationID)
+		actual, err := b.reader.DelegationUnits(ctx, row.SlotAddress, row.DelegationID)
 		if err != nil {
 			slog.Error("buffer: reconcile: on-chain query failed, leaving row as-is for next cycle",
 				"row_id", row.ID, "delegation_id", row.DelegationID, "error", err)

@@ -14,21 +14,26 @@ type fakeDemandObserver struct {
 	err    error
 }
 
-func (f fakeDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration) (int64, error) {
+func (f fakeDemandObserver) RecentReservedUnits(ctx context.Context, window time.Duration, targetAddress string) (int64, error) {
 	return f.recent, f.err
 }
 
-// newTestBuffer builds a Buffer for TargetLevel/VerifyOnChain's own pure
-// unit tests, neither of which exercises Ceiling at all -- a sane
-// default is forced here so every call site below doesn't need its own
-// irrelevant Config.Ceiling just to satisfy NewBuffer's own validation.
+const testSlotAddress = "TSlot1"
+
+// newTestBuffer builds a Buffer for TargetLevels/VerifyOnChain's own pure
+// unit tests. Ceiling and SlotAddresses are defaulted here so every call
+// site below doesn't need its own irrelevant Config.Ceiling/SlotAddresses
+// just to satisfy NewBuffer's own validation.
 func newTestBuffer(demand DemandObserver, reader TronEnergyReader, cfg Config) *Buffer {
 	if cfg.Ceiling <= 0 {
 		cfg.Ceiling = 1000
 	}
+	if len(cfg.SlotAddresses) == 0 {
+		cfg.SlotAddresses = []string{testSlotAddress}
+	}
 	b, err := NewBuffer(nil, nil, nil, demand, reader, nil, cfg)
 	if err != nil {
-		panic(err) // unreachable given the default above; a panic here would mean this helper itself has a bug
+		panic(err) // unreachable given the defaults above; a panic here would mean this helper itself has a bug
 	}
 	return b
 }
@@ -41,12 +46,12 @@ func TestTargetLevel_ProjectsRecentDemandAcrossLookahead(t *testing.T) {
 		LookbackWindow:  2 * time.Hour,
 		LookaheadWindow: 30 * time.Minute,
 	})
-	got, err := b.TargetLevel(context.Background())
+	got, err := b.targetLevelFor(context.Background(), testSlotAddress)
 	if err != nil {
-		t.Fatalf("TargetLevel: %v", err)
+		t.Fatalf("targetLevelFor: %v", err)
 	}
 	if got != 10 {
-		t.Fatalf("TargetLevel = %d, want 10", got)
+		t.Fatalf("targetLevelFor = %d, want 10", got)
 	}
 }
 
@@ -56,12 +61,12 @@ func TestTargetLevel_NeverBelowMinimumFloor(t *testing.T) {
 		LookbackWindow:  2 * time.Hour,
 		LookaheadWindow: 30 * time.Minute,
 	})
-	got, err := b.TargetLevel(context.Background())
+	got, err := b.targetLevelFor(context.Background(), testSlotAddress)
 	if err != nil {
-		t.Fatalf("TargetLevel: %v", err)
+		t.Fatalf("targetLevelFor: %v", err)
 	}
 	if got != 5000 {
-		t.Fatalf("TargetLevel = %d, want the configured floor 5000 even with zero recent demand", got)
+		t.Fatalf("targetLevelFor = %d, want the configured floor 5000 even with zero recent demand", got)
 	}
 }
 
@@ -71,29 +76,48 @@ func TestTargetLevel_DemandAboveFloorWins(t *testing.T) {
 		LookbackWindow:  2 * time.Hour,
 		LookaheadWindow: 30 * time.Minute,
 	})
-	got, err := b.TargetLevel(context.Background())
+	got, err := b.targetLevelFor(context.Background(), testSlotAddress)
 	if err != nil {
-		t.Fatalf("TargetLevel: %v", err)
+		t.Fatalf("targetLevelFor: %v", err)
 	}
 	if got != 18000 { // 10/sec * 1800s
-		t.Fatalf("TargetLevel = %d, want 18000 (demand-driven, above the floor)", got)
+		t.Fatalf("targetLevelFor = %d, want 18000 (demand-driven, above the floor)", got)
 	}
 }
 
 func TestTargetLevel_PropagatesDemandObserverError(t *testing.T) {
 	wantErr := errors.New("demand source unavailable")
 	b := newTestBuffer(fakeDemandObserver{err: wantErr}, nil, Config{MinimumFloor: 1})
-	_, err := b.TargetLevel(context.Background())
+	_, err := b.targetLevelFor(context.Background(), testSlotAddress)
 	if !errors.Is(err, wantErr) {
-		t.Fatalf("TargetLevel error = %v, want wrapping %v", err, wantErr)
+		t.Fatalf("targetLevelFor error = %v, want wrapping %v", err, wantErr)
 	}
 }
 
 func TestTargetLevel_RejectsNegativeDemand(t *testing.T) {
 	b := newTestBuffer(fakeDemandObserver{recent: -1}, nil, Config{MinimumFloor: 1})
-	_, err := b.TargetLevel(context.Background())
+	_, err := b.targetLevelFor(context.Background(), testSlotAddress)
 	if err == nil {
 		t.Fatal("expected an error for a negative recent-units value, got nil")
+	}
+}
+
+func TestTargetLevels_OneEntryPerSlotAddress(t *testing.T) {
+	b := newTestBuffer(fakeDemandObserver{recent: 0}, nil, Config{
+		MinimumFloor:  50,
+		SlotAddresses: []string{"TSlotA", "TSlotB", "TSlotC"},
+	})
+	got, err := b.TargetLevels(context.Background())
+	if err != nil {
+		t.Fatalf("TargetLevels: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("TargetLevels returned %d entries, want 3", len(got))
+	}
+	for _, addr := range []string{"TSlotA", "TSlotB", "TSlotC"} {
+		if got[addr] != 50 {
+			t.Fatalf("TargetLevels[%s] = %d, want the configured floor 50", addr, got[addr])
+		}
 	}
 }
 
