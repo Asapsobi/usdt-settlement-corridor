@@ -5,11 +5,13 @@ package buffer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"energybroker/internal/db"
+	"energybroker/internal/pricing"
 	"energybroker/internal/provider"
 	"energybroker/internal/routing"
 )
@@ -129,7 +131,18 @@ type Buffer struct {
 // provider name cfg.Weights names -- Replenish returns an error the
 // first time the Router selects a name with no matching entry, rather
 // than silently skipping it.
-func NewBuffer(pool *db.Pool, providers map[string]provider.EnergyProvider, router *routing.Router, demand DemandObserver, reader TronEnergyReader, alerter Alerter, cfg Config) *Buffer {
+//
+// Returns an error if cfg.Ceiling is zero or negative -- C4.7's own
+// adversarial scenario: a misconfigured ceiling must refuse to start
+// rather than silently treat every real price as over ceiling and
+// permanently fallback-ladder (routing.UnderCeiling's own `<=`
+// comparison already can't flip into "always pays anything" for a bad
+// ceiling, but "always refuses" is still a silent misconfiguration this
+// constructor should catch loudly instead).
+func NewBuffer(pool *db.Pool, providers map[string]provider.EnergyProvider, router *routing.Router, demand DemandObserver, reader TronEnergyReader, alerter Alerter, cfg Config) (*Buffer, error) {
+	if cfg.Ceiling <= 0 {
+		return nil, fmt.Errorf("buffer: %w: Config.Ceiling must be positive, got %v", routing.ErrInvalidCeiling, cfg.Ceiling)
+	}
 	return &Buffer{
 		pool:      pool,
 		providers: providers,
@@ -138,7 +151,7 @@ func NewBuffer(pool *db.Pool, providers map[string]provider.EnergyProvider, rout
 		reader:    reader,
 		alerter:   alerter,
 		cfg:       cfg,
-	}
+	}, nil
 }
 
 // TargetLevel is how many units this buffer should hold right now: the
@@ -250,6 +263,21 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 		if err != nil {
 			slog.Error("buffer: delegate call failed", "provider", sel.Provider, "error", err)
 			return nil
+		}
+
+		// C4.7: reconcile what this provider actually charged against
+		// what it quoted moments ago (the `quote` fetched above) and
+		// against ceiling -- a vendor's own 200 response is not the only
+		// thing invariant 1/3 refuse to trust blindly; the PRICE it
+		// reports charging gets the same treatment as the delegation
+		// itself.
+		recon := pricing.ReconcileCharge(quote.PricePerUnitSun, delegation, b.cfg.Ceiling)
+		if err := b.router.RecordVendorOvercharge(ctx, recon, delegation.ID, delegation.EnergyUnits, nil); err != nil {
+			if errors.Is(err, routing.ErrChargedAboveCeiling) {
+				slog.Error("buffer: refusing to add over-ceiling-charged capacity to the buffer", "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
+				return nil
+			}
+			slog.Error("buffer: recording the vendor overcharge event failed", "provider", sel.Provider, "delegation_id", delegation.ID, "error", err)
 		}
 
 		confirmed, err := b.VerifyOnChain(ctx, delegation)

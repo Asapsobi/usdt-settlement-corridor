@@ -48,6 +48,7 @@ import (
 	"energybroker/internal/db"
 	"energybroker/internal/ledgerclient"
 	"energybroker/internal/money"
+	"energybroker/internal/pricing"
 	"energybroker/internal/provider"
 	"energybroker/internal/routing"
 )
@@ -160,6 +161,10 @@ type BufferReserver interface {
 type ProviderSelector interface {
 	SelectProvider(ctx context.Context, weights routing.RoutingWeights, ceiling float64) (routing.Selection, error)
 	OnFallbackTriggered(ctx context.Context, selectionReason string, orderID *int64) (routing.FallbackEvent, error)
+	// RecordVendorOvercharge is C4.7's own reconciliation-flagging call --
+	// see routing.Router's own doc comment for why this returns
+	// routing.ErrChargedAboveCeiling rather than a distinct bool.
+	RecordVendorOvercharge(ctx context.Context, recon pricing.ChargeReconciliation, delegationID string, energyUnits int64, orderID *int64) error
 }
 
 // EnergyCostReporter is the one call this package needs from C1 for cost
@@ -234,8 +239,16 @@ type Service struct {
 // energy_buffer row's own provider_name could hold -- Create returns an
 // error the first time either path needs a name with no matching entry.
 // costReporter may be nil (see EnergyCostReporter's own doc comment).
-func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, costReporter EnergyCostReporter, providers map[string]provider.EnergyProvider, cfg Config) *Service {
-	return &Service{pool: pool, orders: orders, buf: buf, router: router, costReporter: costReporter, providers: providers, cfg: cfg}
+//
+// Returns an error if cfg.Ceiling is zero or negative -- C4.7's own
+// adversarial scenario, same reasoning as buffer.NewBuffer's own
+// identical check: refuse to start rather than silently permanently
+// fallback-ladder every reservation's own slow path.
+func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, costReporter EnergyCostReporter, providers map[string]provider.EnergyProvider, cfg Config) (*Service, error) {
+	if cfg.Ceiling <= 0 {
+		return nil, fmt.Errorf("reservations: %w: Config.Ceiling must be positive, got %v", routing.ErrInvalidCeiling, cfg.Ceiling)
+	}
+	return &Service{pool: pool, orders: orders, buf: buf, router: router, costReporter: costReporter, providers: providers, cfg: cfg}, nil
 }
 
 // RecentReservedUnits implements buffer.DemandObserver (C4.3): the
@@ -431,10 +444,37 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 		return Reservation{}, fmt.Errorf("reservations: router selected %q, which has no wired EnergyProvider", sel.Provider)
 	}
 
+	// A fresh quote immediately before Delegate, deliberately not
+	// whatever cached price SelectProvider itself used to make its
+	// routing decision moments ago (C4.7's own "concurrent replenishment
+	// and reservation racing on a price update" scenario: the two must
+	// each reconcile against the price in effect right at their OWN
+	// Delegate call, not a shared, possibly-already-stale routing-time
+	// read).
+	quote, err := prov.Quote(slowCtx)
+	if err != nil {
+		slog.Error("reservations: slow path: re-quoting the just-selected provider failed", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
+		return s.fail(ctx, reservation.ID)
+	}
+
 	delegation, err := prov.Delegate(slowCtx, req.TargetAddress, req.EnergyUnits, s.cfg.delegationDuration())
 	if err != nil {
 		slog.Error("reservations: slow path: Delegate failed", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
 		return s.fail(ctx, reservation.ID)
+	}
+
+	// C4.7: reconcile what this provider actually charged against what
+	// it just quoted and against ceiling -- see buffer.Replenish's own
+	// identical check for why this can't be skipped just because the
+	// vendor's own API call already "succeeded".
+	recon := pricing.ReconcileCharge(quote.PricePerUnitSun, delegation, s.cfg.Ceiling)
+	oid := orderID
+	if err := s.router.RecordVendorOvercharge(ctx, recon, delegation.ID, delegation.EnergyUnits, &oid); err != nil {
+		if errors.Is(err, routing.ErrChargedAboveCeiling) {
+			slog.Error("reservations: slow path: refusing to confirm on an over-ceiling-charged delegation", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
+			return s.fail(ctx, reservation.ID)
+		}
+		slog.Error("reservations: slow path: recording the vendor overcharge event failed", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
 	}
 
 	confirmed, err := s.buf.VerifyOnChain(slowCtx, delegation)

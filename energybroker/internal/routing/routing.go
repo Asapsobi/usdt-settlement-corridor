@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sort"
 	"sync"
@@ -44,6 +45,14 @@ type RoutingWeights map[string]float64
 // a provider name this package doesn't recognize as one of the three
 // primaries.
 var ErrInvalidRoutingWeights = errors.New("routing: invalid routing weights")
+
+// ErrInvalidCeiling guards SelectProvider (and, via each their own
+// constructor, internal/buffer.Buffer and internal/reservations.Service)
+// against a misconfigured ceiling of zero or negative -- C4.7's own
+// adversarial scenario. A non-positive ceiling must refuse to start
+// (or, here, refuse the call outright) rather than silently treating
+// every real price as over ceiling.
+var ErrInvalidCeiling = errors.New("routing: invalid ceiling")
 
 func (w RoutingWeights) validate() error {
 	if len(w) == 0 {
@@ -136,6 +145,18 @@ func (r *Router) SelectProvider(ctx context.Context, weights RoutingWeights, cei
 	if err := weights.validate(); err != nil {
 		return Selection{}, err
 	}
+	// C4.7's own adversarial scenario: a ceiling misconfigured to zero or
+	// negative must refuse outright here, not silently fall through to
+	// UnderCeiling, which (being `price <= ceiling`) would just reject
+	// every real, positive price and permanently fallback-ladder --
+	// safe, but a silent, undiagnosable misconfiguration rather than a
+	// loud one. This is deliberately checked here too, not only at
+	// Buffer/Service construction time: a second, independent guard
+	// costs nothing and protects any future caller that builds a Router
+	// without going through either constructor's own validation.
+	if ceiling <= 0 {
+		return Selection{}, fmt.Errorf("%w: ceiling must be positive, got %v", ErrInvalidCeiling, ceiling)
+	}
 
 	survivors := make(map[string]float64, len(weights))
 	var pricedButOverCeiling int
@@ -149,9 +170,16 @@ func (r *Router) SelectProvider(ctx context.Context, weights RoutingWeights, cei
 	for _, name := range names {
 		quote, err := r.prices.CurrentPrice(ctx, name)
 		if err != nil {
-			continue // unhealthy or stale -- not a routing candidate right now
+			// Not a ceiling check at all -- unhealthy or stale, never
+			// reached comparing a price against ceiling -- so this is
+			// deliberately not logged by auditCeilingCheck below, which
+			// exists specifically to answer "did we ever overpay",
+			// not "was every provider reachable".
+			continue
 		}
-		if !pricing.UnderCeiling(quote, ceiling) {
+		underCeiling := pricing.UnderCeiling(quote, ceiling)
+		auditCeilingCheck(name, quote.PricePerUnitSun, ceiling, underCeiling)
+		if !underCeiling {
 			pricedButOverCeiling++
 			continue
 		}
@@ -207,4 +235,21 @@ func (r *Router) weightedPick(names []string, survivors map[string]float64) stri
 		}
 	}
 	panic("routing: weightedPick called with no survivors")
+}
+
+// auditCeilingCheck logs one line for every ceiling comparison
+// SelectProvider actually performs, pass or fail -- C4.7's own
+// acceptance criterion: "a full audit log line exists for every ceiling
+// check performed... the artifact that lets someone answer 'did we ever
+// overpay' definitively rather than by inference." Info-level on a pass
+// (routine, high-volume, not worth an operator's attention on its own)
+// and Warn-level on a rejection (still routine during a real price
+// spike, but worth being loud about individually, distinct from the
+// once-per-outage manual_fallback_events row C4.6 records separately).
+func auditCeilingCheck(providerName string, priceSun, ceiling float64, underCeiling bool) {
+	if underCeiling {
+		slog.Info("routing: ceiling check", "provider", providerName, "price_sun", priceSun, "ceiling_sun", ceiling, "under_ceiling", true)
+		return
+	}
+	slog.Warn("routing: ceiling check", "provider", providerName, "price_sun", priceSun, "ceiling_sun", ceiling, "under_ceiling", false)
 }

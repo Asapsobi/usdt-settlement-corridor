@@ -57,7 +57,7 @@ func testPool(t *testing.T) *db.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, `TRUNCATE energy_buffer, buffer_allocations RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE energy_buffer, buffer_allocations, vendor_overcharge_events, manual_fallback_events RESTART IDENTITY`); err != nil {
 		t.Fatalf("truncating buffer tables: %v", err)
 	}
 	return pool
@@ -92,7 +92,10 @@ func rowStatus(t *testing.T, pool *db.Pool, id int64) Status {
 func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b := NewBuffer(pool, nil, nil, nil, nil, nil, Config{})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	future := time.Now().Add(time.Hour)
 	id1 := seedAvailableRow(t, pool, provider.Tronsell, "d1", 300, future)
@@ -124,12 +127,15 @@ func TestReserve_ExactlyEnoughCapacitySucceeds(t *testing.T) {
 func TestReserve_ExhaustedBufferTouchesZeroRows(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b := NewBuffer(pool, nil, nil, nil, nil, nil, Config{})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	future := time.Now().Add(time.Hour)
 	id1 := seedAvailableRow(t, pool, provider.Tronsell, "d1", 100, future)
 
-	_, err := b.Reserve(ctx, 42, 500)
+	_, err = b.Reserve(ctx, 42, 500)
 	if !errors.Is(err, ErrBufferExhausted) {
 		t.Fatalf("Reserve error = %v, want ErrBufferExhausted", err)
 	}
@@ -156,7 +162,10 @@ func TestReserve_ExhaustedBufferTouchesZeroRows(t *testing.T) {
 func TestReserve_50ConcurrentCallsNeverOverOrUnderClaim(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	b := NewBuffer(pool, nil, nil, nil, nil, nil, Config{})
+	b, err := NewBuffer(pool, nil, nil, nil, nil, nil, Config{Ceiling: 1000})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	const n = 50
 	const perOrder = 100
@@ -245,7 +254,7 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 	const stagingAddress = "TStagingBuffer0000000000000001"
 	const target = 2200 // not a multiple of 500 -- the last chunk must cover the remainder exactly
 
-	buf := NewBuffer(pool, providers, router, fakeDemandObserver{recent: target}, reader, nil, Config{
+	buf, err := NewBuffer(pool, providers, router, fakeDemandObserver{recent: target}, reader, nil, Config{
 		MinimumFloor:    0,
 		LookbackWindow:  time.Hour,
 		LookaheadWindow: time.Hour, // equal windows: TargetLevel == recent demand exactly
@@ -258,6 +267,9 @@ func TestReplenish_ReachesTargetLevelRespectingMaxUnitsChunking(t *testing.T) {
 		DelegationDuration: 24 * time.Hour,
 		StagingAddress:     stagingAddress,
 	})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	if err := buf.Replenish(ctx); err != nil {
 		t.Fatalf("Replenish: %v", err)
@@ -309,7 +321,7 @@ func TestReplenish_NeverMarksAvailableWithoutOnChainConfirmation(t *testing.T) {
 	// fails on-chain verification.
 	reader := NewFakeTronReader()
 
-	buf := NewBuffer(pool, providers, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
+	buf, err := NewBuffer(pool, providers, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
 		MinimumFloor:       0,
 		LookbackWindow:     time.Hour,
 		LookaheadWindow:    time.Hour,
@@ -318,6 +330,9 @@ func TestReplenish_NeverMarksAvailableWithoutOnChainConfirmation(t *testing.T) {
 		DelegationDuration: 24 * time.Hour,
 		StagingAddress:     "TStagingBuffer0000000000000002",
 	})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	if err := buf.Replenish(ctx); err != nil {
 		t.Fatalf("Replenish: %v", err)
@@ -354,10 +369,14 @@ func TestReconcile_CorrectsAnEarlyRevocationAndAlerts(t *testing.T) {
 	const stagingAddress = "TStagingBuffer0000000000000003"
 	reader := NewFakeTronReader()
 	alerter := &recordingAlerter{}
-	buf := NewBuffer(pool, nil, nil, nil, reader, alerter, Config{
+	buf, err := NewBuffer(pool, nil, nil, nil, reader, alerter, Config{
 		StagingAddress:     stagingAddress,
 		ReconcileLookahead: time.Hour,
+		Ceiling:            1000,
 	})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
 
 	// Nearing expiry (within the 1h lookahead) -- this is the row the
 	// fake vendor is about to revoke early.
@@ -396,5 +415,132 @@ func TestReconcile_CorrectsAnEarlyRevocationAndAlerts(t *testing.T) {
 	}
 	if alerter.calls[0].expected != 5000 || alerter.calls[0].actual != 0 {
 		t.Fatalf("alert expected/actual = %d/%d, want 5000/0", alerter.calls[0].expected, alerter.calls[0].actual)
+	}
+}
+
+// TestNewBuffer_RejectsNonPositiveCeiling is C4.7's own adversarial
+// scenario: a misconfigured ceiling must refuse to start.
+func TestNewBuffer_RejectsNonPositiveCeiling(t *testing.T) {
+	for _, badCeiling := range []float64{0, -1} {
+		_, err := NewBuffer(nil, nil, nil, nil, nil, nil, Config{Ceiling: badCeiling})
+		if !errors.Is(err, routing.ErrInvalidCeiling) {
+			t.Fatalf("NewBuffer(Ceiling=%v) error = %v, want routing.ErrInvalidCeiling", badCeiling, err)
+		}
+	}
+}
+
+func newReconcileTestHarness(t *testing.T, pool *db.Pool) (*provider.MockProvider, *routing.Router, *FakeTronReader) {
+	t.Helper()
+	mock := provider.NewMockProvider(provider.Tronsell, 1, 24.0)
+	providers := map[string]provider.EnergyProvider{provider.Tronsell: mock}
+	poller := pricing.NewPoller(pool, providers, time.Hour)
+	if err := poller.PollAll(context.Background()); err != nil {
+		t.Fatalf("PollAll: %v", err)
+	}
+	router := routing.NewRouter(poller, pool, 1)
+	reader := NewFakeTronReader()
+	reader.AutoConfirm(1_000_000)
+	return mock, router, reader
+}
+
+// TestReplenish_VendorChargedMoreThanQuotedButUnderCeiling_FlaggedAndAccepted
+// is C4.7's own central adversarial scenario, the half where the
+// mismatch stays under ceiling: the delegation must still be flagged
+// (a real vendor-integrity signal worth auditing) but the buffer must
+// still accept it, crediting the ACTUAL charged amount, never the stale
+// quote.
+func TestReplenish_VendorChargedMoreThanQuotedButUnderCeiling_FlaggedAndAccepted(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	mock, router, reader := newReconcileTestHarness(t, pool)
+	mock.ForcePrice(24.0)           // quoted
+	mock.ForceChargedPriceSun(25.5) // actually charged -- a mismatch, but still under the 25.7 ceiling below
+	if err := pricing.NewPoller(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, time.Hour).PollAll(ctx); err != nil {
+		t.Fatalf("re-poll after forcing price: %v", err)
+	}
+
+	buf, err := NewBuffer(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
+		MinimumFloor: 0, LookbackWindow: time.Hour, LookaheadWindow: time.Hour,
+		Weights: routing.RoutingWeights{provider.Tronsell: 1.0}, Ceiling: 25.7,
+		DelegationDuration: 24 * time.Hour, StagingAddress: "TStagingOvercharge0000000001",
+	})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
+
+	if err := buf.Replenish(ctx); err != nil {
+		t.Fatalf("Replenish: %v", err)
+	}
+
+	total, err := availableTotal(ctx, pool)
+	if err != nil {
+		t.Fatalf("availableTotal: %v", err)
+	}
+	if total != 1000 {
+		t.Fatalf("availableTotal = %d, want 1000 -- a mismatched-but-under-ceiling charge must still be accepted", total)
+	}
+
+	var costTRX int64
+	if err := pool.QueryRow(ctx, `SELECT cost_trx FROM energy_buffer WHERE provider_name = $1`, provider.Tronsell).Scan(&costTRX); err != nil {
+		t.Fatalf("fetching recorded cost: %v", err)
+	}
+	wantCost := int64(25.5 * 1000) // 25.5 sun/unit * 1000 units
+	if costTRX != wantCost {
+		t.Fatalf("recorded cost_trx = %d, want %d -- the ACTUAL charged amount, never the stale 24.0 quote", costTRX, wantCost)
+	}
+
+	var overchargeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM vendor_overcharge_events WHERE over_ceiling = false`).Scan(&overchargeCount); err != nil {
+		t.Fatalf("counting vendor_overcharge_events: %v", err)
+	}
+	if overchargeCount != 1 {
+		t.Fatalf("vendor_overcharge_events rows (over_ceiling=false) = %d, want exactly 1", overchargeCount)
+	}
+}
+
+// TestReplenish_VendorChargedAboveCeiling_FlaggedAndRefused is the other
+// half: the actual charge exceeds ceiling outright. Invariant 3 must
+// hold even though the vendor's own Delegate call already "succeeded"
+// -- the capacity must never enter the buffer as ordinary AVAILABLE
+// inventory.
+func TestReplenish_VendorChargedAboveCeiling_FlaggedAndRefused(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	mock, router, reader := newReconcileTestHarness(t, pool)
+	mock.ForcePrice(24.0)           // quoted, well under ceiling
+	mock.ForceChargedPriceSun(30.0) // actually charged -- above the 25.7 ceiling
+	if err := pricing.NewPoller(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, time.Hour).PollAll(ctx); err != nil {
+		t.Fatalf("re-poll after forcing price: %v", err)
+	}
+
+	buf, err := NewBuffer(pool, map[string]provider.EnergyProvider{provider.Tronsell: mock}, router, fakeDemandObserver{recent: 1000}, reader, nil, Config{
+		MinimumFloor: 0, LookbackWindow: time.Hour, LookaheadWindow: time.Hour,
+		Weights: routing.RoutingWeights{provider.Tronsell: 1.0}, Ceiling: 25.7,
+		DelegationDuration: 24 * time.Hour, StagingAddress: "TStagingOvercharge0000000002",
+	})
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
+
+	if err := buf.Replenish(ctx); err != nil {
+		t.Fatalf("Replenish: %v", err)
+	}
+
+	total, err := availableTotal(ctx, pool)
+	if err != nil {
+		t.Fatalf("availableTotal: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("availableTotal = %d, want 0 -- an over-ceiling charge must never enter the buffer as ordinary inventory (invariant 3)", total)
+	}
+
+	var overchargeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM vendor_overcharge_events WHERE over_ceiling = true`).Scan(&overchargeCount); err != nil {
+		t.Fatalf("counting vendor_overcharge_events: %v", err)
+	}
+	if overchargeCount != 1 {
+		t.Fatalf("vendor_overcharge_events rows (over_ceiling=true) = %d, want exactly 1", overchargeCount)
 	}
 }

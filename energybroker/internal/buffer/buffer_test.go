@@ -18,8 +18,19 @@ func (f fakeDemandObserver) RecentReservedUnits(ctx context.Context, window time
 	return f.recent, f.err
 }
 
+// newTestBuffer builds a Buffer for TargetLevel/VerifyOnChain's own pure
+// unit tests, neither of which exercises Ceiling at all -- a sane
+// default is forced here so every call site below doesn't need its own
+// irrelevant Config.Ceiling just to satisfy NewBuffer's own validation.
 func newTestBuffer(demand DemandObserver, reader TronEnergyReader, cfg Config) *Buffer {
-	return NewBuffer(nil, nil, nil, demand, reader, nil, cfg)
+	if cfg.Ceiling <= 0 {
+		cfg.Ceiling = 1000
+	}
+	b, err := NewBuffer(nil, nil, nil, demand, reader, nil, cfg)
+	if err != nil {
+		panic(err) // unreachable given the default above; a panic here would mean this helper itself has a bug
+	}
+	return b
 }
 
 func TestTargetLevel_ProjectsRecentDemandAcrossLookahead(t *testing.T) {

@@ -242,3 +242,25 @@ func assertWithinTolerance(t *testing.T, counts map[string]int, n int, expected 
 		}
 	}
 }
+
+// TestSelectProvider_RejectsNonPositiveCeiling is C4.7's own adversarial
+// scenario: a ceiling misconfigured to zero or negative must refuse
+// outright, never silently evaluate to "everything is over ceiling"
+// (safe but undiagnosable) or, worse, "everything is under ceiling" (a
+// broken comparison that would pay anything -- UnderCeiling's own `<=`
+// can't actually do that, but this guards the call site regardless of
+// how UnderCeiling itself is implemented).
+func TestSelectProvider_RejectsNonPositiveCeiling(t *testing.T) {
+	prices := newFakePriceSource()
+	prices.setPrice(provider.Tronsell, 24.0)
+	prices.setPrice(provider.Netts, 24.0)
+	prices.setPrice(provider.Catfee, 24.0)
+	r := NewRouter(prices, nil, 1)
+
+	for _, badCeiling := range []float64{0, -1, -25.7} {
+		_, err := r.SelectProvider(context.Background(), defaultWeights(), badCeiling)
+		if !errors.Is(err, ErrInvalidCeiling) {
+			t.Fatalf("SelectProvider(ceiling=%v) error = %v, want ErrInvalidCeiling", badCeiling, err)
+		}
+	}
+}

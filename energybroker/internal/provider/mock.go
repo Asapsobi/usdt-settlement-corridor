@@ -40,12 +40,27 @@ type MockProvider struct {
 	mu              sync.Mutex
 	rng             *rand.Rand
 	forcedPrice     *float64
+	forcedChargeSun *float64
 	forceTimeout    bool
 	forceMalformed  bool
 	maxUnits        int64
 	delegationSeq   int64
 	delegateCalls   int
 	redelegateCalls int
+}
+
+// ForceChargedPriceSun configures every subsequent Delegate/Redelegate
+// call to compute CostTRX from sun, independent of whatever Quote (or
+// ForcePrice) reports -- C4.7's own adversarial scenario: a real vendor
+// integrity failure where the price quoted and the price actually
+// charged diverge. Without this knob, MockProvider always charges
+// exactly what it most recently quoted, which cannot exercise
+// reconciliation logic that exists specifically to catch the case where
+// those two facts disagree.
+func (m *MockProvider) ForceChargedPriceSun(sun float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forcedChargeSun = &sun
 }
 
 // DelegateCallCount and RedelegateCallCount report how many times
@@ -173,6 +188,7 @@ func (m *MockProvider) Delegate(ctx context.Context, target string, units int64,
 	forceTimeout := m.forceTimeout
 	forceMalformed := m.forceMalformed
 	forcedPrice := m.forcedPrice
+	forcedChargeSun := m.forcedChargeSun
 	m.mu.Unlock()
 
 	if forceTimeout {
@@ -186,7 +202,14 @@ func (m *MockProvider) Delegate(ctx context.Context, target string, units int64,
 		return Delegation{}, err
 	}
 
+	// ForceChargedPriceSun, when set, deliberately charges based on a
+	// DIFFERENT price than whatever was just quoted -- see its own doc
+	// comment. Absent it, a real vendor (and this mock, by default)
+	// charges exactly what it quoted.
 	price := m.nextPrice(forcedPrice)
+	if forcedChargeSun != nil {
+		price = *forcedChargeSun
+	}
 	cost, err := money.ParseDecimal(fmt.Sprintf("%.6f", price*float64(units)/1_000000))
 	if err != nil {
 		return Delegation{}, fmt.Errorf("mock provider %s: computing cost: %w", m.name, err)
