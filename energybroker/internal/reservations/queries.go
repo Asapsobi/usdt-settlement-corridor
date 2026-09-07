@@ -29,7 +29,7 @@ func scanReservation(row scannable) (*Reservation, error) {
 	var vendor *string
 	var costUnits *int64
 	if err := row.Scan(&r.ID, &r.IdempotencyKey, &r.ExternalID, &r.OrderID, &r.TargetAddress,
-		&r.EnergyUnits, &r.Tier, &status, &vendor, &costUnits, &r.ConfirmedAt, &r.Deadline, &r.CreatedAt); err != nil {
+		&r.EnergyUnits, &r.Tier, &status, &vendor, &costUnits, &r.ConfirmedAt, &r.Deadline, &r.CreatedAt, &r.FastPath); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -44,7 +44,7 @@ func scanReservation(row scannable) (*Reservation, error) {
 	return &r, nil
 }
 
-const selectColumns = `id, idempotency_key, external_id, order_id, target_address, energy_units, tier, status, vendor, cost_trx, confirmed_at, deadline, created_at`
+const selectColumns = `id, idempotency_key, external_id, order_id, target_address, energy_units, tier, status, vendor, cost_trx, confirmed_at, deadline, created_at, via_fast_path`
 
 // insertPending creates a new PENDING reservation row for req against
 // orderID -- the row this whole Create call revolves around, inserted
@@ -80,16 +80,17 @@ func getByID(ctx context.Context, q db.Queryer, id int64) (*Reservation, error) 
 }
 
 // markConfirmed transitions id to CONFIRMED, recording which vendor
-// ultimately serviced it and at what cost. cost is 0 (not null) for a
-// fast-path confirmation -- see Reservation.CostTRX's own doc comment
-// on why that is correct, not a bug.
-func markConfirmed(ctx context.Context, q db.Queryer, id int64, vendor string, cost money.Amount) (*Reservation, error) {
+// ultimately serviced it, at what cost, and via which path -- the last
+// of these is what GET /v1/system/invariants' own "fast-path vs slow-
+// path ratio" and the reservations_total{fast_path,slow_path,failed}
+// metric (C4.8) both read.
+func markConfirmed(ctx context.Context, q db.Queryer, id int64, vendor string, cost money.Amount, viaFastPath bool) (*Reservation, error) {
 	row := q.QueryRow(ctx, `
 		UPDATE reservations
-		SET status = $1, vendor = $2, cost_trx = $3, confirmed_at = $4
-		WHERE id = $5
+		SET status = $1, vendor = $2, cost_trx = $3, confirmed_at = $4, via_fast_path = $5
+		WHERE id = $6
 		RETURNING `+selectColumns+`
-	`, string(StatusConfirmed), vendor, int64(cost), time.Now().UTC(), id)
+	`, string(StatusConfirmed), vendor, int64(cost), time.Now().UTC(), viaFastPath, id)
 	r, err := scanReservation(row)
 	if err != nil {
 		return nil, fmt.Errorf("reservations: marking %d confirmed: %w", id, err)
@@ -107,6 +108,23 @@ func markFailed(ctx context.Context, q db.Queryer, id int64) (*Reservation, erro
 		return nil, fmt.Errorf("reservations: marking %d failed: %w", id, err)
 	}
 	return r, nil
+}
+
+// PathCounts reports how many CONFIRMED reservations resolved via the
+// fast path versus the slow path -- GET /v1/system/invariants' own
+// "fast-path vs slow-path ratio" (C4.8).
+func PathCounts(ctx context.Context, q db.Queryer) (fastCount, slowCount int64, err error) {
+	row := q.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE via_fast_path = true),
+			COUNT(*) FILTER (WHERE via_fast_path = false)
+		FROM reservations
+		WHERE status = $1
+	`, string(StatusConfirmed))
+	if err := row.Scan(&fastCount, &slowCount); err != nil {
+		return 0, 0, fmt.Errorf("reservations: counting path totals: %w", err)
+	}
+	return fastCount, slowCount, nil
 }
 
 // recentReservedUnits sums energy_units for every non-FAILED reservation

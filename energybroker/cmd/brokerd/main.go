@@ -1,8 +1,20 @@
-// Command brokerd serves C4, the energy broker, over HTTP. This chunk
-// (C4.0) only stands up the process: connect to Postgres, serve
-// GET /healthz, shut down cleanly on SIGINT/SIGTERM. Pricing, routing,
-// the buffer, and the C5-facing reservation contract land in later
-// chunks.
+// Command brokerd serves C4, the energy broker, over HTTP: bearer auth
+// plus /healthz, /readyz, and /metrics (C4.8's own HTTP boundary).
+//
+// It does NOT wire Reservations, Buffer, Router, or Poller -- the same
+// posture screening's own screend takes toward its background engines
+// (see that binary's own doc comment): those four all need a real
+// EnergyProvider per primary vendor (Tronsell/Netts/Catfee), and no
+// chunk in this project has built one yet -- internal/provider only
+// exports MockProvider and NoOpProvider, both test/scaffolding-only.
+// Wiring fakes into a "production" binary would be worse than leaving
+// the gap explicit: a deployment running this binary today correctly
+// serves the operational surface (auth, health, metrics) but every
+// business endpoint under /v1 (POST /reservations, GET /buffer,
+// manual-fallback-events, system/prices, system/invariants) panics on a
+// nil dependency (recovered per-request by net/http, not a clean error
+// response) until a real vendor integration lands and this file is
+// updated alongside it.
 package main
 
 import (
@@ -44,8 +56,14 @@ func run() error {
 	}
 	defer pool.Close()
 
+	auth, err := httpapi.AuthConfigFromEnv()
+	if err != nil {
+		return err
+	}
+
 	server := &httpapi.Server{
 		Pool:      pool,
+		Auth:      auth,
 		BuildInfo: buildInfo,
 	}
 	router := httpapi.NewRouter(server)

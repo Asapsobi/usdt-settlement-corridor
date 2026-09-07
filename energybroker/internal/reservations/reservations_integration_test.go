@@ -157,7 +157,7 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 7, ExternalID: "order-fast-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -216,7 +216,7 @@ func TestCreate_IdempotentReplayReturnsOriginalReservationNeverASecondDelegation
 	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 8, ExternalID: "order-idem-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -272,7 +272,7 @@ func TestCreate_SlowPath_FallsThroughAndDelegatesDirectly(t *testing.T) {
 	// No seeded rows -- Reserve is exhausted immediately.
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 9, ExternalID: "order-slow-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -329,7 +329,7 @@ func TestCreate_SlowPath_RespectsTheCeilingAndNeverPaysThrough(t *testing.T) {
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 10, ExternalID: "order-ceiling-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 		// Short poll interval and deadline: the price stays above ceiling
 		// for the entire test, so the slow path's own retry loop (C4.6)
@@ -410,7 +410,7 @@ func TestCreate_SlowPath_RecoversIfAVendorBecomesSelectableWithinDeadline(t *tes
 	}()
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 12, ExternalID: "order-recovers-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights:              defaultWeights(),
 		Ceiling:              ceiling,
 		FallbackPollInterval: 20 * time.Millisecond,
@@ -455,7 +455,7 @@ func TestCreate_SlowPath_DeadlineElapsedReturnsFailed(t *testing.T) {
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 11, ExternalID: "order-deadline-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -495,7 +495,7 @@ func TestCreate_UnknownExternalIDPropagatesOrderResolverError(t *testing.T) {
 
 	wantErr := errors.New("ledgerclient: C1 returned 404 not_found: no such order")
 	orders := fakeOrderResolver{err: wantErr}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -559,7 +559,7 @@ func TestCreate_ReportsCostToC1AfterConfirming(t *testing.T) {
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 99, ExternalID: "order-cost-1"}}
 	reporter := &recordingCostReporter{}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, reporter, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, reporter, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -605,7 +605,7 @@ func TestCreate_ReportsCostToC1AfterConfirming(t *testing.T) {
 // own identical check.
 func TestNewService_RejectsNonPositiveCeiling(t *testing.T) {
 	for _, badCeiling := range []float64{0, -1} {
-		_, err := reservations.NewService(nil, nil, nil, nil, nil, nil, reservations.Config{Ceiling: badCeiling})
+		_, err := reservations.NewService(nil, nil, nil, nil, nil, nil, nil, reservations.Config{Ceiling: badCeiling})
 		if !errors.Is(err, routing.ErrInvalidCeiling) {
 			t.Fatalf("NewService(Ceiling=%v) error = %v, want routing.ErrInvalidCeiling", badCeiling, err)
 		}
@@ -634,7 +634,7 @@ func TestCreate_SlowPath_VendorChargedMoreThanQuotedButUnderCeiling_FlaggedAndCo
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 20, ExternalID: "order-overcharge-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -692,7 +692,7 @@ func TestCreate_SlowPath_VendorChargedAboveCeiling_FlaggedAndFailed(t *testing.T
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 21, ExternalID: "order-overcharge-2"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {
@@ -758,7 +758,7 @@ func TestConcurrent_ReplenishAndSlowPathReservation_NeitherAcceptsAnOverCeilingC
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 22, ExternalID: "order-concurrent-1"}}
-	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
+	svc, err := reservations.NewService(pool, orders, h.buf, h.router, nil, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 	if err != nil {

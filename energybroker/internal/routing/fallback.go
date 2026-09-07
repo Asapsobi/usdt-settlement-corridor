@@ -54,11 +54,23 @@ type FallbackEvent struct {
 	OrderID     *int64
 	ResolvedAt  *time.Time
 	Resolution  *string
+	ResolvedBy  *string
 }
 
 // ErrFallbackEventNotFound means no manual_fallback_events row exists
 // with the given id.
 var ErrFallbackEventNotFound = errors.New("routing: no such fallback event")
+
+// ErrEmptyResolution and ErrEmptyActor guard Resolve's own validation.
+// Exported sentinels, not a bare errors.New each call, so C4.8's own
+// internal/httpapi can errors.Is against them to map a 400
+// invalid_request rather than a generic 500 -- the same discipline
+// every other manual-resolution validation in this project's sibling
+// modules follows (e.g. screening's own holds.ErrEmptyReviewer).
+var (
+	ErrEmptyResolution = errors.New("routing: Resolve requires a non-empty resolution")
+	ErrEmptyActor      = errors.New("routing: Resolve requires a non-empty actor")
+)
 
 // OnFallbackTriggered records a manual_fallback_events row for
 // selectionReason (a SelectProvider result's own ReasonFallbackLadder or
@@ -108,21 +120,41 @@ func (r *Router) OnFallbackTriggered(ctx context.Context, selectionReason string
 
 	slog.Error("routing: MANUAL FALLBACK TRIGGERED -- see docs/runbook-energy-fallback.md",
 		"event_id", event.ID, "reason", reason, "order_id", orderID)
+	r.recordManualFallbackEventTriggered()
 	return event, nil
 }
 
 // Resolve marks eventID resolved -- the runbook's own "mark this event
 // resolved" step, once an operator has either manually delegated energy
 // via JustLendDAO's UI as a stopgap or confirmed the vendors recovered
-// on their own.
-func (r *Router) Resolve(ctx context.Context, eventID int64, resolution string) error {
+// on their own. actor is who resolved it -- C4.8's own
+// POST /v1/manual-fallback-events/{id}/resolve body is explicitly
+// "resolution, actor", the same accountability discipline every other
+// manual-resolution action in this project's own sibling modules
+// requires (e.g. screening's own holds.Release/Reject reviewer field).
+// GetFallbackEvent fetches one manual_fallback_events row by id.
+func (r *Router) GetFallbackEvent(ctx context.Context, eventID int64) (FallbackEvent, error) {
+	e, err := getFallbackEvent(ctx, r.pool, eventID)
+	if err != nil {
+		return FallbackEvent{}, err
+	}
+	if e == nil {
+		return FallbackEvent{}, fmt.Errorf("%w: %d", ErrFallbackEventNotFound, eventID)
+	}
+	return *e, nil
+}
+
+func (r *Router) Resolve(ctx context.Context, eventID int64, resolution, actor string) error {
 	if resolution == "" {
-		return errors.New("routing: Resolve requires a non-empty resolution")
+		return ErrEmptyResolution
+	}
+	if actor == "" {
+		return ErrEmptyActor
 	}
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE manual_fallback_events SET resolved_at = now(), resolution = $1
-		WHERE id = $2 AND resolved_at IS NULL
-	`, resolution, eventID)
+		UPDATE manual_fallback_events SET resolved_at = now(), resolution = $1, resolved_by = $2
+		WHERE id = $3 AND resolved_at IS NULL
+	`, resolution, actor, eventID)
 	if err != nil {
 		return fmt.Errorf("routing: resolving fallback event %d: %w", eventID, err)
 	}
@@ -139,9 +171,49 @@ func (r *Router) Resolve(ctx context.Context, eventID int64, resolution string) 
 	return nil
 }
 
+// ListFallbackEvents returns every manual_fallback_events row, newest
+// first, optionally filtered by resolved (nil lists all, true only
+// resolved, false only open) -- C4.8's own
+// GET /v1/manual-fallback-events?resolved=false.
+func ListFallbackEvents(ctx context.Context, pool db.Queryer, resolved *bool) ([]FallbackEvent, error) {
+	var rows pgx.Rows
+	var err error
+	switch {
+	case resolved == nil:
+		rows, err = pool.Query(ctx, `
+			SELECT id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
+			FROM manual_fallback_events ORDER BY id DESC
+		`)
+	case *resolved:
+		rows, err = pool.Query(ctx, `
+			SELECT id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
+			FROM manual_fallback_events WHERE resolved_at IS NOT NULL ORDER BY id DESC
+		`)
+	default:
+		rows, err = pool.Query(ctx, `
+			SELECT id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
+			FROM manual_fallback_events WHERE resolved_at IS NULL ORDER BY id DESC
+		`)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("routing: listing fallback events: %w", err)
+	}
+	defer rows.Close()
+
+	var out []FallbackEvent
+	for rows.Next() {
+		e, err := scanFallbackEventRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func getFallbackEvent(ctx context.Context, pool db.Queryer, id int64) (*FallbackEvent, error) {
 	row := pool.QueryRow(ctx, `
-		SELECT id, triggered_at, reason, order_id, resolved_at, resolution
+		SELECT id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
 		FROM manual_fallback_events WHERE id = $1
 	`, id)
 	return scanFallbackEvent(row)
@@ -149,7 +221,7 @@ func getFallbackEvent(ctx context.Context, pool db.Queryer, id int64) (*Fallback
 
 func openFallbackEventByReason(ctx context.Context, pool db.Queryer, reason string) (*FallbackEvent, error) {
 	row := pool.QueryRow(ctx, `
-		SELECT id, triggered_at, reason, order_id, resolved_at, resolution
+		SELECT id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
 		FROM manual_fallback_events WHERE reason = $1 AND resolved_at IS NULL
 	`, reason)
 	return scanFallbackEvent(row)
@@ -159,7 +231,7 @@ func insertFallbackEvent(ctx context.Context, pool db.Queryer, reason string, or
 	row := pool.QueryRow(ctx, `
 		INSERT INTO manual_fallback_events (reason, order_id)
 		VALUES ($1, $2)
-		RETURNING id, triggered_at, reason, order_id, resolved_at, resolution
+		RETURNING id, triggered_at, reason, order_id, resolved_at, resolution, resolved_by
 	`, reason, orderID)
 	event, err := scanFallbackEvent(row)
 	if err != nil {
@@ -168,13 +240,25 @@ func insertFallbackEvent(ctx context.Context, pool db.Queryer, reason string, or
 	return *event, nil
 }
 
-func scanFallbackEvent(row pgx.Row) (*FallbackEvent, error) {
-	var e FallbackEvent
-	if err := row.Scan(&e.ID, &e.TriggeredAt, &e.Reason, &e.OrderID, &e.ResolvedAt, &e.Resolution); err != nil {
+type fallbackEventScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanFallbackEvent(row fallbackEventScanner) (*FallbackEvent, error) {
+	e, err := scanFallbackEventRow(row)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("routing: scanning fallback event: %w", err)
 	}
 	return &e, nil
+}
+
+func scanFallbackEventRow(row fallbackEventScanner) (FallbackEvent, error) {
+	var e FallbackEvent
+	if err := row.Scan(&e.ID, &e.TriggeredAt, &e.Reason, &e.OrderID, &e.ResolvedAt, &e.Resolution, &e.ResolvedBy); err != nil {
+		return FallbackEvent{}, err
+	}
+	return e, nil
 }

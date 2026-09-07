@@ -133,6 +133,13 @@ type Reservation struct {
 	ConfirmedAt    *time.Time
 	Deadline       time.Time
 	CreatedAt      time.Time
+	// FastPath is nil until CONFIRMED (a PENDING or FAILED reservation
+	// never resolved to either path), true for a fast-path (buffer
+	// Reserve + Redelegate) confirmation, false for a slow-path (live
+	// Delegate) one. C4.8's own GET /v1/system/invariants and the
+	// reservations_total{fast_path,slow_path,failed} metric both read
+	// this.
+	FastPath *bool
 }
 
 // ErrNotFound means no reservation exists with the given id.
@@ -230,25 +237,41 @@ type Service struct {
 	buf          BufferReserver
 	router       ProviderSelector
 	costReporter EnergyCostReporter
+	metrics      MetricsRecorder
 	providers    map[string]provider.EnergyProvider
 	cfg          Config
+}
+
+// MetricsRecorder is how Create reports the reservations_total{fast_path,
+// slow_path,failed} metric C4.8's own build spec names -- optional, nil
+// means no metrics are recorded, never a panic, the same convention
+// every other pluggable dependency in this project's own sibling
+// modules uses.
+type MetricsRecorder interface {
+	// ReservationConfirmed fires once per CONFIRMED reservation, tagged
+	// by which path confirmed it.
+	ReservationConfirmed(viaFastPath bool)
+	// ReservationFailed fires once per FAILED reservation, regardless of
+	// which path was attempted -- "failed" is its own bucket, not
+	// fast_path_failed/slow_path_failed, per this chunk's own metric name.
+	ReservationFailed()
 }
 
 // NewService wires a Service. providers must contain an entry for every
 // provider name cfg.Weights names, and for every provider name any
 // energy_buffer row's own provider_name could hold -- Create returns an
 // error the first time either path needs a name with no matching entry.
-// costReporter may be nil (see EnergyCostReporter's own doc comment).
+// costReporter and metrics may both be nil (see their own doc comments).
 //
 // Returns an error if cfg.Ceiling is zero or negative -- C4.7's own
 // adversarial scenario, same reasoning as buffer.NewBuffer's own
 // identical check: refuse to start rather than silently permanently
 // fallback-ladder every reservation's own slow path.
-func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, costReporter EnergyCostReporter, providers map[string]provider.EnergyProvider, cfg Config) (*Service, error) {
+func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, costReporter EnergyCostReporter, metrics MetricsRecorder, providers map[string]provider.EnergyProvider, cfg Config) (*Service, error) {
 	if cfg.Ceiling <= 0 {
 		return nil, fmt.Errorf("reservations: %w: Config.Ceiling must be positive, got %v", routing.ErrInvalidCeiling, cfg.Ceiling)
 	}
-	return &Service{pool: pool, orders: orders, buf: buf, router: router, costReporter: costReporter, providers: providers, cfg: cfg}, nil
+	return &Service{pool: pool, orders: orders, buf: buf, router: router, costReporter: costReporter, metrics: metrics, providers: providers, cfg: cfg}, nil
 }
 
 // RecentReservedUnits implements buffer.DemandObserver (C4.3): the
@@ -313,7 +336,7 @@ func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) 
 	if err == nil {
 		vendor, cost, delegations, fastErr := s.confirmFastPath(ctx, alloc, req.TargetAddress)
 		if fastErr == nil {
-			return s.confirmAndReport(ctx, reservation.ID, order.ID, vendor, cost, delegations)
+			return s.confirmAndReport(ctx, reservation.ID, order.ID, vendor, cost, delegations, true)
 		}
 		// The buffer already committed this allocation (Reserve's own
 		// transaction succeeded) before re-delegation failed -- those
@@ -488,7 +511,7 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 		return s.fail(ctx, reservation.ID)
 	}
 
-	return s.confirmAndReport(ctx, reservation.ID, orderID, delegation.ProviderName, delegation.CostTRX, []provider.Delegation{delegation})
+	return s.confirmAndReport(ctx, reservation.ID, orderID, delegation.ProviderName, delegation.CostTRX, []provider.Delegation{delegation}, false)
 }
 
 // confirmAndReport marks id CONFIRMED, then reports cost to C1 for every
@@ -501,8 +524,8 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 // ledgerclient's own ErrUnexpectedHalt/ErrIdempotencyConflictBug for the
 // cases that are genuinely surprising) rather than silently swallowed,
 // but never flips the reservation back to FAILED.
-func (s *Service) confirmAndReport(ctx context.Context, reservationID, orderID int64, vendor string, cost money.Amount, delegations []provider.Delegation) (Reservation, error) {
-	r, err := s.confirm(ctx, reservationID, vendor, cost)
+func (s *Service) confirmAndReport(ctx context.Context, reservationID, orderID int64, vendor string, cost money.Amount, delegations []provider.Delegation, viaFastPath bool) (Reservation, error) {
+	r, err := s.confirm(ctx, reservationID, vendor, cost, viaFastPath)
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -518,10 +541,13 @@ func (s *Service) confirmAndReport(ctx context.Context, reservationID, orderID i
 	return r, nil
 }
 
-func (s *Service) confirm(ctx context.Context, id int64, vendor string, cost money.Amount) (Reservation, error) {
-	r, err := markConfirmed(ctx, s.pool, id, vendor, cost)
+func (s *Service) confirm(ctx context.Context, id int64, vendor string, cost money.Amount, viaFastPath bool) (Reservation, error) {
+	r, err := markConfirmed(ctx, s.pool, id, vendor, cost, viaFastPath)
 	if err != nil {
 		return Reservation{}, err
+	}
+	if s.metrics != nil {
+		s.metrics.ReservationConfirmed(viaFastPath)
 	}
 	return *r, nil
 }
@@ -530,6 +556,9 @@ func (s *Service) fail(ctx context.Context, id int64) (Reservation, error) {
 	r, err := markFailed(ctx, s.pool, id)
 	if err != nil {
 		return Reservation{}, err
+	}
+	if s.metrics != nil {
+		s.metrics.ReservationFailed()
 	}
 	return *r, nil
 }

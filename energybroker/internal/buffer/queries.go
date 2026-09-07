@@ -49,6 +49,37 @@ func availableTotal(ctx context.Context, q db.Queryer) (int64, error) {
 	return total, nil
 }
 
+// totalsByProvider sums units by (provider_name, status) for the two
+// statuses an operator cares about at a glance -- AVAILABLE (spendable
+// now) and RESERVED (already earmarked for a specific order). SPENT and
+// EXPIRED rows are history, not current inventory, so they're excluded
+// here on purpose.
+func totalsByProvider(ctx context.Context, q db.Queryer) ([]ProviderTotal, error) {
+	rows, err := q.Query(ctx, `
+		SELECT provider_name,
+		       COALESCE(SUM(units) FILTER (WHERE status = $1), 0),
+		       COALESCE(SUM(units) FILTER (WHERE status = $2), 0)
+		FROM energy_buffer
+		WHERE status IN ($1, $2)
+		GROUP BY provider_name
+		ORDER BY provider_name
+	`, string(StatusAvailable), string(StatusReserved))
+	if err != nil {
+		return nil, fmt.Errorf("buffer: summing totals by provider: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ProviderTotal
+	for rows.Next() {
+		var t ProviderTotal
+		if err := rows.Scan(&t.ProviderName, &t.Available, &t.Reserved); err != nil {
+			return nil, fmt.Errorf("buffer: scanning provider total: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // insertAvailable records d as a new, AVAILABLE energy_buffer row --
 // called only once VerifyOnChain has independently confirmed it, per
 // invariant 1; a vendor's own 200 response alone never reaches this

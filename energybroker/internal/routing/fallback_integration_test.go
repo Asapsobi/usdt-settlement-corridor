@@ -179,7 +179,7 @@ func TestResolve_MarksResolvedAndAllowsAFreshEventLater(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OnFallbackTriggered: %v", err)
 	}
-	if err := r.Resolve(ctx, event.ID, "vendors recovered on their own"); err != nil {
+	if err := r.Resolve(ctx, event.ID, "vendors recovered on their own", "ops-oncall"); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 
@@ -217,10 +217,10 @@ func TestResolve_TwiceIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OnFallbackTriggered: %v", err)
 	}
-	if err := r.Resolve(ctx, event.ID, "resolved once"); err != nil {
+	if err := r.Resolve(ctx, event.ID, "resolved once", "ops-oncall"); err != nil {
 		t.Fatalf("Resolve (1st): %v", err)
 	}
-	if err := r.Resolve(ctx, event.ID, "resolved again"); err == nil {
+	if err := r.Resolve(ctx, event.ID, "resolved again", "ops-oncall"); err == nil {
 		t.Fatal("expected an error resolving an already-resolved event twice, got nil")
 	}
 }
@@ -229,7 +229,7 @@ func TestResolve_UnknownEventIsAnError(t *testing.T) {
 	pool := testPool(t)
 	r := NewRouter(nil, pool, 1)
 
-	err := r.Resolve(context.Background(), 999999, "resolved")
+	err := r.Resolve(context.Background(), 999999, "resolved", "ops-oncall")
 	if !errors.Is(err, ErrFallbackEventNotFound) {
 		t.Fatalf("Resolve error = %v, want ErrFallbackEventNotFound", err)
 	}

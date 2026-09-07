@@ -68,11 +68,16 @@ func TestReasonForSelection(t *testing.T) {
 
 func TestResolve_RejectsEmptyResolution(t *testing.T) {
 	r := NewRouter(nil, nil, 1)
-	err := r.Resolve(context.Background(), 1, "") // fails validation before ever touching r.pool
-	if err == nil {
-		t.Fatal("expected an error for an empty resolution, got nil")
+	err := r.Resolve(context.Background(), 1, "", "ops-oncall") // fails validation before ever touching r.pool
+	if !errors.Is(err, ErrEmptyResolution) {
+		t.Fatalf("Resolve error = %v, want ErrEmptyResolution", err)
 	}
-	if errors.Is(err, ErrFallbackEventNotFound) {
-		t.Fatal("empty-resolution validation must fail before ever querying the database")
+}
+
+func TestResolve_RejectsEmptyActor(t *testing.T) {
+	r := NewRouter(nil, nil, 1)
+	err := r.Resolve(context.Background(), 1, "vendors recovered", "") // fails validation before ever touching r.pool
+	if !errors.Is(err, ErrEmptyActor) {
+		t.Fatalf("Resolve error = %v, want ErrEmptyActor", err)
 	}
 }

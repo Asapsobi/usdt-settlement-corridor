@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -195,6 +196,38 @@ func (p *Poller) CurrentPrice(ctx context.Context, providerName string) (provide
 			ErrPriceStale, providerName, age.Round(time.Second), p.staleness)
 	}
 	return obs.toQuote(), nil
+}
+
+// PriceStatus is one provider's own full price-health picture at a
+// point in time -- C4.8's own GET /v1/system/prices.
+type PriceStatus struct {
+	ProviderName    string
+	PricePerUnitSun float64
+	ObservedAt      time.Time
+	Healthy         bool   // false if CurrentPrice would currently return an error
+	Error           string // CurrentPrice's own error text, populated only when Healthy is false
+}
+
+// Snapshot reports CurrentPrice's own result for every configured
+// provider at once, sorted by name for a stable response -- the read
+// side of what PollAll writes.
+func (p *Poller) Snapshot(ctx context.Context) []PriceStatus {
+	names := make([]string, 0, len(p.providers))
+	for name := range p.providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]PriceStatus, 0, len(names))
+	for _, name := range names {
+		quote, err := p.CurrentPrice(ctx, name)
+		if err != nil {
+			out = append(out, PriceStatus{ProviderName: name, Healthy: false, Error: err.Error()})
+			continue
+		}
+		out = append(out, PriceStatus{ProviderName: name, PricePerUnitSun: quote.PricePerUnitSun, ObservedAt: quote.QuotedAt, Healthy: true})
+	}
+	return out
 }
 
 // UnderCeiling reports whether quote's price is acceptable to pay under

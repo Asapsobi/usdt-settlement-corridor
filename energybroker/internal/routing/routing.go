@@ -114,8 +114,44 @@ type Router struct {
 	prices PriceSource
 	pool   *db.Pool
 
-	mu  sync.Mutex
-	rng *rand.Rand
+	mu      sync.Mutex
+	rng     *rand.Rand
+	metrics MetricsRecorder
+}
+
+// MetricsRecorder is how this package reports the two Prometheus
+// metrics C4.8's own build spec names that originate here:
+// ceiling_rejections_total{provider} and manual_fallback_events_total.
+// Optional -- nil (the default) means no metrics are recorded, never a
+// panic, the same convention every other pluggable dependency in this
+// project's own sibling modules uses. Set via SetMetrics rather than a
+// NewRouter parameter: every existing caller across this module already
+// constructs a Router before any Metrics implementation exists to give
+// it, and metrics are the one dependency truly optional enough not to
+// warrant another constructor signature change.
+type MetricsRecorder interface {
+	CeilingRejected(providerName string)
+	ManualFallbackEventTriggered()
+}
+
+// SetMetrics wires m into this Router -- see MetricsRecorder's own doc
+// comment. Not safe to call concurrently with SelectProvider/
+// OnFallbackTriggered; call it once, right after NewRouter, before the
+// Router is shared with anything else.
+func (r *Router) SetMetrics(m MetricsRecorder) {
+	r.metrics = m
+}
+
+func (r *Router) recordCeilingRejected(providerName string) {
+	if r.metrics != nil {
+		r.metrics.CeilingRejected(providerName)
+	}
+}
+
+func (r *Router) recordManualFallbackEventTriggered() {
+	if r.metrics != nil {
+		r.metrics.ManualFallbackEventTriggered()
+	}
 }
 
 // NewRouter returns a Router reading prices from prices, recording
@@ -181,6 +217,7 @@ func (r *Router) SelectProvider(ctx context.Context, weights RoutingWeights, cei
 		auditCeilingCheck(name, quote.PricePerUnitSun, ceiling, underCeiling)
 		if !underCeiling {
 			pricedButOverCeiling++
+			r.recordCeilingRejected(name)
 			continue
 		}
 		survivors[name] = weights[name]

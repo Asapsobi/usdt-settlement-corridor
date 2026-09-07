@@ -134,5 +134,9 @@ func (b *Buffer) Reconcile(ctx context.Context) error {
 	if err := markExpired(ctx, b.pool, toExpire); err != nil {
 		return fmt.Errorf("buffer: reconcile: %w", err)
 	}
+
+	b.mu.Lock()
+	b.lastReconciledAt = time.Now().UTC()
+	b.mu.Unlock()
 	return nil
 }

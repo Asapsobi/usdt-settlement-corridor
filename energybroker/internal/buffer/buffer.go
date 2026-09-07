@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"energybroker/internal/db"
+	"energybroker/internal/money"
 	"energybroker/internal/pricing"
 	"energybroker/internal/provider"
 	"energybroker/internal/routing"
@@ -125,6 +127,37 @@ type Buffer struct {
 	reader    TronEnergyReader
 	alerter   Alerter
 	cfg       Config
+
+	mu               sync.Mutex
+	lastReconciledAt time.Time
+	metrics          MetricsRecorder
+}
+
+// MetricsRecorder is how this package reports C4.8's own
+// replenish_cost_trx_total{provider} metric. Optional -- nil (the
+// default) means no metrics are recorded, never a panic, the same
+// convention every other pluggable dependency in this project's own
+// sibling modules uses (e.g. routing.MetricsRecorder). Set via
+// SetMetrics rather than a NewBuffer parameter, for the same reason
+// routing.Router.SetMetrics exists rather than a NewRouter parameter:
+// every existing caller already constructs a Buffer before any Metrics
+// implementation exists to give it.
+type MetricsRecorder interface {
+	ReplenishCost(providerName string, costTRX money.Amount)
+}
+
+// SetMetrics wires m into this Buffer -- see MetricsRecorder's own doc
+// comment. Not safe to call concurrently with Replenish/RunLoop; call it
+// once, right after NewBuffer, before the Buffer is shared with
+// anything else.
+func (b *Buffer) SetMetrics(m MetricsRecorder) {
+	b.metrics = m
+}
+
+func (b *Buffer) recordReplenishCost(providerName string, costTRX money.Amount) {
+	if b.metrics != nil {
+		b.metrics.ReplenishCost(providerName, costTRX)
+	}
 }
 
 // NewBuffer wires a Buffer. providers must contain an entry for every
@@ -176,6 +209,35 @@ func (b *Buffer) TargetLevel(ctx context.Context) (int64, error) {
 		target = b.cfg.MinimumFloor
 	}
 	return target, nil
+}
+
+// AvailableTotal is the current AVAILABLE unit total across every
+// provider -- the other half of TargetLevel's own comparison, exported
+// for C4.8's own GET /v1/system/invariants.
+func (b *Buffer) AvailableTotal(ctx context.Context) (int64, error) {
+	return availableTotal(ctx, b.pool)
+}
+
+// ProviderTotal is one provider's own current AVAILABLE/RESERVED split --
+// C4.8's own GET /v1/buffer, for ops visibility.
+type ProviderTotal struct {
+	ProviderName string
+	Available    int64
+	Reserved     int64
+}
+
+// Totals breaks the current buffer down by provider and status.
+func (b *Buffer) Totals(ctx context.Context) ([]ProviderTotal, error) {
+	return totalsByProvider(ctx, b.pool)
+}
+
+// LastReconciledAt reports when Reconcile last completed successfully,
+// or the zero time if it has never run in this process -- C4.8's own
+// GET /v1/system/invariants' "reconciliation lag" reads time.Since(this).
+func (b *Buffer) LastReconciledAt() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastReconciledAt
 }
 
 // RunLoop replenishes on an interval. Blocks until ctx is cancelled,
@@ -295,6 +357,7 @@ func (b *Buffer) Replenish(ctx context.Context) error {
 		if _, err := insertAvailable(ctx, b.pool, delegation, expiresAt); err != nil {
 			return fmt.Errorf("buffer: recording replenished capacity: %w", err)
 		}
+		b.recordReplenishCost(sel.Provider, delegation.CostTRX)
 
 		shortfall -= chunk
 	}
