@@ -6,21 +6,25 @@
 // between them).
 //
 // Unlike C2 and C3, C4 needs zero additions to C1's already-shipped HTTP
-// surface (§A's own "Read this second" -- er, its own §A intro): the
-// only calls this client makes are the already-general-purpose
-// GET /v1/orders/{external_id} (this chunk, C4.4, to resolve an
-// external_id into C1's internal order id) and POST /v1/entries
-// (C4.5, cost attribution -- not yet built).
+// surface: the only calls this client makes are the already-general-
+// purpose GET /v1/orders/{external_id} (C4.4, to resolve an external_id
+// into C1's internal order id) and POST /v1/entries (C4.5, cost
+// attribution).
 package ledgerclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"energybroker/internal/provider"
 )
 
 // Client calls one C1 (ledger) instance, authenticating with a single
@@ -68,12 +72,27 @@ func decodeAPIError(status int, body []byte) *APIError {
 	return &APIError{Status: status, Code: envelope.Error.Code, Message: envelope.Error.Message}
 }
 
-func (c *Client) do(ctx context.Context, method, path string) (status int, respBody []byte, err error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
+func (c *Client) do(ctx context.Context, method, path, idempotencyKey string, body any) (status int, respBody []byte, err error) {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, fmt.Errorf("ledgerclient: encoding request body: %w", err)
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("ledgerclient: building request: %w", err)
 	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -99,7 +118,7 @@ type Order struct {
 // internal order id -- §A's "Resolves external_id -> C1's internal order
 // id" requirement.
 func (c *Client) GetOrder(ctx context.Context, externalID string) (Order, error) {
-	status, body, err := c.do(ctx, http.MethodGet, "/v1/orders/"+externalID)
+	status, body, err := c.do(ctx, http.MethodGet, "/v1/orders/"+externalID, "", nil)
 	if err != nil {
 		return Order{}, err
 	}
@@ -111,4 +130,105 @@ func (c *Client) GetOrder(ctx context.Context, externalID string) (Order, error)
 		return Order{}, fmt.Errorf("ledgerclient: decoding order response for %s: %w", externalID, err)
 	}
 	return o, nil
+}
+
+// entryLineRequest and postEntryRequest match C1's own decoding structs
+// exactly (ledger/internal/httpapi/entries.go's postEntryRequest) --
+// confirmed against the real implementation, not guessed from §A's own
+// pseudo-JSON, which shows idempotency_key and actor as body fields.
+// Neither actually is one: idempotency_key is the Idempotency-Key HTTP
+// header only, and actor is derived server-side from the bearer token's
+// own LEDGER_API_TOKENS mapping -- C1's decoder rejects unknown fields
+// outright (400), so sending either in the body would break every call.
+type entryLineRequest struct {
+	AccountCode string `json:"account_code"`
+	Asset       string `json:"asset"`
+	Amount      string `json:"amount"`
+}
+
+type postEntryRequest struct {
+	EntryType  string             `json:"entry_type"`
+	OrderID    *int64             `json:"order_id,omitempty"`
+	OccurredAt time.Time          `json:"occurred_at"`
+	Lines      []entryLineRequest `json:"lines"`
+}
+
+type entryResponse struct {
+	ID      int64  `json:"id"`
+	Outcome string `json:"outcome"` // "created" | "replayed"
+}
+
+// ErrUnexpectedHalt and ErrIdempotencyConflictBug are both P1 signals,
+// same posture C2.7 and C3.4 take toward their own "this should be
+// structurally impossible" error paths -- confirmed against C1's real
+// implementation (ledger/internal/httpapi/entries.go and
+// internal/journal/post.go) while building this chunk: a bare
+// POST /v1/entries is NEVER halt-gated for ANY entry_type -- halt.IsHalted
+// is only ever consulted inside orders.Transition, for the 4 pairs
+// C1.5's own transitions table marks HaltBlocked, and a standalone entry
+// post never goes through that function at all. So ErrUnexpectedHalt
+// should be unreachable in practice; if C1 ever returns it here, that is
+// a real, surprising change to its own halt semantics, not routine
+// backoff-and-retry territory -- retrying blindly would risk masking
+// exactly that regression. See ledgerclient_integration_test.go's own
+// live test against a halted C1 instance, which proves the current,
+// real behavior empirically rather than assuming either way (this
+// chunk's own acceptance criterion).
+var (
+	ErrUnexpectedHalt         = errors.New("ledgerclient: P1 ALERT -- unexpected system_halted reporting an energy cost entry; POST /v1/entries is not halt-gated for any entry_type")
+	ErrIdempotencyConflictBug = errors.New("ledgerclient: P1 ALERT -- idempotency_conflict reporting an energy cost entry; this should be structurally impossible if delegation ids are unique")
+)
+
+// ReportEnergyCost posts entry E4 (docs/03-build/c1-ledger-build-prompts.md
+// §B): the TRX cost of one specific delegation, attributed to orderID.
+// Idempotency-Key is "broker:energy_cost:<delegation.ID>", per invariant
+// 4 -- a replay of the same delegation's report (a C4 restart between
+// Delegate/Redelegate succeeding and this call landing) hits C1's own
+// idempotency path and returns success without a double-charge; this
+// function makes no attempt to detect that case itself; C1 already does.
+//
+// OccurredAt is derived from delegation.RequestedAt, deliberately never
+// time.Now() at call time: C1's own idempotency check hashes occurred_at
+// as part of the payload (confirmed against its real implementation --
+// ledger/internal/journal/hash.go), so two calls reporting the exact
+// same delegation must produce a byte-for-byte identical request or C1
+// correctly (and loudly) treats them as a genuine conflict, not a safe
+// replay -- discovered by this package's own live-C1 replay test.
+// delegation.RequestedAt is fixed for the life of one Delegation value,
+// so this makes replay-safety automatic rather than relying on every
+// caller to remember to reuse the same clock reading.
+func (c *Client) ReportEnergyCost(ctx context.Context, delegation provider.Delegation, orderID int64) error {
+	idempotencyKey := "broker:energy_cost:" + delegation.ID
+
+	reqBody := postEntryRequest{
+		EntryType:  "energy_cost",
+		OrderID:    &orderID,
+		OccurredAt: delegation.RequestedAt,
+		Lines: []entryLineRequest{
+			{AccountCode: "expense:energy", Asset: "TRX", Amount: delegation.CostTRX.Format()},
+			{AccountCode: "asset:tron:energy_wallet", Asset: "TRX", Amount: (-delegation.CostTRX).Format()},
+		},
+	}
+
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/entries", idempotencyKey, reqBody)
+	if err != nil {
+		return fmt.Errorf("ledgerclient: report_energy_cost for delegation %s: %w", delegation.ID, err)
+	}
+	if status == http.StatusOK || status == http.StatusCreated {
+		return nil
+	}
+
+	apiErr := decodeAPIError(status, body)
+	switch apiErr.Code {
+	case "system_halted":
+		slog.Error("ledgerclient: P1 ALERT -- unexpected system_halted reporting an energy cost entry",
+			"delegation_id", delegation.ID, "order_id", orderID)
+		return fmt.Errorf("%w: %w", ErrUnexpectedHalt, apiErr)
+	case "idempotency_conflict":
+		slog.Error("ledgerclient: P1 ALERT -- idempotency_conflict reporting an energy cost entry",
+			"delegation_id", delegation.ID, "order_id", orderID)
+		return fmt.Errorf("%w: %w", ErrIdempotencyConflictBug, apiErr)
+	default:
+		return apiErr
+	}
 }

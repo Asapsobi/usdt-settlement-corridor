@@ -101,16 +101,23 @@ func (req Request) validate() error {
 
 // Reservation is §A's own reservation resource.
 //
-// CostTRX is 0 (never nil) for a fast-path confirmation, distinct from a
-// still-PENDING or FAILED reservation's nil: retargeting already-
-// acquired buffer capacity (Redelegate) is itself free -- the real
-// acquisition cost was already attributed to C1 when Replenish first
-// bought that capacity (C4.5's own job). A slow-path confirmation's
-// CostTRX is the real, non-zero cost of the fresh Delegate call this
-// specific reservation triggered. C4.5, whoever builds it, needs this
-// distinction: only a slow-path reservation's own cost is a NEW entry to
-// post; a fast-path reservation's cost was already posted, earlier, by
-// Replenish.
+// CostTRX is the real, non-zero cost of the energy THIS order actually
+// consumed, populated once CONFIRMED, never nil after that: for the slow
+// path, the fresh Delegate call's own cost; for the fast path, the SUM
+// of whatever the underlying energy_buffer row(s) originally cost when
+// Replenish first bought them (buffer.Row.CostTRX, carried through
+// unchanged) -- retargeting them via Redelegate is itself free, but the
+// energy was never free, and this field is "what did securing this
+// order's energy cost," not "what did the redelegation call itself
+// cost." Getting this right mattered enough to fix here in C4.5: an
+// earlier version of this package (C4.4) hardcoded the fast path's own
+// CostTRX to 0, which would have meant no cost ever attributed to C1 for
+// energy consumed via the fast path at all. See ledgerclient's own
+// ReportEnergyCost, which posts one E4 entry per underlying delegation,
+// not one combined entry per reservation -- each entry is idempotency-
+// keyed on ITS OWN delegation id (invariant 4), and a fast-path
+// reservation spanning buffer rows from more than one original
+// acquisition genuinely has more than one delegation behind it.
 type Reservation struct {
 	ID             int64
 	IdempotencyKey string
@@ -152,6 +159,17 @@ type ProviderSelector interface {
 	SelectProvider(ctx context.Context, weights routing.RoutingWeights, ceiling float64) (routing.Selection, error)
 }
 
+// EnergyCostReporter is the one call this package needs from C1 for cost
+// attribution (C4.5) -- ledgerclient.Client's real implementation, or a
+// fake for testing. Optional: nil means no cost is ever reported, never
+// a panic, the same convention every other pluggable dependency in this
+// project's own sibling modules uses (e.g. screening's own
+// pipeline.MetricsRecorder) -- useful for tests that only care about the
+// reservation/buffer mechanics, not C1 write-through.
+type EnergyCostReporter interface {
+	ReportEnergyCost(ctx context.Context, delegation provider.Delegation, orderID int64) error
+}
+
 // Config scopes the slow path's own routing/pricing behavior -- the
 // same Weights/Ceiling internal/buffer's own Replenish uses, since both
 // paths are choosing among the same three primary vendors under the
@@ -176,20 +194,22 @@ func (cfg Config) delegationDuration() time.Duration {
 // Service is this package's own entry point -- §A's "With C5" contract,
 // implemented.
 type Service struct {
-	pool      *db.Pool
-	orders    OrderResolver
-	buf       BufferReserver
-	router    ProviderSelector
-	providers map[string]provider.EnergyProvider
-	cfg       Config
+	pool         *db.Pool
+	orders       OrderResolver
+	buf          BufferReserver
+	router       ProviderSelector
+	costReporter EnergyCostReporter
+	providers    map[string]provider.EnergyProvider
+	cfg          Config
 }
 
 // NewService wires a Service. providers must contain an entry for every
 // provider name cfg.Weights names, and for every provider name any
 // energy_buffer row's own provider_name could hold -- Create returns an
 // error the first time either path needs a name with no matching entry.
-func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, providers map[string]provider.EnergyProvider, cfg Config) *Service {
-	return &Service{pool: pool, orders: orders, buf: buf, router: router, providers: providers, cfg: cfg}
+// costReporter may be nil (see EnergyCostReporter's own doc comment).
+func NewService(pool *db.Pool, orders OrderResolver, buf BufferReserver, router ProviderSelector, costReporter EnergyCostReporter, providers map[string]provider.EnergyProvider, cfg Config) *Service {
+	return &Service{pool: pool, orders: orders, buf: buf, router: router, costReporter: costReporter, providers: providers, cfg: cfg}
 }
 
 // RecentReservedUnits implements buffer.DemandObserver (C4.3): the
@@ -252,9 +272,9 @@ func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) 
 
 	alloc, err := s.buf.Reserve(ctx, order.ID, req.EnergyUnits)
 	if err == nil {
-		vendor, cost, fastErr := s.confirmFastPath(ctx, alloc, req.TargetAddress)
+		vendor, cost, delegations, fastErr := s.confirmFastPath(ctx, alloc, req.TargetAddress)
 		if fastErr == nil {
-			return s.confirm(ctx, reservation.ID, vendor, cost)
+			return s.confirmAndReport(ctx, reservation.ID, order.ID, vendor, cost, delegations)
 		}
 		// The buffer already committed this allocation (Reserve's own
 		// transaction succeeded) before re-delegation failed -- those
@@ -272,43 +292,55 @@ func (s *Service) Create(ctx context.Context, req Request) (Reservation, error) 
 		return Reservation{}, fmt.Errorf("reservations: reserving from the buffer: %w", err)
 	}
 
-	return s.slowPath(ctx, *reservation, req)
+	return s.slowPath(ctx, *reservation, req, order.ID)
 }
 
 // confirmFastPath redirects every energy_buffer row alloc claimed to
 // targetAddress, verifying each one on-chain before trusting it. Zero
 // calls to any EnergyProvider.Delegate -- only Redelegate -- per this
-// chunk's own acceptance criterion.
-func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation, targetAddress string) (vendor string, cost money.Amount, err error) {
+// chunk's own acceptance criterion. Returns one provider.Delegation per
+// underlying row (reconstructed from that row's own original
+// acquisition -- provider name, delegation id, units, and cost --  with
+// TargetAddress updated to where it was just redirected), for
+// confirmAndReport to post an E4 entry against each: a fast-path
+// allocation spanning rows from more than one original acquisition
+// genuinely has more than one delegation, and each needs its own,
+// separately idempotency-keyed entry (invariant 4).
+func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation, targetAddress string) (vendor string, totalCost money.Amount, delegations []provider.Delegation, err error) {
 	rows, err := s.buf.RowsByIDs(ctx, alloc.RowIDs)
 	if err != nil {
-		return "", 0, err
+		return "", 0, nil, err
 	}
 
 	vendorsSeen := map[string]bool{}
 	for _, row := range rows {
 		prov, ok := s.providers[row.ProviderName]
 		if !ok {
-			return "", 0, fmt.Errorf("reservations: buffer row %d references provider %q with no wired EnergyProvider", row.ID, row.ProviderName)
+			return "", 0, nil, fmt.Errorf("reservations: buffer row %d references provider %q with no wired EnergyProvider", row.ID, row.ProviderName)
 		}
 
 		fresh, err := prov.Redelegate(ctx, row.DelegationID, targetAddress, row.Units)
 		if err != nil {
-			return "", 0, fmt.Errorf("redelegating row %d (%s, delegation %s): %w", row.ID, row.ProviderName, row.DelegationID, err)
+			return "", 0, nil, fmt.Errorf("redelegating row %d (%s, delegation %s): %w", row.ID, row.ProviderName, row.DelegationID, err)
 		}
 
 		confirmed, err := s.buf.VerifyOnChain(ctx, fresh)
 		if err != nil {
-			return "", 0, fmt.Errorf("verifying redelegated row %d on-chain: %w", row.ID, err)
+			return "", 0, nil, fmt.Errorf("verifying redelegated row %d on-chain: %w", row.ID, err)
 		}
 		if !confirmed {
-			return "", 0, fmt.Errorf("redelegated row %d did not verify on-chain", row.ID)
+			return "", 0, nil, fmt.Errorf("redelegated row %d did not verify on-chain", row.ID)
 		}
 
 		vendorsSeen[row.ProviderName] = true
+		totalCost += row.CostTRX
+		delegations = append(delegations, provider.Delegation{
+			ID: row.DelegationID, ProviderName: row.ProviderName, TargetAddress: targetAddress,
+			EnergyUnits: row.Units, CostTRX: row.CostTRX, RequestedAt: row.AcquiredAt,
+		})
 	}
 
-	return joinVendorNames(vendorsSeen), 0, nil
+	return joinVendorNames(vendorsSeen), totalCost, delegations, nil
 }
 
 // slowPath is C4.4's own vendor-latency-carrying path: a live
@@ -316,7 +348,7 @@ func (s *Service) confirmFastPath(ctx context.Context, alloc *buffer.Allocation,
 // req.Deadline. Metering how often this path is taken (versus the fast
 // path) is C4.8's own job, not this chunk's -- see this chunk's own
 // build spec.
-func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Request) (Reservation, error) {
+func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Request, orderID int64) (Reservation, error) {
 	slowCtx, cancel := context.WithDeadline(ctx, req.Deadline)
 	defer cancel()
 
@@ -353,7 +385,34 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 		return s.fail(ctx, reservation.ID)
 	}
 
-	return s.confirm(ctx, reservation.ID, delegation.ProviderName, delegation.CostTRX)
+	return s.confirmAndReport(ctx, reservation.ID, orderID, delegation.ProviderName, delegation.CostTRX, []provider.Delegation{delegation})
+}
+
+// confirmAndReport marks id CONFIRMED, then reports cost to C1 for every
+// delegation involved -- best-effort, AFTER confirmation, using ctx (not
+// any path-specific deadline context, which may already be past its own
+// deadline by now): the energy is already secured on-chain at this
+// point, and a cost-reporting failure is a bookkeeping problem, never a
+// reason to undo a reservation a customer's payout may already be
+// relying on. A failure here is logged loudly (P1-flavored, via
+// ledgerclient's own ErrUnexpectedHalt/ErrIdempotencyConflictBug for the
+// cases that are genuinely surprising) rather than silently swallowed,
+// but never flips the reservation back to FAILED.
+func (s *Service) confirmAndReport(ctx context.Context, reservationID, orderID int64, vendor string, cost money.Amount, delegations []provider.Delegation) (Reservation, error) {
+	r, err := s.confirm(ctx, reservationID, vendor, cost)
+	if err != nil {
+		return Reservation{}, err
+	}
+
+	if s.costReporter != nil {
+		for _, d := range delegations {
+			if err := s.costReporter.ReportEnergyCost(ctx, d, orderID); err != nil {
+				slog.Error("reservations: reporting energy cost to C1 failed -- needs manual reconciliation",
+					"reservation_id", reservationID, "order_id", orderID, "delegation_id", d.ID, "provider", d.ProviderName, "error", err)
+			}
+		}
+	}
+	return r, nil
 }
 
 func (s *Service) confirm(ctx context.Context, id int64, vendor string, cost money.Amount) (Reservation, error) {

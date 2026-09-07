@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,13 +68,17 @@ func testPool(t *testing.T) *db.Pool {
 // seedAvailableRow inserts an AVAILABLE energy_buffer row directly --
 // this package's own tests care about Create's own fast/slow-path
 // branching, not about how a warm buffer got that way (internal/buffer's
-// own tests already cover Replenish exhaustively).
-func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID string, units int64) {
+// own tests already cover Replenish exhaustively). costTRX is a real,
+// non-zero minor-units amount, not a placeholder: confirmFastPath (C4.5)
+// sums exactly this value to attribute the fast path's own real cost, so
+// a test seeding 0 here would silently hide a cost-attribution
+// regression rather than catch one.
+func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID string, units, costTRX int64) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(), `
 		INSERT INTO energy_buffer (provider_name, delegation_id, units, acquired_at, cost_trx, expires_at, status)
-		VALUES ($1, $2, $3, now(), 0, now() + interval '1 hour', 'AVAILABLE')
-	`, providerName, delegationID, units)
+		VALUES ($1, $2, $3, now(), $4, now() + interval '1 hour', 'AVAILABLE')
+	`, providerName, delegationID, units, costTRX)
 	if err != nil {
 		t.Fatalf("seeding available row: %v", err)
 	}
@@ -145,10 +150,10 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 	reader.AutoConfirm(1_000_000) // every Redelegate this test makes verifies on-chain
 	h := newTestHarness(t, pool, reader)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 7, ExternalID: "order-fast-1"}}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -174,8 +179,8 @@ func TestCreate_FastPath_ConfirmsWellWithinDeadlineWithZeroDelegateCalls(t *test
 	if res.Vendor == nil || *res.Vendor != provider.Tronsell {
 		t.Fatalf("Vendor = %v, want tronsell", res.Vendor)
 	}
-	if res.CostTRX == nil || *res.CostTRX != 0 {
-		t.Fatalf("CostTRX = %v, want 0 (redelegation is free; the acquisition cost was already attributed by Replenish)", res.CostTRX)
+	if res.CostTRX == nil || *res.CostTRX != 1_200000 {
+		t.Fatalf("CostTRX = %v, want 1200000 -- the seeded buffer row's own original acquisition cost, attributed to this order (redelegation itself is free, but the energy never was)", res.CostTRX)
 	}
 	// A tight, explicit wall-clock bound -- the fast path against fakes
 	// with no artificial delay should complete in well under a second,
@@ -201,10 +206,10 @@ func TestCreate_IdempotentReplayReturnsOriginalReservationNeverASecondDelegation
 	reader.AutoConfirm(1_000_000)
 	h := newTestHarness(t, pool, reader)
 
-	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500)
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-1", 500, 1_200000)
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 8, ExternalID: "order-idem-1"}}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -257,7 +262,7 @@ func TestCreate_SlowPath_FallsThroughAndDelegatesDirectly(t *testing.T) {
 	// No seeded rows -- Reserve is exhausted immediately.
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 9, ExternalID: "order-slow-1"}}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -311,7 +316,7 @@ func TestCreate_SlowPath_RespectsTheCeilingAndNeverPaysThrough(t *testing.T) {
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 10, ExternalID: "order-ceiling-1"}}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -354,7 +359,7 @@ func TestCreate_SlowPath_DeadlineElapsedReturnsFailed(t *testing.T) {
 	}
 
 	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 11, ExternalID: "order-deadline-1"}}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -391,7 +396,7 @@ func TestCreate_UnknownExternalIDPropagatesOrderResolverError(t *testing.T) {
 
 	wantErr := errors.New("ledgerclient: C1 returned 404 not_found: no such order")
 	orders := fakeOrderResolver{err: wantErr}
-	svc := reservations.NewService(pool, orders, h.buf, h.router, h.providers, reservations.Config{
+	svc := reservations.NewService(pool, orders, h.buf, h.router, nil, h.providers, reservations.Config{
 		Weights: defaultWeights(), Ceiling: ceiling,
 	})
 
@@ -415,5 +420,77 @@ func TestCreate_UnknownExternalIDPropagatesOrderResolverError(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("reservations rows = %d, want 0 -- a failed order lookup must never create a reservation row", count)
+	}
+}
+
+type recordedCostReport struct {
+	delegation provider.Delegation
+	orderID    int64
+}
+
+type recordingCostReporter struct {
+	mu      sync.Mutex
+	reports []recordedCostReport
+}
+
+func (r *recordingCostReporter) ReportEnergyCost(ctx context.Context, delegation provider.Delegation, orderID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reports = append(r.reports, recordedCostReport{delegation, orderID})
+	return nil
+}
+
+// TestCreate_ReportsCostToC1AfterConfirming proves Create actually
+// wires C4.5's own EnergyCostReporter into both paths -- exactly one
+// report per underlying delegation, each carrying the real order id and
+// the real, non-zero cost, dispatched only AFTER the reservation is
+// already CONFIRMED (never before, and never at all for a FAILED one).
+func TestCreate_ReportsCostToC1AfterConfirming(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	reader := buffer.NewFakeTronReader()
+	reader.AutoConfirm(1_000_000)
+	h := newTestHarness(t, pool, reader)
+
+	seedAvailableRow(t, pool, provider.Tronsell, "seed-cost-1", 500, 1_200000)
+
+	orders := fakeOrderResolver{order: ledgerclient.Order{ID: 99, ExternalID: "order-cost-1"}}
+	reporter := &recordingCostReporter{}
+	svc := reservations.NewService(pool, orders, h.buf, h.router, reporter, h.providers, reservations.Config{
+		Weights: defaultWeights(), Ceiling: ceiling,
+	})
+
+	req := reservations.Request{
+		IdempotencyKey: "dispatch:order-cost-1:1",
+		ExternalID:     "order-cost-1",
+		TargetAddress:  "TPayoutSlot00000000000000000007",
+		EnergyUnits:    500,
+		Tier:           "STANDARD",
+		Deadline:       time.Now().Add(5 * time.Second),
+	}
+
+	res, err := svc.Create(ctx, req)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Status != reservations.StatusConfirmed {
+		t.Fatalf("Status = %s, want CONFIRMED", res.Status)
+	}
+
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	if len(reporter.reports) != 1 {
+		t.Fatalf("cost reports = %d, want exactly 1", len(reporter.reports))
+	}
+	report := reporter.reports[0]
+	if report.orderID != 99 {
+		t.Fatalf("reported order_id = %d, want 99", report.orderID)
+	}
+	if report.delegation.ID != "seed-cost-1" {
+		t.Fatalf("reported delegation id = %q, want %q (the underlying buffer row's own original acquisition)", report.delegation.ID, "seed-cost-1")
+	}
+	if report.delegation.CostTRX != 1_200000 {
+		t.Fatalf("reported CostTRX = %v, want 1200000", report.delegation.CostTRX)
 	}
 }
