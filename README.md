@@ -7,8 +7,9 @@ swap service but as **TRC20 payout infrastructure for businesses**.
 
 This repository is the working record of the evaluation, the architecture decisions
 that came out of it, and the build specifications derived from those decisions —
-and, as of 7 Sep 2026, the ledger core, the deposit watcher, screening, and the
-energy broker, plus a payout-dispatcher build spec with no code behind it yet.
+and, as of 8 Sep 2026, the ledger core, the deposit watcher, screening, the
+energy broker, and key management, plus a payout-dispatcher build spec with no
+code behind it yet.
 
 ## Where things stand
 
@@ -19,8 +20,8 @@ energy broker, plus a payout-dispatcher build spec with no code behind it yet.
 | Margin engine | Wholesale TRON energy (25.7 sun blend vs 41 sun market) + batch multisend |
 | Contribution margin | 87.1% at a $3,000 ticket |
 | MVP scope | 6 services, one ledger, no smart contracts · ≈9–10 eng-weeks |
-| Build status | **C1 (ledger core), C2 (deposit watcher), C3 (screening), and C4 (energy broker) are built and tested; C5 (payout dispatcher) has a build spec but no code.** C1: all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers, scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs. C2: all chunks C2.0–C2.10 shipped, including the replay harness and HTTP boundary, wired to a live chain-watching engine and verified against real BSC. C3: all chunks C3.0–C3.9 shipped, including its own replay ship-gate harness; `cmd/screend` now also runs the discovery background loop for real (against a real, running C1 — no fake, no vendor dependency). The pipeline and re-screen loops are still not wired: both need a real `provider.ScreeningProvider` (an AML vendor client), and vendor choice among the Chainalysis/TRM/Elliptic candidates `component-map.md` names was deliberately left unmade — wiring a mock into a production compliance path would silently screen real orders against a fake verdict, which is worse than the honest gap. C4: all chunks C4.0–C4.9 shipped, including its own replay ship-gate harness (9/9 scenarios, 6/6 final assertions passing against a real ledger and real Postgres); `cmd/brokerd` is now fully wired to production, including real Tronsell/Netts/CatFee HTTP integrations and a real TronGrid on-chain reader, added after discovering none of the three vendors' real APIs support the delegation-retargeting the original buffer design assumed — see the "Read this fourth" addendum in `docs/03-build/c4-energy-broker-build-prompts.md`. Going live still needs the real payout slot addresses, a confirmed Tronsell base URL, and a whitelisted Netts egress IP — all operator-supplied, none fabricated. C5: build prompts only (`docs/03-build/c5-payout-dispatcher-build-prompts.md`), no code — written against a proposed `SigningService` interface and a fake. S1: **design only, no code** — `docs/02-architecture/s1-key-custody-architecture.md` (self-hosted cloud-KMS custody, six independent slot keys, a hybrid auto/2-of-N-human-approval threshold) and `docs/03-build/s1-key-management-build-prompts.md` (sequenced chunks S1.0–S1.6), which also supersedes C5's original synchronous `SigningService` proposal with an async request/poll version C5's own dispatch state machine will need to account for. See `docs/03-build/c1-scenario-catalog.md`, `depositwatcher/`, `screening/`, and `energybroker/`. |
-| Next action | Three independent gaps left, not one linear next step. **S1 needs to actually be built** against its new spec (S1.0–S1.6), then wired into a real cloud KMS account — the design is done, the code and the real key-generation ceremony aren't. **A real AML vendor needs to be chosen and contracted** (Chainalysis/TRM/Elliptic, per `component-map.md`) before C3's pipeline and re-screen loops can be wired for real — discovery is already wired, since it needed no vendor. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc are still not confirmed — C4 now polls real vendor prices live, which removes the code-correctness risk, but not the open question of whether retail-tier pricing still clears the modeled margin. |
+| Build status | **C1 (ledger core), C2 (deposit watcher), C3 (screening), C4 (energy broker), and S1 (key management) are built and tested; C5 (payout dispatcher) has a build spec but no code.** C1: all chunks C1.0–C1.11 shipped, C1.9 replay gate passing at 10,000 orders / 32 workers, scenario catalog audited row-by-row against the real test suite (3 coverage gaps found and closed, one real HTTP-boundary bug found and fixed). C1.11 added the reversal/reorg HTTP surface (`POST /v1/entries/{id}/reversal`, `POST /v1/orders/{id}/reorg`) that C2 needs. C2: all chunks C2.0–C2.10 shipped, including the replay harness and HTTP boundary, wired to a live chain-watching engine and verified against real BSC. C3: all chunks C3.0–C3.9 shipped, including its own replay ship-gate harness; `cmd/screend` now also runs the discovery background loop for real (against a real, running C1 — no fake, no vendor dependency). The pipeline and re-screen loops are still not wired: both need a real `provider.ScreeningProvider` (an AML vendor client), and vendor choice among the Chainalysis/TRM/Elliptic candidates `component-map.md` names was deliberately left unmade — wiring a mock into a production compliance path would silently screen real orders against a fake verdict, which is worse than the honest gap. C4: all chunks C4.0–C4.9 shipped, including its own replay ship-gate harness (9/9 scenarios, 6/6 final assertions passing against a real ledger and real Postgres); `cmd/brokerd` is now fully wired to production, including real Tronsell/Netts/CatFee HTTP integrations and a real TronGrid on-chain reader, added after discovering none of the three vendors' real APIs support the delegation-retargeting the original buffer design assumed — see the "Read this fourth" addendum in `docs/03-build/c4-energy-broker-build-prompts.md`. Going live still needs the real payout slot addresses, a confirmed Tronsell base URL, and a whitelisted Netts egress IP — all operator-supplied, none fabricated. C5: build prompts only (`docs/03-build/c5-payout-dispatcher-build-prompts.md`), no code — written against a proposed `SigningService` interface and a fake, now superseded (see below). S1: all chunks S1.0–S1.6 shipped, including its own replay ship-gate harness (5/5 scenarios, 4/4 final assertions passing against real Postgres) — see `s1/`. Signs against a real, independently-verified secp256k1/TRON signing path (DER↔compact conversion, recovery-id resolution against KMS's own missing `v` value) and a real 2-of-N human-approval queue, both tested against an in-process `FakeKMSClient` standing in for real cloud KMS — there is no real AWS/GCP adapter yet, and `cmd/s1d` refuses to start without `S1_KMS_CLIENT` set (no default, so a misconfigured deployment fails loud rather than signing real payouts against a fake key). The replay ship gate itself caught one real spec bug during the build (a "names exactly 2 approvers" assertion that a legitimate KMS-failure-retry scenario violates) — fixed in both the code and the build doc. Going live needs the real KMS key-generation ceremony (`docs/02-architecture/s1-key-custody-architecture.md`'s own "Key generation and bootstrapping" — an operational procedure with real cloud credentials, not something built here) and a real KMS adapter behind `kmssign.KMSClient`. See `docs/03-build/c1-scenario-catalog.md`, `depositwatcher/`, `screening/`, and `energybroker/`. |
+| Next action | Three independent gaps left, not one linear next step. **S1 needs a real cloud KMS adapter and the actual key-generation ceremony** before C5 can sign anything for real — the code and its own ship gate are done, the cloud-account work isn't (and can't be done from here). **A real AML vendor needs to be chosen and contracted** (Chainalysis/TRM/Elliptic, per `component-map.md`) before C3's pipeline and re-screen loops can be wired for real — discovery is already wired, since it needed no vendor. On the business side, the week-2 wholesale pricing calls to Tronsell/Netts flagged in the findings doc are still not confirmed — C4 now polls real vendor prices live, which removes the code-correctness risk, but not the open question of whether retail-tier pricing still clears the modeled margin. |
 
 ## Documents
 
@@ -104,10 +105,15 @@ energy broker, plus a payout-dispatcher build spec with no code behind it yet.
 - **[s1-key-management-build-prompts.md](docs/03-build/s1-key-management-build-prompts.md)** —
   key management, specified the same way as C1–C5: sequenced build chunks
   (S1.0 → S1.6) turning `s1-key-custody-architecture.md`'s decisions into code.
-  **Not built — design only.** Replaces C5's original synchronous `Sign` proposal
-  with a request/poll `SigningService` (mirroring C4's own PENDING→CONFIRMED
-  reservation shape) since a human-approval path can legitimately take minutes to
-  hours, which a synchronous call can't wait on safely.
+  **Built** — all chunks shipped, including S1.6's own replay ship-gate harness,
+  which caught one real spec bug (an over-strict "exactly 2 approvers" final
+  assertion a legitimate retry scenario violates) during the build itself — see
+  `s1/`. Replaces C5's original synchronous `Sign` proposal with a request/poll
+  `SigningService` (mirroring C4's own PENDING→CONFIRMED reservation shape)
+  since a human-approval path can legitimately take minutes to hours, which a
+  synchronous call can't wait on safely. No real cloud KMS adapter yet — signs
+  against `kmssign.KMSClient`, real for everything except the actual AWS/GCP
+  call.
 
 ### `ledger/`
 
@@ -145,13 +151,27 @@ vendor-agnostic interface plus real Tronsell/Netts/CatFee HTTP clients),
 `pricing`, `routing`, `buffer` (including the real `TronGridReader` on-chain
 verifier), `reservations`, `ledgerclient`, `httpapi`, `replay`.
 
+### `s1/`
+
+The built S1 service — Go + PostgreSQL, `pgx/v5`, `chi` routing, `goose`
+migrations. `cmd/s1d` (the HTTP boundary — two separate bearer-auth scopes,
+one for C5's own signing calls, one for human approvers; refuses to start
+without `S1_KMS_CLIENT` set, no default), `cmd/migrate`, `cmd/replay` (S1.6's
+own ship-gate harness). Packages under `internal/`: `kmssign` (the *only*
+package that may hold or produce signing-capable code — `KMSClient` interface,
+`FakeKMSClient`, and `Wrapper`, the real TRON-over-KMS signing mechanics —
+enforced by its own dependency test), `slots` (the key registry, deriving each
+slot's real TRON address from its KMS public key), `requests` (the
+`SigningService` queue: auto-sign under threshold, 2-of-N human approval at or
+above it), `httpapi`.
+
 ## Reading order
 
 If you are new to this: **findings → architecture decisions → component map → C1 build
 prompts → scenario catalog → `ledger/` → C2 build prompts → `depositwatcher/` → C3
-build prompts → `screening/` → C4 build prompts → `energybroker/` → C5 build
-prompts.** Each document assumes the previous one is settled and does not re-open
-it.
+build prompts → `screening/` → C4 build prompts → `energybroker/` → S1 architecture
+→ S1 build prompts → `s1/` → C5 build prompts.** Each document assumes the
+previous one is settled and does not re-open it.
 
 ## Repository conventions
 

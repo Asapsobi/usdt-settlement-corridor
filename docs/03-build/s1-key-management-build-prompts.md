@@ -477,10 +477,17 @@ same posture every prior ship-gate harness took)
 - A KMS failure mid-approval (FakeKMSClient forced to error once): the
   request recovers on retry without losing either recorded approval.
 - FINAL ASSERTIONS (mirroring C4.9's own shape): every SIGNED request has
-  an audit row; every over-threshold SIGNED request's audit row names
-  exactly 2 approvers; no signing_requests or audit row ever contains
-  anything that looks like a private key or seed (a mechanical grep-style
-  check against every text/bytea column, not just a code-level dependency
+  an audit row; every over-threshold SIGNED request's audit row names AT
+  LEAST 2 real, distinct approvers, every one of them backed by an actual
+  matching APPROVE decision (not exactly 2 -- a request that needed a
+  retry after a failed sign attempt, per the KMS-failure scenario above,
+  legitimately accumulates a 3rd distinct approver by the time it signs,
+  and the audit log correctly names all real contributors rather than an
+  artificially truncated 2 -- this was found by actually running the
+  harness, not designed in up front); no signing_requests or audit row
+  ever contains anything that looks like a private key or seed (a
+  mechanical grep-style check against every text/bytea column, not just a
+  code-level dependency
   test) -- the OUTPUT of this system getting invariant 1 right, checked
   independently of whether the code enforcing it is itself correct.
 

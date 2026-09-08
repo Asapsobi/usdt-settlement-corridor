@@ -72,7 +72,7 @@ C6 and C4 can be built in parallel with C2 once C1's journal-entry contract is f
 ### S1 — Key management / signing
 - **Owns:** custody of the six TRON slot keys and the BSC HD seed, the only signing capability anywhere in this system.
 - **Does not own:** transaction construction, slot selection/caps/rotation (C5's own slot-identity registry), broadcast.
-- **Design:** `docs/02-architecture/s1-key-custody-architecture.md` — self-hosted cloud KMS, six independent slot keys, a hybrid auto/2-of-N-human-approval threshold. Build chunks: `docs/03-build/s1-key-management-build-prompts.md` (S1.0–S1.6). Not built.
+- **Design:** `docs/02-architecture/s1-key-custody-architecture.md` — self-hosted cloud KMS, six independent slot keys, a hybrid auto/2-of-N-human-approval threshold. **Built** — `docs/03-build/s1-key-management-build-prompts.md` (S1.0–S1.6), see `s1/`. No real cloud KMS adapter yet; signs against an in-process fake standing in for one.
 
 ## What is deliberately not built at MVP
 
