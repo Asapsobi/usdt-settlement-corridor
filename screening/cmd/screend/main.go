@@ -1,13 +1,23 @@
 // Command screend serves C3, the screening service, over HTTP: the
 // hold queue, screening-result audit lookups, and re-screen flags
-// (C3.8). It does NOT yet run the automatic pipeline, discovery, or
-// re-screen background loops (C3.4/C3.3/C3.7's own engines) -- that
-// wiring is deliberately out of this chunk's scope, the same way
-// depositwatcher's own watcherd engine wiring landed as a separate
-// effort from any single numbered C2 chunk. A deployment running this
-// binary today serves the manual-review and audit surface correctly;
-// it needs the engine wiring added separately before it screens
-// anything on its own.
+// (C3.8) -- plus, now, the discovery background loop (C3.3), which
+// polls C1 for newly-funded orders and resolves their sender_address,
+// both against a real ledgerclient.Client (no fake, no vendor
+// dependency).
+//
+// It does NOT run the pipeline or re-screen background loops
+// (C3.4/C3.7's own engines). Both need a real provider.ScreeningProvider
+// -- a real AML vendor client, one of the candidates component-map.md's
+// own C3 "provider call" line names without picking one -- and
+// internal/provider only has MockProvider. The C3 build doc is explicit
+// that vendor choice was deliberately left unmade ("vendor abstraction,
+// not vendor choice"); wiring a mock into a production compliance path
+// would silently screen real orders against a fake, seeded verdict,
+// which is worse than the honest gap left here. A deployment running
+// this binary today discovers funded orders and serves the manual-
+// review/audit surface correctly; it needs a real ScreeningProvider
+// added, and pipeline.RunLoop/rescreen.RunLoop wired against it, before
+// it screens anything on its own.
 package main
 
 import (
@@ -22,6 +32,7 @@ import (
 	"time"
 
 	"screening/internal/db"
+	"screening/internal/discovery"
 	"screening/internal/httpapi"
 	"screening/internal/ledgerclient"
 )
@@ -59,7 +70,7 @@ func run() error {
 	ledgerToken := os.Getenv("SCREENING_LEDGER_TOKEN")
 	if ledgerBaseURL == "" || ledgerToken == "" {
 		return errors.New("screend: SCREENING_LEDGER_BASE_URL and SCREENING_LEDGER_TOKEN are both required " +
-			"(POST /holds/{id}/release and /reject call C1 through this client)")
+			"(POST /holds/{id}/release and /reject, and the discovery loop's own PollFundedOrders/GetSenderAddress, all call C1 through this client)")
 	}
 	ledgerClient := ledgerclient.New(ledgerBaseURL, ledgerToken)
 
@@ -70,6 +81,19 @@ func run() error {
 		BuildInfo:    buildInfo,
 	}
 	router := httpapi.NewRouter(server)
+
+	// ledgerClient implements both discovery.FundedOrderPoller
+	// (PollFundedOrders) and provider.SenderAddressLookup
+	// (GetSenderAddress) for real, against the real, running C1 this
+	// binary was configured to talk to above -- no fake, no vendor
+	// dependency, so this loop has nothing blocking it from running in
+	// production today. See this file's own doc comment for why
+	// pipeline/rescreen aren't started alongside it.
+	go func() {
+		if err := discovery.RunLoop(ctx, pool, ledgerClient, ledgerClient, 0); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("screend: discovery loop exited", "error", err)
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:    listenAddr(),
