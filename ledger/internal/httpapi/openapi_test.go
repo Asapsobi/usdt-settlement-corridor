@@ -56,6 +56,7 @@ func TestEveryRouteIsInOpenAPISpec(t *testing.T) {
 		"/v1/orders/{external_id}":             {"get"},
 		"/v1/orders/{external_id}/transitions": {"post"},
 		"/v1/orders/{external_id}/reorg":       {"post"},
+		"/v1/accounts":                         {"post"},
 		"/v1/accounts/{code}/balance":          {"get"},
 		"/v1/balances":                         {"get"},
 		"/v1/trial-balance":                    {"get"},

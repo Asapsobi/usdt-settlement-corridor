@@ -1,0 +1,241 @@
+openapi: "3.0.3"
+info:
+  title: C5 — Payout Dispatcher
+  version: "0.1.0"
+  description: >
+    Turns a screened order into an actual TRC20 payment. See
+    docs/03-build/c5-payout-dispatcher-build-prompts.md for the full
+    build spec this API implements. POST /v1/dispatch performs only the
+    synchronous half of a dispatch (slot selection, EnterDispatching's
+    own E2 entry) -- construction, signing, broadcast, and finality
+    confirmation happen out of band, driven by a background worker not
+    wired into this HTTP process.
+
+servers:
+  - url: http://localhost:8086
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Healthz" }
+
+  /readyz:
+    get:
+      summary: Readiness check (database reachable)
+      security: []
+      responses:
+        "200":
+          description: Ready.
+        "503":
+          description: Not ready.
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /v1/dispatch:
+    post:
+      summary: Trigger dispatch for a screened order
+      description: >
+        The explicit trigger C6 (or an ops tool) calls once an order is
+        screened. C5 never polls C1 for screened orders on its own
+        initiative, matching the same push-not-poll reasoning C4's own
+        reservation contract settled on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostDispatchRequest" }
+      responses:
+        "202":
+          description: Order committed to `dispatching` (E2 posted).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dispatch" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The order is not in `screened`, or no slot is eligible under both caps.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/dispatch/{order_id}:
+    get:
+      summary: Current dispatch attempt status for an order
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dispatch" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/slots:
+    get:
+      summary: Current status/balance/tx_count for every slot
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Slot" }
+
+  /v1/slots/{id}/retire:
+    post:
+      summary: Manually retire a slot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostRetireSlotRequest" }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Slot" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: No such status transition is legal from the slot's current status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/system/invariants:
+    get:
+      summary: Open dispatching orders, batch queue depth, slot cap headroom
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invariants" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  responses:
+    BadRequest:
+      description: invalid_request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The named resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    Healthz:
+      type: object
+      properties:
+        status: { type: string }
+        version: { type: string }
+        commit: { type: string }
+
+    PostDispatchRequest:
+      type: object
+      required: [external_id]
+      properties:
+        external_id: { type: string }
+
+    Dispatch:
+      type: object
+      properties:
+        order_id: { type: integer, format: int64 }
+        slot_id: { type: integer }
+        conversion_entry_key: { type: string }
+        status:
+          type: string
+          enum: [DISPATCHING, SETTLED, HELD]
+        entered_dispatching_at: { type: string, format: date-time }
+        latest_attempt_number: { type: integer, nullable: true }
+        latest_attempt_status:
+          type: string
+          nullable: true
+          enum: [BUILT, SIGNED, BROADCAST, CONFIRMED, FAILED]
+        tron_txid: { type: string, nullable: true }
+        broadcast_at: { type: string, format: date-time, nullable: true }
+
+    Slot:
+      type: object
+      properties:
+        id: { type: integer }
+        tron_address: { type: string }
+        status:
+          type: string
+          enum: [ACTIVE, RETIRING, RETIRED]
+        balance: { type: string }
+        tx_count: { type: integer, format: int64 }
+        activated_at: { type: string, format: date-time }
+        retired_at: { type: string, format: date-time, nullable: true }
+        last_dispatch_at: { type: string, format: date-time, nullable: true }
+
+    PostRetireSlotRequest:
+      type: object
+      properties:
+        immediate:
+          type: boolean
+          description: Skip RETIRING and mark RETIRED directly.
+
+    Invariants:
+      type: object
+      properties:
+        open_dispatching_orders: { type: integer }
+        stuck_pending_reconciliation: { type: integer }
+        batch_queue_depth: { type: integer }
+        slot_headroom:
+          type: array
+          items:
+            type: object
+            properties:
+              slot_id: { type: integer }
+              balance: { type: string }
+              balance_ceiling: { type: string }
+              tx_count: { type: integer, format: int64 }
+              tx_count_ceiling: { type: integer, format: int64 }

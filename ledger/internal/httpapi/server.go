@@ -61,6 +61,7 @@ func NewRouter(s *Server) http.Handler {
 		r.With(requireIdempotencyKey).Post("/orders/{external_id}/transitions", s.postTransition)
 		r.With(requireIdempotencyKey).Post("/orders/{external_id}/reorg", s.postReorg)
 
+		r.With(requireIdempotencyKey).Post("/accounts", s.postAccount)
 		r.Get("/accounts/{code}/balance", s.getAccountBalance)
 		r.Get("/balances", s.getBalances)
 		r.Get("/trial-balance", s.getTrialBalance)

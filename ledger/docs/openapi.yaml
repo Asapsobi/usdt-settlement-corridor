@@ -290,6 +290,36 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/accounts:
+    post:
+      summary: Create an account (idempotent on code)
+      description: >
+        The only way any account beyond the fixed chart internal/accounts.Seed
+        creates up front comes into existence: a payout slot, a customer's
+        liability account in a given asset. Idempotent on code alone, not on
+        the Idempotency-Key header -- a second call with the same code
+        returns the account as it actually exists, even if this call's own
+        type/asset differ from what's stored; the header is still required
+        by the blanket "no header, no write" rule, just not threaded
+        anywhere.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostAccountRequest" }
+      responses:
+        "201":
+          description: >
+            Account created, or already existed -- both return 201; this
+            route has no separate "replayed" outcome to distinguish, unlike
+            POST /v1/entries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
   /v1/accounts/{code}/balance:
     get:
       summary: An account's balance
@@ -678,6 +708,26 @@ components:
         account_code: { type: string }
         asset: { type: string }
         balance: { type: string }
+
+    PostAccountRequest:
+      type: object
+      required: [code, type, asset]
+      properties:
+        code: { type: string }
+        type:
+          type: string
+          enum: [ASSET, LIABILITY, REVENUE, EXPENSE, EQUITY, POSITION]
+        asset: { type: string }
+
+    Account:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        code: { type: string }
+        type: { type: string }
+        asset: { type: string }
+        normal_side: { type: integer }
+        opened_at: { type: string, format: date-time }
 
     PostSnapshotRequest:
       type: object
