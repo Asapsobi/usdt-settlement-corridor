@@ -38,19 +38,39 @@ type Alerter interface {
 	AlertBufferShortfall(ctx context.Context, row Row, expectedUnits, actualUnits int64)
 }
 
+// verifyTolerancePermille is how far short of the requested units a
+// real on-chain delegation may fall and still count as present -- 1 per
+// mille (0.1%), rounded down, minimum 1 unit. Found live wiring the MVP
+// proof run: a real CatFee delegation for 65000 requested units landed
+// on-chain as exactly 64999 (EnergyLimit), a harmless rounding artifact
+// on the vendor's own side (their priceInSun-based allocation math, not
+// a partial/failed delegation) that an exact `total >= requested` check
+// rejected outright. This is deliberately a small, fixed tolerance, not
+// a "trust the vendor" loophole -- a genuinely partial or failed
+// delegation (e.g. 0, or a few percent short) still fails this check,
+// per invariant 1's own reasoning in this function's doc comment below.
+func verifyTolerance(requested int64) int64 {
+	t := requested / 1000
+	if t < 1 {
+		t = 1
+	}
+	return t
+}
+
 // VerifyOnChain queries d's own delegation on-chain and confirms the
-// expected units are actually present. A vendor's Delegate response
-// claiming success is never, on its own, sufficient to mark capacity
-// AVAILABLE -- invariant 1 -- this is the independent check that makes
-// that claim trustworthy. Returns false (not an error) for both "fully
-// absent" and "partially present" -- a partial delegation is not safe
-// to treat as the full amount this component believes it has.
+// expected units are actually present (within verifyTolerance -- see
+// its own doc comment). A vendor's Delegate response claiming success is
+// never, on its own, sufficient to mark capacity AVAILABLE -- invariant
+// 1 -- this is the independent check that makes that claim trustworthy.
+// Returns false (not an error) for both "fully absent" and
+// "meaningfully partial" -- a real shortfall is not safe to treat as the
+// full amount this component believes it has.
 func (b *Buffer) VerifyOnChain(ctx context.Context, d provider.Delegation) (bool, error) {
 	total, err := b.reader.DelegationUnits(ctx, d.TargetAddress, d.ID)
 	if err != nil {
 		return false, fmt.Errorf("buffer: querying on-chain delegation %s for %s: %w", d.ID, d.TargetAddress, err)
 	}
-	return total >= d.EnergyUnits, nil
+	return total >= d.EnergyUnits-verifyTolerance(d.EnergyUnits), nil
 }
 
 // DefaultReconcileInterval is how often RunReconcileLoop re-checks, when

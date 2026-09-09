@@ -228,6 +228,42 @@ func (c *Client) ReportReorg(ctx context.Context, externalID, originalEntryKey s
 	return nil
 }
 
+// AccountType is C1's closed set of account types, mirrored here rather
+// than imported (C2 has no import path into the ledger module -- HTTP is
+// the only boundary). Matches dispatcher/internal/ledgerclient's own
+// identical mirror.
+type AccountType string
+
+const (
+	AccountAsset     AccountType = "ASSET"
+	AccountLiability AccountType = "LIABILITY"
+)
+
+type postAccountRequest struct {
+	Code  string `json:"code"`
+	Type  string `json:"type"`
+	Asset string `json:"asset"`
+}
+
+// EnsureAccount calls POST /v1/accounts, C1's idempotent-on-code account
+// creation endpoint (added for C5, real gap found and closed here too --
+// see this method's own call site in reportDepositFinal). Safe to call
+// on every deposit report, not just the first one for a given customer:
+// a second call with the same code is a no-op read of the account as it
+// actually exists.
+func (c *Client) EnsureAccount(ctx context.Context, code string, accountType AccountType, asset string, idempotencyKey string) error {
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/accounts", idempotencyKey, postAccountRequest{
+		Code: code, Type: string(accountType), Asset: asset,
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusCreated {
+		return decodeAPIError(status, body)
+	}
+	return nil
+}
+
 // ReportDepositFinal posts the one write C2 ever makes to credit a
 // deposit -- POST /v1/orders/{external_id}/transitions to funded, with
 // the E1 entry inline, exactly the shape §A specifies. The
@@ -287,7 +323,30 @@ func (c *Client) reportDepositFinal(ctx context.Context, candidate finality.Cand
 	idempotencyKey := finality.DepositFinalIdempotencyKey(candidate.TxHash, candidate.LogIndex)
 	occurredAt := candidate.BlockTime.UTC().Format(time.RFC3339)
 	depositAccount := fmt.Sprintf("asset:bsc:deposit:%d", candidate.OrderID)
-	customerAccount := "liability:customer:" + candidate.CustomerID
+	// :USDT_BEP20 suffix required -- matches the account-code convention
+	// every other component in this project uses (e.g. dispatcher's own
+	// customerAccountCode(customerID, asset)); C5's own E2 entry later
+	// nets against this exact code when converting to TRC20, so a
+	// mismatch here would silently create TWO different accounts for the
+	// same customer instead of one. Found live, wiring the MVP proof run:
+	// this was missing the suffix entirely.
+	customerAccount := "liability:customer:" + candidate.CustomerID + ":USDT_BEP20"
+
+	// Ensure both accounts this entry references actually exist before
+	// posting it -- C1 does not auto-vivify an account on first journal
+	// reference (the same real gap C5's own EnterDispatching hit and
+	// fixed via EnsureAccount; C2 never got the equivalent call). The
+	// deposit account is per-order and always new; the customer account
+	// may already exist from a prior order for the same customer, in
+	// which case this is a no-op read.
+	if err := c.EnsureAccount(ctx, depositAccount, AccountAsset, "USDT_BEP20", idempotencyKey+":ensure-deposit"); err != nil {
+		c.recordReport("ensure_account_failed")
+		return fmt.Errorf("ledgerclient: deposit_final for %s: ensuring %s exists: %w", candidate.ExternalID, depositAccount, err)
+	}
+	if err := c.EnsureAccount(ctx, customerAccount, AccountLiability, "USDT_BEP20", idempotencyKey+":ensure-customer"); err != nil {
+		c.recordReport("ensure_account_failed")
+		return fmt.Errorf("ledgerclient: deposit_final for %s: ensuring %s exists: %w", candidate.ExternalID, customerAccount, err)
+	}
 
 	reqBody := map[string]any{
 		"to_state":         "funded",

@@ -12,6 +12,8 @@ import (
 
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/core"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
 	"dispatcher/internal/txbuild"
@@ -39,9 +41,20 @@ type GrpcBroadcastClient struct {
 // NewGrpcBroadcastClient connects to a TRON node's gRPC endpoint (e.g.
 // "grpc.trongrid.io:50051"). The connection is established once, here,
 // and reused for every Broadcast call.
+//
+// Plaintext (grpc.WithTransportCredentials(insecure.NewCredentials())),
+// not TLS -- confirmed live against grpc.trongrid.io:50051 (a real
+// public TronGrid endpoint, real GetNowBlock response received) while
+// wiring the MVP proof run: a TLS handshake against that same endpoint
+// fails immediately (server closes the connection, EOF), while plaintext
+// gRPC succeeds. This is why "insecure" here is the CORRECT transport
+// for a real node, not a shortcut -- TRON's own gRPC surface, including
+// commercial providers, is conventionally plaintext, authenticated (when
+// needed) via SetAPIKey's own TRON-PRO-API-KEY header, never via TLS
+// client/server certs.
 func NewGrpcBroadcastClient(nodeAddress string, timeout time.Duration) (*GrpcBroadcastClient, error) {
 	g := client.NewGrpcClientWithTimeout(nodeAddress, timeout)
-	if err := g.Start(); err != nil {
+	if err := g.Start(grpc.WithTransportCredentials(insecure.NewCredentials())); err != nil {
 		return nil, fmt.Errorf("dispatch: connecting to TRON node %q: %w", nodeAddress, err)
 	}
 	return &GrpcBroadcastClient{grpc: g}, nil

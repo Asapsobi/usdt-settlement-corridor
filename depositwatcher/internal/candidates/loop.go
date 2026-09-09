@@ -17,6 +17,18 @@ import (
 // for candidates faster than new blocks can possibly have been ingested.
 const DefaultInterval = 3 * time.Second
 
+// maxBlocksPerTick bounds how many blocks runTick's own ScanRange call
+// covers at once, regardless of how far behind lastCandidate has
+// fallen -- see this constant's own call site for why. Real-traffic
+// testing against a public provider's own 20000-result cap on the real
+// USDT_BEP20 contract found even 200 blocks intermittently too wide (the
+// contract's own Transfer volume varies enough by time of day that a
+// fixed block count is an imperfect proxy for log count); 100 blocks
+// (~5 minutes of BSC block production) leaves real margin. A deployment
+// scanning a much quieter token, or paying for a provider with a higher
+// cap, could raise this.
+const maxBlocksPerTick = 100
+
 // RunLoop is cmd/watcherd's own engine: on each tick, it scans every
 // block internal/chain's own ingestion loop has already vetted (never
 // ahead of chain.LastScannedHeight -- ingestion's pre-final-reorg check
@@ -74,10 +86,27 @@ func runTick(ctx context.Context, pool *chain.Pool, database *db.Pool, quotes Qu
 	}
 
 	if ingestedHeight > lastCandidate {
-		if err := ScanRange(ctx, pool, database, quotes, tracker, cfg, lastCandidate+1, ingestedHeight); err != nil {
-			return fmt.Errorf("candidates: scanning [%d,%d]: %w", lastCandidate+1, ingestedHeight, err)
+		// Capped at maxBlocksPerTick, not the full [lastCandidate+1,
+		// ingestedHeight] backlog in one call -- found live wiring the
+		// MVP proof run: eth_getLogs against a high-traffic contract
+		// (USDT_BEP20 itself, tens of thousands of Transfer events
+		// across every holder, not just this watcher's own addresses)
+		// exceeds a real RPC provider's own per-call result cap well
+		// before this backlog was even large (a few hundred blocks was
+		// enough), and with no chunking the range only ever grew every
+		// tick, since a failed call never advances the cursor -- a
+		// genuinely unrecoverable stall, not a transient error. Capping
+		// consumes a large backlog (a fresh deployment, or a watcher
+		// that was down for a while) incrementally across several ticks
+		// instead.
+		toHeight := ingestedHeight
+		if toHeight-lastCandidate > maxBlocksPerTick {
+			toHeight = lastCandidate + maxBlocksPerTick
 		}
-		if err := chain.SetCandidateScannedHeight(ctx, database, ingestedHeight); err != nil {
+		if err := ScanRange(ctx, pool, database, quotes, tracker, cfg, lastCandidate+1, toHeight); err != nil {
+			return fmt.Errorf("candidates: scanning [%d,%d]: %w", lastCandidate+1, toHeight, err)
+		}
+		if err := chain.SetCandidateScannedHeight(ctx, database, toHeight); err != nil {
 			return err
 		}
 	}
