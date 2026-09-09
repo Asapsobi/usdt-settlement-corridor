@@ -106,6 +106,14 @@ func (s *Store) ListDispatching(ctx context.Context) ([]Attempt, error) {
 	return out, rows.Err()
 }
 
+// markStatus transitions orderID from DISPATCHING to status, idempotent
+// on a retry that lands after its own prior call already succeeded:
+// found while wiring ConfirmFinality into a caller (the MVP proof run's
+// orchestration loop) that genuinely retries it on every tick until
+// finality -- a crash between settleOrder committing and this call the
+// first time around must not turn a legitimate replay into an error the
+// second time around, the same "replay, don't fail" discipline every
+// other idempotency key in this project already gets.
 func (s *Store) markStatus(ctx context.Context, orderID int64, status Status) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE dispatch_state SET status = $1, updated_at = now()
@@ -115,8 +123,12 @@ func (s *Store) markStatus(ctx context.Context, orderID int64, status Status) er
 		return fmt.Errorf("dispatch: marking order %d %s: %w", orderID, status, err)
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := s.Get(ctx, orderID); err != nil {
+		current, err := s.Get(ctx, orderID)
+		if err != nil {
 			return err
+		}
+		if current.Status == status {
+			return nil
 		}
 		return fmt.Errorf("dispatch: order %d attempt is not in DISPATCHING, cannot mark %s", orderID, status)
 	}

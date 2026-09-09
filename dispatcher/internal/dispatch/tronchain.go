@@ -47,6 +47,35 @@ func NewGrpcBroadcastClient(nodeAddress string, timeout time.Duration) (*GrpcBro
 	return &GrpcBroadcastClient{grpc: g}, nil
 }
 
+// CurrentBlockReference fetches a fresh txbuild.BlockReference from this
+// client's own node -- GetNowBlockCtx, the same real gRPC call every
+// TRON wallet uses to pick a recent reference block before building a
+// transaction. Timestamp/Expiration come from the wall clock, not the
+// block's own timestamp (matching every fake caller in this codebase,
+// e.g. the replay harness's own buildTransfer), with a 2-minute
+// expiration window -- TRON's own tolerance, per BlockReference's doc
+// comment. Like Broadcast itself, this has not been exercised against a
+// live node from a build session.
+func (c *GrpcBroadcastClient) CurrentBlockReference(ctx context.Context) (txbuild.BlockReference, error) {
+	block, err := c.grpc.GetNowBlockCtx(ctx)
+	if err != nil {
+		return txbuild.BlockReference{}, fmt.Errorf("dispatch: fetching current TRON block: %w", err)
+	}
+	if len(block.Blockid) != 32 {
+		return txbuild.BlockReference{}, fmt.Errorf("dispatch: current TRON block returned a %d-byte blockid, want 32", len(block.Blockid))
+	}
+	var hash [32]byte
+	copy(hash[:], block.Blockid)
+
+	now := time.Now().UTC()
+	return txbuild.BlockReference{
+		BlockNumber: block.BlockHeader.RawData.Number,
+		BlockHash:   hash,
+		Timestamp:   now,
+		Expiration:  now.Add(2 * time.Minute),
+	}, nil
+}
+
 // Broadcast submits tx and returns its txID on success. TRON's own
 // Broadcast RPC reports failure via Return.Result=false (with a code and
 // a human-readable message), not a transport-level error, so a false

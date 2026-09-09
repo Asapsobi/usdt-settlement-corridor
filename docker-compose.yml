@@ -1,0 +1,269 @@
+# Stands up the whole MVP proof run (docs/03-build/mvp-proof-run-plan.md)
+# in one place: C1-C5, S1, and the proofrun driver, each against its own
+# real Postgres. Scoped to that task, NOT a production deployment
+# artifact -- no TLS between services, no secrets manager, single-replica
+# everything, matching every component's own existing per-module
+# docker-compose.yml (this file's own DB user/password/db-name/port
+# choices are copied from those, unchanged, so this can run alongside or
+# instead of them).
+#
+# NOT exercised against a real Docker daemon while writing it (this
+# session's own environment has no Docker installed) -- the equivalent
+# wiring (each binary run directly, against a locally-built Postgres) WAS
+# verified for real in the same session; see this repo's own commit
+# history / session notes for what that proved. Run `docker compose
+# config` and `docker compose build` before relying on this for the
+# actual proof run.
+#
+# Prerequisites this file cannot supply -- see mvp-proof-run-plan.md's
+# own "OPERATOR-SUPPLIED PREREQUISITES": copy .env.proofrun.example to
+# .env and fill in a real BSC RPC provider, the real BEP20 USDT
+# contract's already-verified address (pre-filled below, see
+# c2-deposit-watcher-build-prompts.md's own BscScan citation), a real
+# TronGrid API key, a real Tronsell/Netts/Catfee account, the real
+# funded TRON slot address(es), and a TRON gRPC node.
+
+services:
+  # ---- C1: ledger ----
+  ledger-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger_dev
+    ports: ["5432:5432"]
+    volumes: ["ledger_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  ledger:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: ledger, SERVER_BIN: ledgerd } }
+    depends_on: { ledger-db: { condition: service_healthy } }
+    environment:
+      LEDGER_DATABASE_URL: postgres://ledger:ledger@ledger-db:5432/ledger_dev?sslmode=disable
+      LEDGER_API_TOKENS: ${LEDGER_API_TOKENS:-ledgertoken:proofrun}
+      LEDGER_LISTEN_ADDR: ":8080"
+    ports: ["8080:8080"]
+
+  # ---- C2: deposit watcher ----
+  watcher-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: watcher
+      POSTGRES_PASSWORD: watcher
+      POSTGRES_DB: watcher_dev
+    ports: ["5433:5432"]
+    volumes: ["watcher_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watcher -d watcher_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  watcher:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: depositwatcher, SERVER_BIN: watcherd } }
+    depends_on:
+      watcher-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+    environment:
+      WATCHER_DATABASE_URL: postgres://watcher:watcher@watcher-db:5432/watcher_dev?sslmode=disable
+      WATCHER_API_TOKENS: ${WATCHER_API_TOKENS:-watchertoken:proofrun}
+      WATCHER_LISTEN_ADDR: ":8082"
+      # Real BIP32 xpub for HD deposit-address derivation -- operator-
+      # supplied, no default (a placeholder key here would derive real,
+      # unspendable-by-anyone-who-matters addresses for a real proof run).
+      WATCHER_XPUB: ${WATCHER_XPUB:?set WATCHER_XPUB in .env -- see .env.proofrun.example}
+      # Real BSC RPC endpoint(s), comma-separated -- operator-supplied.
+      WATCHER_RPC_PROVIDERS: ${WATCHER_RPC_PROVIDERS:?set WATCHER_RPC_PROVIDERS in .env -- see .env.proofrun.example}
+      WATCHER_LEDGER_BASE_URL: http://ledger:8080
+      WATCHER_LEDGER_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      # Binance-Peg BSC-USD (BEP-20) -- verified against BscScan, see
+      # c2-deposit-watcher-build-prompts.md's own citation. Real mainnet
+      # address, not a placeholder; override only if that's ever wrong.
+      WATCHER_CONTRACT_ADDRESS: ${WATCHER_CONTRACT_ADDRESS:-0x55d398326f99059fF775485246999027B3197955}
+    ports: ["8082:8082"]
+
+  # ---- C3: screening ----
+  screening-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: screening
+      POSTGRES_PASSWORD: screening
+      POSTGRES_DB: screening_dev
+    ports: ["5434:5432"]
+    volumes: ["screening_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U screening -d screening_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  screening:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: screening, SERVER_BIN: screend } }
+    depends_on:
+      screening-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+    environment:
+      SCREENING_DATABASE_URL: postgres://screening:screening@screening-db:5432/screening_dev?sslmode=disable
+      SCREENING_API_TOKENS: ${SCREENING_API_TOKENS:-screentoken:proofrun}
+      SCREENING_LISTEN_ADDR: ":8083"
+      SCREENING_LEDGER_BASE_URL: http://ledger:8080
+      SCREENING_LEDGER_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      # provider.AlwaysCleanProvider -- NOT a real compliance decision,
+      # see internal/provider/alwaysclean.go's own doc comment. Only for
+      # this supervised, no-real-customer-traffic proof run.
+      SCREENING_PROVIDER: always_clean
+      SCREENING_ALLOW_ALWAYS_CLEAN: "true"
+    ports: ["8083:8083"]
+
+  # ---- C4: energy broker ----
+  broker-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: broker
+      POSTGRES_PASSWORD: broker
+      POSTGRES_DB: broker_dev
+    ports: ["5435:5432"]
+    volumes: ["broker_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U broker -d broker_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  broker:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: energybroker, SERVER_BIN: brokerd } }
+    depends_on:
+      broker-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+    environment:
+      BROKER_DATABASE_URL: postgres://broker:broker@broker-db:5432/broker_dev?sslmode=disable
+      BROKER_API_TOKENS: ${BROKER_API_TOKENS:-brokertoken:proofrun}
+      BROKER_LISTEN_ADDR: ":8084"
+      LEDGER_BASE_URL: http://ledger:8080
+      LEDGER_API_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      # Every one of these is real money/credentials -- operator-
+      # supplied, no default, no fabrication. See mvp-proof-run-plan.md's
+      # own "OPERATOR-SUPPLIED PREREQUISITES".
+      BROKER_TRONSELL_BASE_URL: ${BROKER_TRONSELL_BASE_URL:?set in .env}
+      BROKER_TRONSELL_API_KEY: ${BROKER_TRONSELL_API_KEY:?set in .env}
+      BROKER_NETTS_API_KEY: ${BROKER_NETTS_API_KEY:-}
+      BROKER_NETTS_REAL_IP: ${BROKER_NETTS_REAL_IP:-}
+      BROKER_CATFEE_API_KEY: ${BROKER_CATFEE_API_KEY:-}
+      BROKER_CATFEE_API_SECRET: ${BROKER_CATFEE_API_SECRET:-}
+      BROKER_PAYOUT_SLOT_ADDRESSES: ${BROKER_PAYOUT_SLOT_ADDRESSES:?set in .env -- the real, funded TRON slot address(es)}
+      BROKER_ROUTING_WEIGHTS: ${BROKER_ROUTING_WEIGHTS:-tronsell:100}
+      BROKER_PRICE_CEILING_SUN: ${BROKER_PRICE_CEILING_SUN:-100}
+      BROKER_TRONGRID_BASE_URL: ${BROKER_TRONGRID_BASE_URL:-https://api.trongrid.io}
+      BROKER_TRONGRID_API_KEY: ${BROKER_TRONGRID_API_KEY:?set in .env}
+    ports: ["8084:8084"]
+
+  # ---- S1: key management / signing ----
+  s1-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: s1
+      POSTGRES_PASSWORD: s1
+      POSTGRES_DB: s1_dev
+    ports: ["5437:5432"]
+    volumes: ["s1_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U s1 -d s1_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  s1:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: s1, SERVER_BIN: s1d } }
+    depends_on: { s1-db: { condition: service_healthy } }
+    environment:
+      S1_DATABASE_URL: postgres://s1:s1@s1-db:5432/s1_dev?sslmode=disable
+      S1_C5_API_TOKENS: ${S1_C5_API_TOKENS:-s1c5token:dispatcher}
+      S1_APPROVER_API_TOKENS: ${S1_APPROVER_API_TOKENS:-s1approvertoken:operator}
+      S1_LISTEN_ADDR: ":8085"
+      # mvp-proof-run-plan.md decision 1: run this proof stage against
+      # FakeKMSClient unchanged -- it produces REAL, independently
+      # verifiable signatures (see kmssign/mock.go's own doc comment),
+      # just not HSM-backed custody. Do not set this to anything else;
+      # no real cloud KMS adapter exists in this codebase yet.
+      S1_KMS_CLIENT: fake
+      S1_APPROVAL_THRESHOLD_USD: ${S1_APPROVAL_THRESHOLD_USD:-1000000}
+    ports: ["8085:8085"]
+
+  # ---- C5: payout dispatcher ----
+  dispatcher-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dispatcher
+      POSTGRES_PASSWORD: dispatcher
+      POSTGRES_DB: dispatcher_dev
+    ports: ["5436:5432"]
+    volumes: ["dispatcher_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatcher -d dispatcher_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  dispatcher:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: dispatcher, SERVER_BIN: dispatchd } }
+    depends_on:
+      dispatcher-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+      broker: { condition: service_started }
+      s1: { condition: service_started }
+    environment:
+      DISPATCHER_DATABASE_URL: postgres://dispatcher:dispatcher@dispatcher-db:5432/dispatcher_dev?sslmode=disable
+      DISPATCHER_API_TOKENS: ${DISPATCHER_API_TOKENS:-dispatchertoken:proofrun}
+      DISPATCHER_LISTEN_ADDR: ":8086"
+      DISPATCHER_LEDGER_BASE_URL: http://ledger:8080
+      DISPATCHER_LEDGER_API_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      DISPATCHER_SIGNING_BASE_URL: http://s1:8085
+      DISPATCHER_SIGNING_API_TOKEN: ${S1_C5_API_TOKEN_VALUE:-s1c5token}
+      DISPATCHER_SLOT_BALANCE_CEILING: ${DISPATCHER_SLOT_BALANCE_CEILING:-50000.000000}
+      DISPATCHER_SLOT_TX_COUNT_CEILING: ${DISPATCHER_SLOT_TX_COUNT_CEILING:-5000}
+      DISPATCHER_ENERGY_BASE_URL: http://broker:8084
+      DISPATCHER_ENERGY_API_TOKEN: ${BROKER_API_TOKEN_VALUE:-brokertoken}
+      DISPATCHER_ENERGY_PER_TRANSFER_UNITS: ${DISPATCHER_ENERGY_PER_TRANSFER_UNITS:-65000}
+      DISPATCHER_ORCHESTRATE_INTERVAL: ${DISPATCHER_ORCHESTRATE_INTERVAL:-5s}
+      # Real TRON node -- operator-supplied. grpc.trongrid.io:50051 is
+      # TronGrid's own real, public gRPC endpoint (still needs a funded
+      # slot key behind S1 and real TRX for broadcast fees to actually
+      # move anything).
+      DISPATCHER_TRON_GRPC_ADDR: ${DISPATCHER_TRON_GRPC_ADDR:-grpc.trongrid.io:50051}
+      DISPATCHER_TRON_API_BASE_URL: ${DISPATCHER_TRON_API_BASE_URL:-https://api.trongrid.io}
+    ports: ["8086:8086"]
+
+  # ---- proof-run driver (docs/03-build/mvp-proof-run-plan.md §2(b)) ----
+  proofrun:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: proofrun, SERVER_BIN: proofrund, HAS_MIGRATE: "false" } }
+    depends_on:
+      ledger: { condition: service_started }
+      watcher: { condition: service_started }
+      dispatcher: { condition: service_started }
+    environment:
+      PROOFRUN_LISTEN_ADDR: ":8090"
+      PROOFRUN_LEDGER_BASE_URL: http://ledger:8080
+      PROOFRUN_LEDGER_API_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      PROOFRUN_WATCHER_BASE_URL: http://watcher:8082
+      PROOFRUN_WATCHER_API_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
+      PROOFRUN_DISPATCHER_BASE_URL: http://dispatcher:8086
+      PROOFRUN_DISPATCHER_API_TOKEN: ${DISPATCHER_API_TOKEN_VALUE:-dispatchertoken}
+      # 25bp fee (product-operations-architecture.md's own pricing
+      # analysis) + a flat placeholder network fee -- see
+      # proofrun/internal/driver's own Config doc comment.
+      PROOFRUN_FEE_BASIS_POINTS: ${PROOFRUN_FEE_BASIS_POINTS:-25}
+      PROOFRUN_NETWORK_FEE_UNITS: ${PROOFRUN_NETWORK_FEE_UNITS:-1.800000}
+      PROOFRUN_QUOTE_VALIDITY: ${PROOFRUN_QUOTE_VALIDITY:-24h}
+    ports: ["8090:8090"]
+
+volumes:
+  ledger_pgdata:
+  watcher_pgdata:
+  screening_pgdata:
+  broker_pgdata:
+  s1_pgdata:
+  dispatcher_pgdata:

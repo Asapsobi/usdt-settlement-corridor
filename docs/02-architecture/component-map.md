@@ -51,6 +51,7 @@ C6 and C4 can be built in parallel with C2 once C1's journal-entry contract is f
 - **Owns:** provider call (Chainalysis / TRM / Elliptic), result caching by sender address, hold queue, manual review path, reason codes.
 - **Does not own:** the release action itself — it returns a verdict; the ledger transitions the order.
 - **Dimension:** ~100 calls/day at MVP volume. Cost per call is a real line item at scale; cache by sender.
+- **Built** — `docs/03-build/c3-screening-build-prompts.md` (C3.0–C3.9), see `screening/`. The discovery loop runs for real against a real, running C1 (no vendor dependency). The pipeline and re-screen loops have no real `provider.ScreeningProvider` wired — vendor choice was deliberately left unmade — but as of 9 Sep 2026 `cmd/screend` can start both against `provider.AlwaysCleanProvider`, an explicitly-labeled non-production placeholder, for `docs/03-build/mvp-proof-run-plan.md`'s own supervised proof run only.
 
 ### C4 — Energy broker
 - **Owns:** routing 60/35/5 across Tronsell / Netts / CatFee, price polling with a ceiling, pre-order lead time, delegation confirmation, fallback ladder, per-payout cost attribution to the ledger.
@@ -64,11 +65,13 @@ C6 and C4 can be built in parallel with C2 once C1's journal-entry contract is f
 - **Hard parts:** energy exhausted at broadcast; slot frozen mid-flight; duplicate broadcast on retry; partial batch success in multisend; slot rotation without stranding balance.
 - **Testnet dependency:** the week-6 batched-multisend energy measurement (35,000/recipient assumption) is measured here — this component's own energy-per-recipient config, not yet independently confirmed.
 - **Built** — `docs/03-build/c5-payout-dispatcher-build-prompts.md` (C5.0–C5.11), see `dispatcher/`. Signs against S1's real request/poll `SigningService` contract but an in-process fake standing in for S1 itself (no real cloud KMS behind S1 yet, so nothing in this component can touch mainnet). Sweep-tier batching is built against a *proposed* multisend contract interface (no smart contract exists on either chain per decision 1 — see the doc's own C5.8 discussion) and a fake standing in for it. Required a small addition to C1 (`POST /v1/accounts`, idempotent-on-code) so this component can ensure the per-customer/per-slot ledger accounts it references actually exist — C1 had no way to create an account over HTTP before.
+- **Wired, 9 Sep 2026** — `internal/orchestrate`, started by `cmd/dispatchd`: the background loop that carries a screened Direct/Standard order from `EnterDispatching` through energy reservation, signing, broadcast, and finality confirmation with no manual step, closing the gap `cmd/dispatchd`'s own doc comment previously flagged as not yet built. Found and fixed one real bug along the way: `ConfirmFinality` never updated `dispatch_state` to `SETTLED` the way every other settlement/failure path in this package did. Sweep-tier orchestration is still undriven (needs the multisend contract above). Also added `cmd/seed-slot` — a one-time, idempotent CLI to register a real payout slot, since `internal/httpapi` has no `POST /v1/slots` route (mirrors `ledger/cmd/seed-console`'s own precedent, not a new production endpoint).
 
 ### C6 — API gateway
 - **Owns:** auth, rate limits, quote issuance with the 90s lock, idempotency keys, HMAC-SHA256 webhook signing with 8 retries, sandbox with the four deterministic failure triggers (reorg, screening hold, energy exhaustion, retry storm).
 - **Does not own:** money movement; calls a pricing library rather than embedding tiers.
 - **Rule:** quote-then-order, never quote-inside-order.
+- **Not built.** `proofrun/` (`docs/03-build/mvp-proof-run-plan.md`) is a deliberately minimal stand-in — no auth, no rate limiting, no persisted quotes, no tiered pricing, no webhooks, no sandbox — that creates an order against C1 and gets a deposit address from C2, purely to prove C1→C5/S1 works end to end. It is scaffolding for that proof, not a step toward C6; this component still needs to be built in full, separately.
 
 ### S1 — Key management / signing
 - **Owns:** custody of the six TRON slot keys and the BSC HD seed, the only signing capability anywhere in this system.

@@ -95,6 +95,18 @@ func (d *Dispatcher) ConfirmFinality(ctx context.Context, order ledgerclient.Ord
 	if err := d.settleOrder(ctx, order, attempt.SlotID, settleKey, occurredAt); err != nil {
 		return false, BroadcastAttempt{}, err
 	}
+	// Mirrors HandlePartialSettlement's own d.Store.MarkSettled call for
+	// the Sweep path -- dispatch_state's own status must reach a
+	// terminal value too, not just dispatch_attempts', or a caller
+	// scanning Store.ListDispatching (C5.7's reconciliation job, and
+	// this proof run's own orchestration loop) would see this order as
+	// still in flight forever after it has actually settled. Found while
+	// wiring the MVP proof run's orchestration loop: this single-order
+	// path never called it, unlike every other settlement/failure path
+	// in this package.
+	if err := d.Store.MarkSettled(ctx, order.ID); err != nil {
+		return false, BroadcastAttempt{}, fmt.Errorf("dispatch: order %d settled in C1 but marking dispatch_state SETTLED failed: %w", order.ID, err)
+	}
 
 	updated, err := d.Attempts.markConfirmed(ctx, attemptID)
 	if err != nil {

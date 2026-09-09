@@ -1,28 +1,32 @@
 // Command screend serves C3, the screening service, over HTTP: the
 // hold queue, screening-result audit lookups, and re-screen flags
-// (C3.8) -- plus, now, the discovery background loop (C3.3), which
-// polls C1 for newly-funded orders and resolves their sender_address,
-// both against a real ledgerclient.Client (no fake, no vendor
-// dependency).
+// (C3.8) -- plus the discovery background loop (C3.3), which polls C1
+// for newly-funded orders and resolves their sender_address.
 //
-// It does NOT run the pipeline or re-screen background loops
-// (C3.4/C3.7's own engines). Both need a real provider.ScreeningProvider
-// -- a real AML vendor client, one of the candidates component-map.md's
-// own C3 "provider call" line names without picking one -- and
-// internal/provider only has MockProvider. The C3 build doc is explicit
-// that vendor choice was deliberately left unmade ("vendor abstraction,
-// not vendor choice"); wiring a mock into a production compliance path
-// would silently screen real orders against a fake, seeded verdict,
-// which is worse than the honest gap left here. A deployment running
-// this binary today discovers funded orders and serves the manual-
-// review/audit surface correctly; it needs a real ScreeningProvider
-// added, and pipeline.RunLoop/rescreen.RunLoop wired against it, before
-// it screens anything on its own.
+// SCREENING_PROVIDER selects what pipeline.RunLoop/rescreen.RunLoop (the
+// screening and re-screen engines, C3.4/C3.7) actually screen against:
+//   - unset (default): neither loop starts. No real
+//     provider.ScreeningProvider exists yet -- a real AML vendor client,
+//     one of the candidates component-map.md's own C3 "provider call"
+//     line names without picking one -- and wiring a mock into a
+//     production compliance path would silently screen real orders
+//     against a fake, seeded verdict, which is worse than the honest
+//     gap left here. A deployment running this binary this way
+//     discovers funded orders and serves the manual-review/audit
+//     surface correctly, nothing more.
+//   - "always_clean": both loops start against
+//     provider.AlwaysCleanProvider -- NOT a real compliance decision,
+//     see that type's own doc comment. Exists only for
+//     docs/03-build/mvp-proof-run-plan.md's own supervised, no-real-
+//     customer-traffic proof run. Refuses to start if
+//     SCREENING_ALLOW_ALWAYS_CLEAN is not also "true", so this can't be
+//     reached by an unexamined env default.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -35,6 +39,9 @@ import (
 	"screening/internal/discovery"
 	"screening/internal/httpapi"
 	"screening/internal/ledgerclient"
+	"screening/internal/pipeline"
+	"screening/internal/provider"
+	"screening/internal/rescreen"
 )
 
 func main() {
@@ -95,6 +102,31 @@ func run() error {
 		}
 	}()
 
+	screeningProvider, providerName, err := screeningProviderFromEnv()
+	if err != nil {
+		return err
+	}
+	if screeningProvider != nil {
+		// ledgerClient implements both pipeline.Reporter (ReportVerdict)
+		// and rescreen.OrderLister (ListOrdersByState) for real, against
+		// the same running C1 -- see this file's own doc comment for what
+		// SCREENING_PROVIDER=always_clean actually means.
+		go func() {
+			cfg := pipeline.Config{ProviderName: providerName}
+			if err := pipeline.RunLoop(ctx, pool, screeningProvider, ledgerClient, cfg, 0); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("screend: pipeline loop exited", "error", err)
+			}
+		}()
+		go func() {
+			cfg := rescreen.Config{ProviderName: providerName}
+			if err := rescreen.RunLoop(ctx, pool, ledgerClient, screeningProvider, cfg, 0); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("screend: rescreen loop exited", "error", err)
+			}
+		}()
+		slog.Warn("screend: pipeline and rescreen loops started against a PLACEHOLDER screening provider -- not a real compliance decision",
+			"provider", providerName)
+	}
+
 	srv := &http.Server{
 		Addr:    listenAddr(),
 		Handler: router,
@@ -122,6 +154,31 @@ func run() error {
 	}
 	slog.Info("screend shut down cleanly")
 	return nil
+}
+
+// screeningProviderFromEnv reads SCREENING_PROVIDER. Unset (the
+// default): returns (nil, "", nil) -- pipeline/rescreen stay unstarted,
+// exactly this binary's prior behavior. "always_clean": returns
+// provider.AlwaysCleanProvider, but only if SCREENING_ALLOW_ALWAYS_CLEAN
+// is also exactly "true" -- a second, explicit flag so a real deployment
+// can never reach a placeholder compliance decision through one
+// mistyped env var alone. Any other SCREENING_PROVIDER value is a
+// startup error: this binary refuses to guess what an unrecognized
+// provider name was supposed to mean.
+func screeningProviderFromEnv() (provider.ScreeningProvider, string, error) {
+	name := os.Getenv("SCREENING_PROVIDER")
+	switch name {
+	case "":
+		return nil, "", nil
+	case "always_clean":
+		if os.Getenv("SCREENING_ALLOW_ALWAYS_CLEAN") != "true" {
+			return nil, "", fmt.Errorf("screend: SCREENING_PROVIDER=always_clean also requires SCREENING_ALLOW_ALWAYS_CLEAN=true " +
+				"-- provider.AlwaysCleanProvider is not a real compliance decision, see its own doc comment")
+		}
+		return provider.AlwaysCleanProvider{}, provider.AlwaysCleanProviderName, nil
+	default:
+		return nil, "", fmt.Errorf("screend: unrecognized SCREENING_PROVIDER %q (supported: unset, \"always_clean\")", name)
+	}
 }
 
 func listenAddr() string {

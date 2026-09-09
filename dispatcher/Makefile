@@ -11,8 +11,16 @@ test:
 # Requires DISPATCHER_TEST_DATABASE_URL pointing at a real, reachable
 # Postgres 16 instance, e.g.:
 #   export DISPATCHER_TEST_DATABASE_URL=postgres://dispatcher:dispatcher@localhost:5436/dispatcher_test
+#
+# -p 1 runs one package's test binary at a time: DISPATCHER_TEST_DATABASE_URL
+# and LEDGER_TEST_DATABASE_URL are shared across every package in this
+# module's own suite, and internal/orchestrate's own RunTick deliberately
+# scans every currently-screened order across the whole shared database
+# (required production behavior, not a bug) -- running it concurrently
+# with another package's own in-flight test orders risks it dispatching
+# rows a sibling test isn't done setting up yet.
 test-integration:
-	go test -tags=integration ./...
+	go test -tags=integration -p 1 ./...
 
 # Requires DISPATCHER_DATABASE_URL. Uses our own cmd/migrate rather than
 # goose's CLI binary -- see cmd/migrate's own doc comment.
