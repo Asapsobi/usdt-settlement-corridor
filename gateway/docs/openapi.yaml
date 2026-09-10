@@ -1,0 +1,305 @@
+openapi: "3.0.3"
+info:
+  title: C6 — API Gateway
+  version: "0.1.0"
+  description: >
+    The customer-facing contract for the whole USDT BEP20->TRC20
+    settlement corridor: quote -> order -> status -> webhook, plus an
+    isolated sandbox exercising four deterministic failure triggers.
+    See docs/03-build/c6-api-gateway-build-prompts.md for the full
+    build spec this API implements. Customer-facing bearer auth (C6.1)
+    is a distinct, separate concern from the service-to-service auth
+    every other component in this corridor uses toward each other.
+
+servers:
+  - url: http://localhost:8087
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Healthz" }
+
+  /readyz:
+    get:
+      summary: Readiness check (database reachable)
+      security: []
+      responses:
+        "200":
+          description: Ready.
+        "503":
+          description: Not ready.
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /v1/quotes:
+    post:
+      summary: Issue a time-locked price quote
+      description: >
+        Decision 5's own "quote-then-order, never quote-inside-order":
+        the price a customer sees here is the exact row POST /v1/orders
+        later reads back verbatim, never recomputed. Production
+        customers only -- a sandbox API key gets 403 production_only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostQuoteRequest" }
+      responses:
+        "201":
+          description: Quote issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "423":
+          description: system_halted -- C1 is currently halted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders:
+    post:
+      summary: Create an order against a live, unexpired quote
+      description: >
+        The C1+C2 choreography ("Read this second" in the build spec):
+        creates the order in C1, then assigns a deposit address via C2.
+        If the second call fails, the order still comes back (status
+        address_pending) rather than failing outright -- C6.4's
+        reconciliation loop closes that gap asynchronously. Requires
+        Idempotency-Key; production customers only.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostOrderRequest" }
+      responses:
+        "201":
+          description: Order created (status created or address_pending).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: quote_expired, quote_already_consumed, or idempotency_conflict.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "423":
+          description: system_halted -- C1 is currently halted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders/{external_id}:
+    get:
+      summary: Pull-based order status (the webhook's own backstop)
+      description: >
+        Reads through to C1's own live state, translated into a
+        defined customer-facing status -- never a passthrough of an
+        internal state string this gateway hasn't been taught about.
+        A suspended customer can still call this. Production customers
+        only; a sandbox order's external_id is invisible here by
+        construction (it lives in a separate table).
+      parameters:
+        - name: external_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sandbox/orders:
+    post:
+      summary: Create a sandbox order with a scripted, deterministic outcome
+      description: >
+        C6.7's own fully separate code path -- never touches real
+        C1/C2/C4/C5 state. trigger selects which of the four documented
+        scenarios (reorg, screening_hold, energy_exhaustion,
+        retry_storm) this order deterministically plays out. Sandbox
+        API keys only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostSandboxOrderRequest" }
+      responses:
+        "201":
+          description: Sandbox order created, already in its scripted final state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SandboxOrder" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/sandbox/orders/{external_id}:
+    get:
+      summary: Read back a sandbox order
+      description: >
+        Reads sandbox_orders only, never gateway_orders -- structurally
+        cannot return production data. Sandbox API keys only.
+      parameters:
+        - name: external_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SandboxOrder" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        A customer's own sk_live_ (production) or sk_test_ (sandbox)
+        API key -- the two are never interchangeable (invariant 4).
+
+  responses:
+    BadRequest:
+      description: invalid_request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: customer_suspended, sandbox_only, or production_only.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The named resource does not exist (or belongs to a different customer -- ownership is checked, not just existence).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    Healthz:
+      type: object
+      properties:
+        status: { type: string }
+        version: { type: string }
+        commit: { type: string }
+
+    PostQuoteRequest:
+      type: object
+      required: [tier, amount_in, recipient_address]
+      properties:
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string, description: Decimal string, e.g. "3000.000000". }
+        recipient_address: { type: string }
+
+    Quote:
+      type: object
+      properties:
+        quote_id: { type: integer, format: int64 }
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string }
+        amount_out: { type: string }
+        fee_units: { type: string }
+        network_fee_units: { type: string }
+        recipient_address: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    PostOrderRequest:
+      type: object
+      required: [quote_id, external_id]
+      properties:
+        quote_id: { type: integer, format: int64 }
+        external_id: { type: string }
+
+    Order:
+      type: object
+      properties:
+        external_id: { type: string }
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string }
+        amount_out: { type: string }
+        fee_units: { type: string }
+        network_fee_units: { type: string }
+        recipient_address: { type: string }
+        deposit_address: { type: string, nullable: true }
+        status:
+          type: string
+          description: >
+            address_pending or created (POST /v1/orders' own view);
+            quoted, funded, screened, dispatching, settled, held,
+            refunded, or expired (GET /v1/orders/{id}'s own view, once
+            an address has been assigned).
+
+    PostSandboxOrderRequest:
+      type: object
+      required: [tier, amount_in, recipient_address, trigger]
+      properties:
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string }
+        recipient_address: { type: string }
+        trigger:
+          type: string
+          enum: [reorg, screening_hold, energy_exhaustion, retry_storm]
+
+    SandboxOrder:
+      type: object
+      properties:
+        external_id: { type: string, description: Always sbx_ prefixed. }
+        trigger:
+          type: string
+          enum: [reorg, screening_hold, energy_exhaustion, retry_storm]
+        tier: { type: string, enum: [DIRECT, STANDARD, SWEEP] }
+        amount_in: { type: string }
+        amount_out: { type: string }
+        fee_units: { type: string }
+        network_fee_units: { type: string }
+        recipient_address: { type: string }
+        deposit_address: { type: string }
+        state: { type: string }
+        hold_reason: { type: string, nullable: true }
+        webhook_attempts: { type: integer }
+        webhook_exhausted: { type: boolean }
