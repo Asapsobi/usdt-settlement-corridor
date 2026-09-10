@@ -24,10 +24,15 @@ const DefaultInterval = 3 * time.Second
 // USDT_BEP20 contract found even 200 blocks intermittently too wide (the
 // contract's own Transfer volume varies enough by time of day that a
 // fixed block count is an imperfect proxy for log count); 100 blocks
-// (~5 minutes of BSC block production) leaves real margin. A deployment
-// scanning a much quieter token, or paying for a provider with a higher
-// cap, could raise this.
-const maxBlocksPerTick = 100
+// (~5 minutes of BSC block production) left real margin against THAT
+// cap. A second real run (10 Sep 2026) found free providers enforcing a
+// much stricter, hard per-call BLOCK-RANGE ceiling regardless of result
+// count, and that ceiling varies by provider: 1rpc.io's own free tier
+// allows 50 blocks, Alchemy's free tier allows only 10. Lowered to 10 to
+// clear the tightest of these with no margin to spare -- a deployment
+// paying for a provider with a higher cap on every dimension could
+// raise this.
+const maxBlocksPerTick = 10
 
 // RunLoop is cmd/watcherd's own engine: on each tick, it scans every
 // block internal/chain's own ingestion loop has already vetted (never

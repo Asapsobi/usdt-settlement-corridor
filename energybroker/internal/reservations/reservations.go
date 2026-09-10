@@ -513,13 +513,42 @@ func (s *Service) slowPath(ctx context.Context, reservation Reservation, req Req
 		slog.Error("reservations: slow path: recording the vendor overcharge event failed", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
 	}
 
-	confirmed, err := s.buf.VerifyOnChain(slowCtx, delegation)
-	if err != nil {
-		slog.Error("reservations: slow path: on-chain verification errored", "reservation_id", reservation.ID, "provider", sel.Provider, "error", err)
+	// A vendor's own 200 response is never trusted alone (invariant 1) --
+	// but the on-chain state it's claiming can genuinely take a few
+	// seconds to propagate after that response returns (TRON's own block
+	// time, plus whatever the vendor's own broadcast pipeline adds).
+	// Found live running a real order against CatFee (10 Sep 2026): the
+	// very first VerifyOnChain call after Delegate returned saw 0
+	// available energy and failed the reservation outright, discarding a
+	// delegation that (confirmed independently, seconds later) landed
+	// correctly at 64999/65000 units -- a real purchase, wasted by
+	// checking before it had a chance to land, not a real shortfall. Three
+	// attempts, 3s apart, bounded by slowCtx's own deadline, gives real
+	// propagation time without weakening what "confirmed" means -- a
+	// delegation that's genuinely absent or partial after 9s still fails
+	// exactly as before.
+	var confirmed bool
+	var verifyErr error
+verifyRetry:
+	for attempt := 1; attempt <= 3; attempt++ {
+		confirmed, verifyErr = s.buf.VerifyOnChain(slowCtx, delegation)
+		if verifyErr != nil || confirmed {
+			break
+		}
+		if attempt < 3 {
+			select {
+			case <-slowCtx.Done():
+				break verifyRetry
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}
+	if verifyErr != nil {
+		slog.Error("reservations: slow path: on-chain verification errored", "reservation_id", reservation.ID, "provider", sel.Provider, "error", verifyErr)
 		return s.fail(ctx, reservation.ID)
 	}
 	if !confirmed {
-		slog.Error("reservations: slow path: delegation did not verify on-chain -- a vendor's own 200 response is never trusted alone (invariant 1)",
+		slog.Error("reservations: slow path: delegation did not verify on-chain after 3 attempts over 9s -- a vendor's own 200 response is never trusted alone (invariant 1)",
 			"reservation_id", reservation.ID, "provider", sel.Provider)
 		return s.fail(ctx, reservation.ID)
 	}
@@ -552,6 +581,24 @@ func (s *Service) confirmAndReport(ctx context.Context, reservationID, orderID i
 		}
 	}
 	return r, nil
+}
+
+// ManualConfirm is the "needs manual reconciliation" gap confirmAndReport's
+// own doc comment names, given an actual tool: a reservation the slow
+// path marked FAILED (a verification timeout, a transient error) whose
+// underlying delegation is independently confirmed real -- e.g. via a
+// direct on-chain read against the vendor's target address -- gets
+// confirmed here using that already-real delegation, instead of either
+// staying permanently stuck (Create's own idempotency-key replay means
+// the normal path never re-attempts a terminal FAILED row) or paying for
+// a second vendor order that duplicates the first. Ops-tool only, never
+// called from Create's own request path -- the caller is responsible for
+// having independently verified the delegation before calling this, the
+// same trust boundary cmd/seed-slot and cmd/seed-slot-key already
+// established for their own "no HTTP route for this operator action"
+// gaps elsewhere in this project.
+func (s *Service) ManualConfirm(ctx context.Context, reservationID, orderID int64, delegation provider.Delegation) (Reservation, error) {
+	return s.confirmAndReport(ctx, reservationID, orderID, delegation.ProviderName, delegation.CostTRX, []provider.Delegation{delegation}, false)
 }
 
 func (s *Service) confirm(ctx context.Context, id int64, vendor string, cost money.Amount, viaFastPath bool) (Reservation, error) {
