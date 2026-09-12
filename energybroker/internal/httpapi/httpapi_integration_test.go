@@ -193,6 +193,24 @@ func seedAvailableRow(t *testing.T, pool *db.Pool, providerName, delegationID, s
 	}
 }
 
+// seedReservationRow inserts a reservation row directly, bypassing
+// Create() entirely -- for OC.5's own list/reconcile tests, which need a
+// row already sitting at a specific status (most usefully FAILED), not
+// one that reached it through a real vendor call.
+func seedReservationRow(t *testing.T, pool *db.Pool, idempotencyKey, externalID string, orderID int64, targetAddress, status string) int64 {
+	t.Helper()
+	var id int64
+	err := pool.QueryRow(context.Background(), `
+		INSERT INTO reservations (idempotency_key, external_id, order_id, target_address, energy_units, tier, status, deadline)
+		VALUES ($1, $2, $3, $4, 65000, 'DIRECT', $5, now() + interval '1 hour')
+		RETURNING id
+	`, idempotencyKey, externalID, orderID, targetAddress, status).Scan(&id)
+	if err != nil {
+		t.Fatalf("seeding reservation row: %v", err)
+	}
+	return id
+}
+
 func doRequest(t *testing.T, method, url, token string, body any) *http.Response {
 	t.Helper()
 	return doRequestWithIdempotencyKey(t, method, url, token, "", body)
@@ -606,5 +624,92 @@ func TestPostReservation_OrderNotFoundOnRealC1(t *testing.T) {
 	}
 	if decodeError(t, resp).Error.Code != "order_not_found" {
 		t.Fatalf("code = %q, want order_not_found", decodeError(t, resp).Error.Code)
+	}
+}
+
+func TestGetReservations_RequiresAtLeastOneStatus(t *testing.T) {
+	baseURL, _, _ := testServer(t, nil)
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/reservations", testToken, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestGetReservations_FiltersByStatus(t *testing.T) {
+	baseURL, pool, _ := testServer(t, nil)
+	failedID := seedReservationRow(t, pool, "list-test-failed", "list-test-failed-ext", 9001, "TListTestFailed00000000000001", "FAILED")
+	seedReservationRow(t, pool, "list-test-pending", "list-test-pending-ext", 9002, "TListTestPending0000000000001", "PENDING")
+
+	var got struct {
+		Reservations []struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+		} `json:"reservations"`
+	}
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/reservations?status=FAILED", testToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	decodeInto(t, resp, &got)
+
+	found := false
+	for _, r := range got.Reservations {
+		if r.ID == failedID {
+			found = true
+			if r.Status != "FAILED" {
+				t.Errorf("status = %q, want FAILED", r.Status)
+			}
+		}
+		if r.Status != "FAILED" {
+			t.Errorf("filtering on status=FAILED returned a %s row", r.Status)
+		}
+	}
+	if !found {
+		t.Errorf("seeded FAILED reservation %d not present in status=FAILED results", failedID)
+	}
+}
+
+func TestPostReservationReconcile_ConfirmsAFailedRow(t *testing.T) {
+	baseURL, pool, _ := testServer(t, nil)
+	id := seedReservationRow(t, pool, "reconcile-test-1", "reconcile-test-1-ext", 9101, "TReconcileTest000000000000001", "FAILED")
+
+	resp := doRequestWithIdempotencyKey(t, http.MethodPost, fmt.Sprintf("%s/v1/reservations/%d/reconcile", baseURL, id), testToken, "reconcile:1", map[string]any{
+		"order_id":       9101,
+		"provider":       "catfee",
+		"delegation_id":  "manual-test-delegation-1",
+		"target_address": "TReconcileTest000000000000001",
+		"energy_units":   65000,
+		"cost_trx":       "1.950000",
+	})
+	if resp.StatusCode != http.StatusOK {
+		errBody := decodeError(t, resp)
+		t.Fatalf("status = %d, code = %s, message = %s", resp.StatusCode, errBody.Error.Code, errBody.Error.Message)
+	}
+	var got struct {
+		Status  string  `json:"status"`
+		Vendor  *string `json:"vendor"`
+		CostTRX *string `json:"cost_trx"`
+	}
+	decodeInto(t, resp, &got)
+	if got.Status != "CONFIRMED" {
+		t.Fatalf("status = %q, want CONFIRMED", got.Status)
+	}
+	if got.Vendor == nil || *got.Vendor != "catfee" {
+		t.Fatalf("vendor = %v, want catfee", got.Vendor)
+	}
+	if got.CostTRX == nil || *got.CostTRX != "1.950000" {
+		t.Fatalf("cost_trx = %v, want 1.950000", got.CostTRX)
+	}
+}
+
+func TestPostReservationReconcile_MissingFieldsReturns400(t *testing.T) {
+	baseURL, pool, _ := testServer(t, nil)
+	id := seedReservationRow(t, pool, "reconcile-test-2", "reconcile-test-2-ext", 9102, "TReconcileTest000000000000002", "FAILED")
+
+	resp := doRequestWithIdempotencyKey(t, http.MethodPost, fmt.Sprintf("%s/v1/reservations/%d/reconcile", baseURL, id), testToken, "reconcile:2", map[string]any{
+		"order_id": 9102,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }

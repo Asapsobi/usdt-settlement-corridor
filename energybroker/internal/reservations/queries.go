@@ -79,6 +79,36 @@ func getByID(ctx context.Context, q db.Queryer, id int64) (*Reservation, error) 
 	return scanReservation(row)
 }
 
+// listByStatus lists reservations matching any of statuses, newest first,
+// bounded by limit -- the ops console's own OC.5 (see
+// docs/03-build/ops-console-build-prompts.md), closing the gap
+// GET /v1/reservations/{id} being get-by-id-only left: finding a stuck
+// FAILED/PENDING row required a direct SELECT against this table before
+// this route existed.
+func listByStatus(ctx context.Context, q db.Queryer, statuses []string, limit int) ([]Reservation, error) {
+	rows, err := q.Query(ctx, `SELECT `+selectColumns+` FROM reservations WHERE status = ANY($1) ORDER BY created_at DESC LIMIT $2`,
+		statuses, limit)
+	if err != nil {
+		return nil, fmt.Errorf("reservations: listing by status: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Reservation
+	for rows.Next() {
+		r, err := scanReservation(rows)
+		if err != nil {
+			return nil, err
+		}
+		if r != nil {
+			out = append(out, *r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reservations: listing by status: %w", err)
+	}
+	return out, nil
+}
+
 // markConfirmed transitions id to CONFIRMED, recording which vendor
 // ultimately serviced it, at what cost, and via which path -- the last
 // of these is what GET /v1/system/invariants' own "fast-path vs slow-

@@ -67,7 +67,9 @@ func NewRouter(s *Server) http.Handler {
 		r.Use(authMiddleware(s.Auth))
 
 		r.Post("/reservations", s.postReservation)
+		r.Get("/reservations", s.getReservations)
 		r.Get("/reservations/{id}", s.getReservation)
+		r.Post("/reservations/{id}/reconcile", s.postReservationReconcile)
 
 		r.Get("/buffer", s.getBuffer)
 

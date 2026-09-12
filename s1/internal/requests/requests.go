@@ -41,6 +41,19 @@ type SigningRequest struct {
 	CreatedAt time.Time
 }
 
+// PendingSummary is one row of ListPending's own result -- the ops
+// console's own OC.7 (see docs/03-build/ops-console-build-prompts.md):
+// enough for an approver to see which requests are waiting on them
+// without already knowing the id, never the digest or anything
+// signature-related, matching GetSignature's own posture of returning
+// SignedTx only once SIGNED.
+type PendingSummary struct {
+	ID           int64
+	SlotID       int
+	EstimatedUSD float64
+	CreatedAt    time.Time
+}
+
 // ErrRequestAlreadyResolved guards Approve/Reject against acting on a
 // request that already reached a terminal state -- a caller bug worth
 // surfacing loudly (a decision after resolution means something upstream

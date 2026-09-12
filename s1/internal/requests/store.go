@@ -187,6 +187,37 @@ func (s *Store) signAndRecord(ctx context.Context, requestID int64, slotID int, 
 }
 
 // GetSignature implements SigningService.
+// ListPending lists every PENDING signing request, oldest first -- the
+// one query GetSignature (get-by-id-only) never let an approver make: an
+// approver has no way to discover WHICH requests are awaiting them short
+// of already knowing the id, unless the id came from somewhere else
+// entirely (dispatcher logs/DB). Oldest first, not newest, because the
+// operational question this answers is "what's been waiting longest,"
+// not "what just came in."
+func (s *Store) ListPending(ctx context.Context) ([]PendingSummary, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, slot_id, estimated_usd, created_at FROM signing_requests
+		WHERE status = $1 ORDER BY created_at ASC
+	`, string(StatusPending))
+	if err != nil {
+		return nil, fmt.Errorf("requests: listing pending: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingSummary
+	for rows.Next() {
+		var p PendingSummary
+		if err := rows.Scan(&p.ID, &p.SlotID, &p.EstimatedUSD, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("requests: scanning pending row: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("requests: listing pending: %w", err)
+	}
+	return out, nil
+}
+
 func (s *Store) GetSignature(ctx context.Context, id int64) (SigningRequest, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, status, signed_tx, created_at FROM signing_requests WHERE id = $1

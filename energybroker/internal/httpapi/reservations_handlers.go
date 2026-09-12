@@ -1,9 +1,13 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
+	"energybroker/internal/money"
+	"energybroker/internal/provider"
 	"energybroker/internal/reservations"
 )
 
@@ -97,6 +101,111 @@ func (s *Server) getReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.Reservations.Get(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, toReservationResponse(res))
+}
+
+var validReservationStatuses = map[string]bool{"PENDING": true, "CONFIRMED": true, "FAILED": true}
+
+// getReservations is GET /v1/reservations?status=&limit= (ops-console-
+// build-prompts.md's OC.5) -- the first route to list reservations by
+// status; GET /v1/reservations/{id} is, and remains, get-by-id-only.
+// Closes the gap this session's own second proof run hit directly: a
+// stuck FAILED reservation had to be found with a raw SELECT against
+// broker_dev, because nothing else could find it.
+func (s *Server) getReservations(w http.ResponseWriter, r *http.Request) {
+	statuses := r.URL.Query()["status"]
+	if len(statuses) == 0 {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "at least one status query parameter is required"))
+		return
+	}
+	for _, st := range statuses {
+		if !validReservationStatuses[st] {
+			writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code,
+				fmt.Sprintf("unrecognized status %q, want PENDING, CONFIRMED, or FAILED", st)))
+			return
+		}
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, ok := parsePositiveInt(w, raw)
+		if !ok {
+			return
+		}
+		limit = parsed
+	}
+
+	rows, err := s.Reservations.ListByStatus(r.Context(), statuses, limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := make([]reservationResponse, len(rows))
+	for i, row := range rows {
+		out[i] = toReservationResponse(row)
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"reservations": out})
+}
+
+func parsePositiveInt(w http.ResponseWriter, raw string) (int, bool) {
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "limit must be a positive integer"))
+		return 0, false
+	}
+	return v, true
+}
+
+type postReservationReconcileRequest struct {
+	OrderID       int64  `json:"order_id"`
+	Provider      string `json:"provider"`
+	DelegationID  string `json:"delegation_id"`
+	TargetAddress string `json:"target_address"`
+	EnergyUnits   int64  `json:"energy_units"`
+	CostTRX       string `json:"cost_trx"`
+}
+
+// postReservationReconcile is POST /v1/reservations/{id}/reconcile --
+// the HTTP form of cmd/reconcile-reservation's own ManualConfirm call,
+// added because that operation had no HTTP route at all before now, only
+// a CLI needing shell access to whichever machine runs brokerd. Kept
+// alongside the CLI (docs/03-build/ops-console-build-prompts.md's OC.5:
+// "an additional way to reach the same operation, not a replacement").
+// Exactly cmd/reconcile-reservation/main.go's own doc comment applies
+// here too: the caller is vouching for a delegation independently
+// verified real (e.g. read directly on-chain) -- this is never called
+// from Create's own request path, and nothing here re-derives or
+// double-checks that verification.
+func (s *Server) postReservationReconcile(w http.ResponseWriter, r *http.Request) {
+	id, ok := urlParamInt64(w, r, "id")
+	if !ok {
+		return
+	}
+	var req postReservationReconcileRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.OrderID == 0 || req.Provider == "" || req.DelegationID == "" || req.TargetAddress == "" || req.EnergyUnits <= 0 || req.CostTRX == "" {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code,
+			"order_id, provider, delegation_id, target_address, energy_units (>0), and cost_trx are all required"))
+		return
+	}
+	cost, err := money.ParseDecimal(req.CostTRX)
+	if err != nil {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "cost_trx: "+err.Error()))
+		return
+	}
+
+	now := time.Now().UTC()
+	delegation := provider.Delegation{
+		ID: req.DelegationID, ProviderName: req.Provider, TargetAddress: req.TargetAddress,
+		EnergyUnits: req.EnergyUnits, CostTRX: cost, RequestedAt: now, ExpiresAt: now.Add(time.Hour), ConfirmedAt: &now,
+	}
+
+	res, err := s.Reservations.ManualConfirm(r.Context(), id, req.OrderID, delegation)
 	if err != nil {
 		writeErr(w, err)
 		return

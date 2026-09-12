@@ -511,3 +511,88 @@ func TestGetInvariants_NoChainOrTracker_OmitsFields(t *testing.T) {
 		t.Fatalf("invariants with no ChainPool/Tracker configured = %v, want an empty object (all fields omitted)", got)
 	}
 }
+
+func TestGetCursor_ReadsSeededRow(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	var got map[string]any
+	status := call(t, srv, http.MethodGet, "/v1/system/cursor", "", nil, &got)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if _, ok := got["last_scanned"]; !ok {
+		t.Errorf("response missing last_scanned: %v", got)
+	}
+	if _, ok := got["updated_at"]; !ok {
+		t.Errorf("response missing updated_at: %v", got)
+	}
+}
+
+func TestPostCursor_MissingIdempotencyKey_Returns400(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	body := map[string]any{"last_scanned": 100, "last_candidate_scanned": 50, "reason": "test"}
+	var errBody errorDTO
+	status := call(t, srv, http.MethodPost, "/v1/system/cursor", "", body, &errBody)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if errBody.Error.Code != "invalid_request" {
+		t.Fatalf("error code = %q, want invalid_request", errBody.Error.Code)
+	}
+}
+
+func TestPostCursor_RejectsMissingReason(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	body := map[string]any{"last_scanned": 100, "last_candidate_scanned": 50}
+	var got map[string]any
+	status := call(t, srv, http.MethodPost, "/v1/system/cursor", "idem-1", body, &got)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %v", status, got)
+	}
+}
+
+func TestPostCursor_RejectsCandidateAheadOfScanned(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	body := map[string]any{"last_scanned": 100, "last_candidate_scanned": 200, "reason": "test"}
+	var got map[string]any
+	status := call(t, srv, http.MethodPost, "/v1/system/cursor", "idem-2", body, &got)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (candidate ahead of scanned must be rejected), body = %v", status, got)
+	}
+}
+
+func TestPostCursor_ThenGetReflectsIt(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	body := map[string]any{"last_scanned": 500, "last_candidate_scanned": 400, "reason": "test fast-forward"}
+	var posted map[string]any
+	status := call(t, srv, http.MethodPost, "/v1/system/cursor", "idem-3", body, &posted)
+	if status != http.StatusOK {
+		t.Fatalf("POST status = %d, want 200, body = %v", status, posted)
+	}
+
+	var got map[string]any
+	status = call(t, srv, http.MethodGet, "/v1/system/cursor", "", nil, &got)
+	if status != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", status)
+	}
+	if int64(got["last_scanned"].(float64)) != 500 {
+		t.Errorf("last_scanned = %v, want 500", got["last_scanned"])
+	}
+	if int64(got["last_candidate_scanned"].(float64)) != 400 {
+		t.Errorf("last_candidate_scanned = %v, want 400", got["last_candidate_scanned"])
+	}
+}

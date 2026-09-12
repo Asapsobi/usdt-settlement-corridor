@@ -281,3 +281,72 @@ func TestHealthzReadyzUnauthenticated(t *testing.T) {
 		}
 	}
 }
+
+func TestGetSigningRequests_ListsOnlyPending(t *testing.T) {
+	baseURL, _ := testServer(t, 10000)
+
+	// Over threshold -- stays PENDING, should appear in the list.
+	pendingDigest := hex.EncodeToString(bytes.Repeat([]byte{9}, 32))
+	pendingResp := doRequest(t, http.MethodPost, baseURL+"/v1/signing-requests", c5Token, map[string]any{
+		"slot_id": 1, "digest": pendingDigest, "estimated_usd": 50000, "idempotency_key": "idem-list-pending",
+	})
+	if pendingResp.StatusCode != http.StatusCreated {
+		t.Fatalf("seeding pending request: status = %d, want 201", pendingResp.StatusCode)
+	}
+	var pending signingRequestResult
+	decodeInto(t, pendingResp, &pending)
+	if pending.Status != "PENDING" {
+		t.Fatalf("seeded request status = %q, want PENDING", pending.Status)
+	}
+
+	// Under threshold -- signs immediately, should NOT appear in the list.
+	signedDigest := hex.EncodeToString(bytes.Repeat([]byte{10}, 32))
+	signedResp := doRequest(t, http.MethodPost, baseURL+"/v1/signing-requests", c5Token, map[string]any{
+		"slot_id": 1, "digest": signedDigest, "estimated_usd": 5000, "idempotency_key": "idem-list-signed",
+	})
+	if signedResp.StatusCode != http.StatusCreated {
+		t.Fatalf("seeding signed request: status = %d, want 201", signedResp.StatusCode)
+	}
+	var signed signingRequestResult
+	decodeInto(t, signedResp, &signed)
+
+	listResp := doRequest(t, http.MethodGet, baseURL+"/v1/signing-requests?status=pending", c5Token, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", listResp.StatusCode)
+	}
+	var got struct {
+		SigningRequests []struct {
+			ID           int64   `json:"id"`
+			SlotID       int     `json:"slot_id"`
+			EstimatedUSD float64 `json:"estimated_usd"`
+		} `json:"signing_requests"`
+	}
+	decodeInto(t, listResp, &got)
+
+	foundPending, foundSigned := false, false
+	for _, r := range got.SigningRequests {
+		if r.ID == pending.ID {
+			foundPending = true
+			if r.EstimatedUSD != 50000 {
+				t.Errorf("pending request estimated_usd = %v, want 50000", r.EstimatedUSD)
+			}
+		}
+		if r.ID == signed.ID {
+			foundSigned = true
+		}
+	}
+	if !foundPending {
+		t.Errorf("PENDING request %d not present in status=pending list", pending.ID)
+	}
+	if foundSigned {
+		t.Errorf("SIGNED request %d wrongly present in status=pending list", signed.ID)
+	}
+}
+
+func TestGetSigningRequests_RejectsUnsupportedStatus(t *testing.T) {
+	baseURL, _ := testServer(t, 10000)
+	resp := doRequest(t, http.MethodGet, baseURL+"/v1/signing-requests?status=signed", c5Token, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}

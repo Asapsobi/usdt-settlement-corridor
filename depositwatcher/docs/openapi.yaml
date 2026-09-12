@@ -198,6 +198,47 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Invariants" }
 
+  /v1/system/cursor:
+    get:
+      summary: Raw ingestion_cursor row
+      description: >
+        The first route to expose last_scanned/last_candidate_scanned
+        directly -- every prior operator-facing signal only ever derived a
+        lag number from them.
+      responses:
+        "200":
+          description: Current cursor state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cursor" }
+    post:
+      summary: Manually set the ingestion cursor (operator override)
+      description: >
+        Closes a real gap: both real MVP proof runs needed this set by
+        hand, directly against Postgres. Validates
+        last_candidate_scanned <= last_scanned and refuses to set either
+        value past the chain's own current tip.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [last_scanned, last_candidate_scanned, reason]
+              properties:
+                last_scanned: { type: integer, format: int64 }
+                last_candidate_scanned: { type: integer, format: int64 }
+                reason: { type: string }
+      responses:
+        "200":
+          description: Updated cursor state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -302,3 +343,10 @@ components:
         cursor_lag_blocks: { type: integer, format: int64 }
         pending_finality_count: { type: integer }
         oldest_pending_candidate_age_seconds: { type: number }
+
+    Cursor:
+      type: object
+      properties:
+        last_scanned: { type: integer, format: int64 }
+        last_candidate_scanned: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }

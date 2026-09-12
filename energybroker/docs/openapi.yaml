@@ -85,6 +85,37 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+    get:
+      summary: List reservations by status
+      description: >
+        At least one status is required. The first route to list
+        reservations at all -- GET /v1/reservations/{id} is, and remains,
+        get-by-id-only.
+      parameters:
+        - name: status
+          in: query
+          required: true
+          schema:
+            type: array
+            items: { type: string, enum: [PENDING, CONFIRMED, FAILED] }
+          style: form
+          explode: true
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Reservation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /v1/reservations/{id}:
     get:
@@ -97,6 +128,40 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Reservation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/reservations/{id}/reconcile:
+    post:
+      summary: Manually confirm a wrongly-FAILED reservation (operator override)
+      description: >
+        The HTTP form of cmd/reconcile-reservation's own ManualConfirm
+        call. Never called from POST /v1/reservations' own path -- the
+        caller is vouching for a delegation independently verified real,
+        e.g. read directly on-chain against the vendor's own target
+        address.
+      parameters:
+        - $ref: "#/components/parameters/ReservationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, provider, delegation_id, target_address, energy_units, cost_trx]
+              properties:
+                order_id: { type: integer, format: int64 }
+                provider: { type: string }
+                delegation_id: { type: string }
+                target_address: { type: string }
+                energy_units: { type: integer, format: int64 }
+                cost_trx: { type: string }
+      responses:
+        "200":
+          description: OK -- the reservation, now CONFIRMED.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/buffer:

@@ -64,6 +64,8 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/system/providers", s.getProviders)
 		r.Get("/system/invariants", s.getInvariants)
+		r.Get("/system/cursor", s.getCursor)
+		r.With(requireIdempotencyKey).Post("/system/cursor", s.postCursor)
 	})
 
 	return router

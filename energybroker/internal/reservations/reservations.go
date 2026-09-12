@@ -314,6 +314,12 @@ func (s *Service) Get(ctx context.Context, id int64) (Reservation, error) {
 	return *r, nil
 }
 
+// ListByStatus lists reservations matching any of statuses, newest
+// first, bounded by limit.
+func (s *Service) ListByStatus(ctx context.Context, statuses []string, limit int) ([]Reservation, error) {
+	return listByStatus(ctx, s.pool, statuses, limit)
+}
+
 // Create implements §A's own POST /v1/reservations: idempotent on
 // req.IdempotencyKey, resolving req.ExternalID to C1's own internal
 // order id, then the fast path (buffer.Reserve against req.TargetAddress's

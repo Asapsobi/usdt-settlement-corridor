@@ -60,6 +60,40 @@ func (s *Server) postSigningRequest(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, toSigningRequestResponse(result))
 }
 
+type pendingSummaryResponse struct {
+	ID           int64     `json:"id"`
+	SlotID       int       `json:"slot_id"`
+	EstimatedUSD float64   `json:"estimated_usd"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// getSigningRequests is GET /v1/signing-requests?status=pending -- the
+// ops console's own OC.7 (see docs/03-build/ops-console-build-prompts.md).
+// status=pending is the only supported value today: this route exists so
+// an approver can discover WHICH requests are awaiting them, and every
+// other status is already terminal (SIGNED/REJECTED), which
+// GetSignature's own get-by-id already serves once the id is known from
+// elsewhere. C5-scope-authenticated like every other read on this
+// service -- see this route's own entry in the build doc for why a read
+// here is fine with a shared token even though approve/reject is not.
+func (s *Server) getSigningRequests(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	if status != "pending" {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, `status must be "pending"`))
+		return
+	}
+	pending, err := s.Signing.ListPending(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := make([]pendingSummaryResponse, len(pending))
+	for i, p := range pending {
+		out[i] = pendingSummaryResponse{ID: p.ID, SlotID: p.SlotID, EstimatedUSD: p.EstimatedUSD, CreatedAt: p.CreatedAt}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"signing_requests": out})
+}
+
 // getSigningRequest is GET /v1/signing-requests/{id}.
 func (s *Server) getSigningRequest(w http.ResponseWriter, r *http.Request) {
 	id, ok := urlParamInt64(w, r, "id")
