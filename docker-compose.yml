@@ -1,11 +1,19 @@
-# Stands up the whole MVP proof run (docs/03-build/mvp-proof-run-plan.md)
-# in one place: C1-C5, S1, and the proofrun driver, each against its own
-# real Postgres. Scoped to that task, NOT a production deployment
-# artifact -- no TLS between services, no secrets manager, single-replica
-# everything, matching every component's own existing per-module
-# docker-compose.yml (this file's own DB user/password/db-name/port
-# choices are copied from those, unchanged, so this can run alongside or
-# instead of them).
+# Stands up the whole MVP: C1-C5, S1, C6 (the API gateway), and the
+# proofrun driver, each against its own real Postgres. Scoped to that
+# task, NOT a production deployment artifact -- no TLS between services,
+# no secrets manager, single-replica everything, matching every
+# component's own existing per-module docker-compose.yml (this file's own
+# DB user/password/db-name/port choices are copied from those, unchanged,
+# so this can run alongside or instead of them).
+#
+# gateway (C6) was added after the original MVP proof run wiring below --
+# it depends on ledger and watcher the same way proofrun does, but is the
+# real customer-facing API those scaffolding routes were never meant to
+# be (see README.md's own "proofrun/" entry). It does not depend on
+# broker/dispatcher/s1 directly: C6 only ever talks to C1 and C2 over
+# HTTP, same as gatewayd's own cmd/gatewayd/main.go requires -- the rest
+# of the pipeline advances on its own via each service's own background
+# loop once C1's order state changes.
 #
 # NOT exercised against a real Docker daemon while writing it (this
 # session's own environment has no Docker installed) -- the equivalent
@@ -237,6 +245,36 @@ services:
       DISPATCHER_TRON_API_BASE_URL: ${DISPATCHER_TRON_API_BASE_URL:-https://api.trongrid.io}
     ports: ["8086:8086"]
 
+  # ---- C6: API gateway ----
+  gateway-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway_dev
+    ports: ["5438:5432"]
+    volumes: ["gateway_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  gateway:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: gateway, SERVER_BIN: gatewayd } }
+    depends_on:
+      gateway-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+      watcher: { condition: service_started }
+    environment:
+      GATEWAY_DATABASE_URL: postgres://gateway:gateway@gateway-db:5432/gateway_dev?sslmode=disable
+      GATEWAY_LISTEN_ADDR: ":8087"
+      GATEWAY_LEDGER_BASE_URL: http://ledger:8080
+      GATEWAY_LEDGER_API_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      GATEWAY_WATCHER_BASE_URL: http://watcher:8082
+      GATEWAY_WATCHER_API_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
+    ports: ["8087:8087"]
+
   # ---- proof-run driver (docs/03-build/mvp-proof-run-plan.md §2(b)) ----
   proofrun:
     build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: proofrun, SERVER_BIN: proofrund, HAS_MIGRATE: "false" } }
@@ -267,3 +305,4 @@ volumes:
   broker_pgdata:
   s1_pgdata:
   dispatcher_pgdata:
+  gateway_pgdata:
