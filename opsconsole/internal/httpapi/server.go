@@ -92,6 +92,9 @@ func NewRouter(s *Server) http.Handler {
 		r.Post("/wallets/{id}/sweep", s.postSweepSlot)
 		r.Post("/wallets/sweep/finalize", s.postSweepFinalize)
 
+		r.Get("/deposits/watching", s.getDepositsWatching)
+		r.Post("/deposits/{order_id}/confirm", s.postConfirmDeposit)
+
 		r.Get("/ledger/halt", s.getLedgerHalt)
 		r.Post("/ledger/halt/set", s.postLedgerHaltSet)
 		r.Post("/ledger/halt/clear", s.postLedgerHaltClear)

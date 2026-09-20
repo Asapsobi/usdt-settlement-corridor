@@ -249,7 +249,7 @@ func (s *Server) deriveBlocker(r *http.Request, order opclient.Order) (blocker, 
 
 type serviceAlert struct {
 	Service, Message string
-	OK                bool
+	OK               bool
 }
 
 type alertsPageData struct {

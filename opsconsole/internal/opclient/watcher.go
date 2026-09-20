@@ -108,6 +108,25 @@ func (c *WatcherClient) GetAddress(ctx context.Context, orderID int64) (WatchedA
 	return out, err
 }
 
+// ConfirmDepositResult is C2's own postConfirmDeposit response shape.
+type ConfirmDepositResult struct {
+	OrderID     int64  `json:"order_id"`
+	TxHash      string `json:"tx_hash"`
+	BlockNumber uint64 `json:"block_number"`
+	Accepted    bool   `json:"accepted"`
+}
+
+// ConfirmDeposit calls C2's own POST /v1/addresses/{order_id}/confirm-deposit
+// (OC.12) -- an operator-supplied txid, verified on-chain before it's fed
+// through the exact same crediting path a normally-detected deposit
+// uses; still respects finality, never a manual override that skips it.
+func (c *WatcherClient) ConfirmDeposit(ctx context.Context, orderID int64, txHash string) (ConfirmDepositResult, error) {
+	body := map[string]any{"tx_hash": txHash}
+	var out ConfirmDepositResult
+	err := do(ctx, c.http, "watcher", c.token, http.MethodPost, c.baseURL+"/v1/addresses/"+strconv.FormatInt(orderID, 10)+"/confirm-deposit", body, &out)
+	return out, err
+}
+
 // GetAddressBalance calls C2's own GET /v1/addresses/{order_id}/balance.
 func (c *WatcherClient) GetAddressBalance(ctx context.Context, orderID int64) (string, error) {
 	var out struct {

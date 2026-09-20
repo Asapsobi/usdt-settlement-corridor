@@ -159,22 +159,22 @@ func (c *LedgerClient) GetInvariants(ctx context.Context) (LedgerInvariants, err
 
 // Order is C1's own Order schema (ledger/docs/openapi.yaml).
 type Order struct {
-	ID                int64  `json:"id"`
-	ExternalID        string `json:"external_id"`
-	CustomerID        string `json:"customer_id"`
-	Tier              string `json:"tier"`
-	State             string `json:"state"`
-	AmountIn          string `json:"amount_in"`
-	AmountOut         string `json:"amount_out"`
-	FeeUnits          string `json:"fee_units"`
-	NetworkFeeUnits   string `json:"network_fee_units"`
-	RecipientAddress  string `json:"recipient_address"`
-	SenderAddress     string `json:"sender_address,omitempty"`
-	QuotedAt          string `json:"quoted_at"`
-	QuoteExpiresAt    string `json:"quote_expires_at"`
-	Version           int    `json:"version"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
+	ID               int64  `json:"id"`
+	ExternalID       string `json:"external_id"`
+	CustomerID       string `json:"customer_id"`
+	Tier             string `json:"tier"`
+	State            string `json:"state"`
+	AmountIn         string `json:"amount_in"`
+	AmountOut        string `json:"amount_out"`
+	FeeUnits         string `json:"fee_units"`
+	NetworkFeeUnits  string `json:"network_fee_units"`
+	RecipientAddress string `json:"recipient_address"`
+	SenderAddress    string `json:"sender_address,omitempty"`
+	QuotedAt         string `json:"quoted_at"`
+	QuoteExpiresAt   string `json:"quote_expires_at"`
+	Version          int    `json:"version"`
+	CreatedAt        string `json:"created_at"`
+	UpdatedAt        string `json:"updated_at"`
 }
 
 // OrderList is C1's own GET /v1/orders response shape.
