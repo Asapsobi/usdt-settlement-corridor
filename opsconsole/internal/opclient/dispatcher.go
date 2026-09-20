@@ -72,3 +72,31 @@ func (c *DispatcherClient) RetireSlot(ctx context.Context, id int, immediate boo
 	body := map[string]any{"immediate": immediate}
 	return do(ctx, c.http, "dispatcher", c.token, http.MethodPost, c.baseURL+"/v1/slots/"+strconv.Itoa(id)+"/retire", body, nil)
 }
+
+// Dispatch is C5's own GET /v1/dispatch/{order_id} response shape
+// (dispatcher/docs/openapi.yaml's own Dispatch schema). Carries no
+// reservation_id or signing_request_id -- there is no such field on
+// the real route today, so an order detail view cannot link from here
+// to a specific C4 reservation or S1 signing request; see OC.10's own
+// "Read this third" item 3.
+type Dispatch struct {
+	OrderID              int64      `json:"order_id"`
+	SlotID               int        `json:"slot_id"`
+	ConversionEntryKey   string     `json:"conversion_entry_key"`
+	Status               string     `json:"status"`
+	EnteredDispatchingAt time.Time  `json:"entered_dispatching_at"`
+	LatestAttemptNumber  *int       `json:"latest_attempt_number,omitempty"`
+	LatestAttemptStatus  *string    `json:"latest_attempt_status,omitempty"`
+	TronTxID             *string    `json:"tron_txid,omitempty"`
+	BroadcastAt          *time.Time `json:"broadcast_at,omitempty"`
+}
+
+// GetDispatch calls C5's own GET /v1/dispatch/{order_id}. ErrNotFound
+// (via APIError with a 404 Status) means this order hasn't reached
+// dispatching yet -- a normal, expected state for most orders, not a
+// fault.
+func (c *DispatcherClient) GetDispatch(ctx context.Context, orderID int64) (Dispatch, error) {
+	var out Dispatch
+	err := do(ctx, c.http, "dispatcher", c.token, http.MethodGet, c.baseURL+"/v1/dispatch/"+strconv.FormatInt(orderID, 10), nil, &out)
+	return out, err
+}

@@ -98,6 +98,16 @@ func (c *WatcherClient) ListAddresses(ctx context.Context, limit int) ([]Watched
 	return out.Addresses, err
 }
 
+// GetAddress calls C2's own GET /v1/addresses/{order_id} -- one order's
+// own deposit-address status (WATCHING/FUNDED/RETIRED), the sub-stage
+// detail within C1's "quoted"/"funded" states that OC.10's order detail
+// view needs.
+func (c *WatcherClient) GetAddress(ctx context.Context, orderID int64) (WatchedAddress, error) {
+	var out WatchedAddress
+	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, c.baseURL+"/v1/addresses/"+strconv.FormatInt(orderID, 10), nil, &out)
+	return out, err
+}
+
 // GetAddressBalance calls C2's own GET /v1/addresses/{order_id}/balance.
 func (c *WatcherClient) GetAddressBalance(ctx context.Context, orderID int64) (string, error) {
 	var out struct {

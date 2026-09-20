@@ -40,6 +40,12 @@ type Server struct {
 	Audit     *auditlog.Log
 	AuditPath string // the file Audit itself writes to -- getAudit's own read view (OC.8) tails this directly
 
+	// StuckOrderMinutes is OC_STUCK_ORDER_MINUTES -- how long a
+	// dispatching order may sit with no reservation and no dispatch
+	// record before getAlerts' own orphaned-order check flags it.
+	// Defaults to 30 if zero.
+	StuckOrderMinutes int
+
 	Templates *Templates
 	BuildInfo func() (version, commit string)
 }
@@ -77,6 +83,10 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/", s.getHome)
 		r.Get("/partial/home", s.getHomePartial)
+
+		r.Get("/orders", s.getOrders)
+		r.Get("/orders/{external_id}", s.getOrderDetail)
+		r.Get("/alerts", s.getAlerts)
 
 		r.Get("/ledger/halt", s.getLedgerHalt)
 		r.Post("/ledger/halt/set", s.postLedgerHaltSet)

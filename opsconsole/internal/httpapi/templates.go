@@ -30,6 +30,8 @@ type navItem struct {
 
 var navItems = []navItem{
 	{"/", "Home", iconHome},
+	{"/orders", "Orders", iconOrders},
+	{"/alerts", "Alerts", iconAlert},
 	{"/ledger/halt", "Ledger", iconLedger},
 	{"/watcher/cursor", "Watcher", iconWatcher},
 	{"/broker/reservations?status=FAILED", "Broker", iconBroker},
@@ -113,6 +115,9 @@ func MustLoadTemplates() *Templates {
 		"s1_approvals":        s1ApprovalsContent,
 		"sandbox_orders":      sandboxOrdersContent,
 		"manual_flow":         manualFlowContent,
+		"order_list":          orderListContent,
+		"order_detail":        orderDetailContent,
+		"alerts":              alertsContent,
 		"audit":               auditContent,
 	}
 	funcs := template.FuncMap{

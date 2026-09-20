@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -67,6 +68,8 @@ func run() error {
 		Audit:      audit,
 		AuditPath:  cfg.auditLogPath,
 		BuildInfo:  buildInfo,
+
+		StuckOrderMinutes: cfg.stuckOrderMinutes,
 	}
 	if cfg.gatewayBaseURL != "" && cfg.gatewaySandboxKey != "" {
 		server.Gateway = opclient.NewGatewayClient(cfg.gatewayBaseURL, cfg.gatewaySandboxKey)
@@ -116,6 +119,7 @@ type config struct {
 	s1BaseURL, s1C5Token               string
 	gatewayBaseURL, gatewaySandboxKey  string // optional -- see OC_GATEWAY_* below
 	proofrunBaseURL                    string // optional -- see OC_PROOFRUN_BASE_URL below
+	stuckOrderMinutes                  int    // optional -- see OC_STUCK_ORDER_MINUTES below
 }
 
 // configFromEnv reads every OC_* config value -- required, no default,
@@ -164,6 +168,17 @@ func configFromEnv() (config, error) {
 	// wraps proofrun's own driver, which has no auth of its own to
 	// configure -- see opclient.ProofrunClient's own doc comment.
 	cfg.proofrunBaseURL = os.Getenv("OC_PROOFRUN_BASE_URL")
+
+	// Optional, defaults to 30 (httpapi.Server's own zero-value fallback)
+	// -- how long a dispatching order may sit with no reservation and no
+	// dispatch record before getAlerts' orphaned-order check flags it.
+	if raw := os.Getenv("OC_STUCK_ORDER_MINUTES"); raw != "" {
+		minutes, err := strconv.Atoi(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("opsconsoled: OC_STUCK_ORDER_MINUTES: %w", err)
+		}
+		cfg.stuckOrderMinutes = minutes
+	}
 
 	return cfg, nil
 }

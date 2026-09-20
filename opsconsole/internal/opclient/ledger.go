@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -152,5 +154,54 @@ type LedgerInvariants struct {
 func (c *LedgerClient) GetInvariants(ctx context.Context) (LedgerInvariants, error) {
 	var out LedgerInvariants
 	err := do(ctx, c.http, "ledger", c.token, http.MethodGet, c.baseURL+"/v1/system/invariants", nil, &out)
+	return out, err
+}
+
+// Order is C1's own Order schema (ledger/docs/openapi.yaml).
+type Order struct {
+	ID                int64  `json:"id"`
+	ExternalID        string `json:"external_id"`
+	CustomerID        string `json:"customer_id"`
+	Tier              string `json:"tier"`
+	State             string `json:"state"`
+	AmountIn          string `json:"amount_in"`
+	AmountOut         string `json:"amount_out"`
+	FeeUnits          string `json:"fee_units"`
+	NetworkFeeUnits   string `json:"network_fee_units"`
+	RecipientAddress  string `json:"recipient_address"`
+	SenderAddress     string `json:"sender_address,omitempty"`
+	QuotedAt          string `json:"quoted_at"`
+	QuoteExpiresAt    string `json:"quote_expires_at"`
+	Version           int    `json:"version"`
+	CreatedAt         string `json:"created_at"`
+	UpdatedAt         string `json:"updated_at"`
+}
+
+// OrderList is C1's own GET /v1/orders response shape.
+type OrderList struct {
+	Orders     []Order `json:"orders"`
+	NextCursor string  `json:"next_cursor"`
+}
+
+// GetOrder fetches one order by its external id (GET /v1/orders/{external_id}).
+func (c *LedgerClient) GetOrder(ctx context.Context, externalID string) (Order, error) {
+	var out Order
+	err := do(ctx, c.http, "ledger", c.token, http.MethodGet, c.baseURL+"/v1/orders/"+url.PathEscape(externalID), nil, &out)
+	return out, err
+}
+
+// ListOrders lists orders in state, paginated by cursor (GET /v1/orders --
+// state is required on C1's own real route, there is no unfiltered
+// "list everything" mode).
+func (c *LedgerClient) ListOrders(ctx context.Context, state, updatedAfter string, limit int) (OrderList, error) {
+	q := url.Values{"state": {state}}
+	if updatedAfter != "" {
+		q.Set("updated_after", updatedAfter)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var out OrderList
+	err := do(ctx, c.http, "ledger", c.token, http.MethodGet, c.baseURL+"/v1/orders?"+q.Encode(), nil, &out)
 	return out, err
 }

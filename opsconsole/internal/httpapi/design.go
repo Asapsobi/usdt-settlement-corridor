@@ -272,4 +272,5 @@ const (
 	iconCheck      = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11L4 12"/></svg>`
 	iconSandbox    = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9" stroke-dasharray="2 2"/></svg>`
 	iconManual     = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11.5V6a2 2 0 1 1 4 0v4.5"/><path d="M13 10V5a2 2 0 1 1 4 0v6"/><path d="M17 11V8.5a2 2 0 1 1 4 0V15a7 7 0 0 1-7 7h-1.5a7 7 0 0 1-5.9-3.2l-2.9-4.5a1.7 1.7 0 0 1 2.6-2.2L9 15"/></svg>`
+	iconOrders     = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h4"/></svg>`
 )
