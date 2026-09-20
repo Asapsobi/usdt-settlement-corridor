@@ -258,6 +258,35 @@ func ListActive(ctx context.Context, q Queryer) ([]WatchedAddress, error) {
 	return out, nil
 }
 
+// ListAll lists every watched address regardless of status, newest
+// first, bounded by limit -- unlike ListActive, this includes RETIRED
+// addresses deliberately: the ops console's own Sweep page (see
+// docs/03-build/ops-console-build-prompts.md's OC.11) needs exactly
+// these, since a settled order's own deposit address still holds its
+// real on-chain BEP20 balance until an operator manually sweeps it --
+// "retired" describes this package's own bookkeeping, not what's
+// sitting on-chain.
+func ListAll(ctx context.Context, q Queryer, limit int) ([]WatchedAddress, error) {
+	rows, err := q.Query(ctx, selectSQL+` ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("addresses: list all: %w", err)
+	}
+	defer rows.Close()
+
+	var out []WatchedAddress
+	for rows.Next() {
+		wa, err := scanWatchedAddress(rows)
+		if err != nil {
+			return nil, fmt.Errorf("addresses: list all: %w", err)
+		}
+		out = append(out, wa)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("addresses: list all: %w", err)
+	}
+	return out, nil
+}
+
 // mapTransitionError turns migration 0002's RAISE EXCEPTION (Postgres
 // error code P0001, plpgsql's generic "raised exception" class) into
 // ErrIllegalStatusTransition. Anything else is a genuine, unclassified

@@ -36,6 +36,14 @@ type Config struct {
 	// provider must fail or disagree before ProviderHealthSnapshot marks
 	// it unhealthy. Defaults to 3 if zero or negative.
 	UnhealthyAfterConsecutiveFailures int
+
+	// FinalityTolerance is how many blocks apart two providers'
+	// self-reported "finalized" heights may be and still be checked for
+	// agreement, rather than one being discarded outright as too far
+	// behind. See LatestFinalized's own doc comment for why an exact,
+	// same-instant match is the wrong bar on a chain that finalizes
+	// roughly once a block. Defaults to 5 if zero or negative.
+	FinalityTolerance uint64
 }
 
 // ErrTooFewProviders is returned by NewPool for fewer than 2 providers --
@@ -48,9 +56,10 @@ var ErrTooFewProviders = errors.New("chain: at least 2 providers are required (n
 // result only when enough of them agree. It never speaks for a single
 // provider on its own.
 type Pool struct {
-	providers      []Provider
-	minAgreement   int
-	unhealthyAfter int
+	providers         []Provider
+	minAgreement      int
+	unhealthyAfter    int
+	finalityTolerance uint64
 
 	mu     sync.Mutex
 	health map[string]*health
@@ -94,11 +103,17 @@ func NewPool(providers []Provider, cfg Config) (*Pool, error) {
 		unhealthyAfter = 3
 	}
 
+	finalityTolerance := cfg.FinalityTolerance
+	if finalityTolerance <= 0 {
+		finalityTolerance = 5
+	}
+
 	p := &Pool{
-		providers:      append([]Provider(nil), providers...), // defensive copy
-		minAgreement:   minAgreement,
-		unhealthyAfter: unhealthyAfter,
-		health:         make(map[string]*health, len(providers)),
+		providers:         append([]Provider(nil), providers...), // defensive copy
+		minAgreement:      minAgreement,
+		unhealthyAfter:    unhealthyAfter,
+		finalityTolerance: finalityTolerance,
+		health:            make(map[string]*health, len(providers)),
 	}
 	for _, prov := range providers {
 		p.health[prov.Name] = &health{}

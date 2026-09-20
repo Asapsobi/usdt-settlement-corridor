@@ -227,6 +227,64 @@ func TestLatestFinalized_AmbiguousAgreement_HardError(t *testing.T) {
 	}
 }
 
+func TestLatestFinalized_ProvidersWithinTolerance_NormalizeAndAgree(t *testing.T) {
+	pool, a, b := twoNodePool(t, 2)
+
+	block1000 := testHeader(1000, hash(9))
+	h1000 := block1000.Hash()
+
+	a.setFinalized(1000, h1000)
+	b.setBlock(1000, block1000)    // what B is asked for while normalizing onto the shared reference height
+	b.setFinalized(1002, hash(77)) // B's own self-reported point, 2 ahead of A -- within the default 5-block tolerance
+
+	height, agreedHash, err := pool.LatestFinalized(context.Background())
+	if err != nil {
+		t.Fatalf("expected success (both agree once normalized onto height 1000), got %v", err)
+	}
+	if height != 1000 || agreedHash != h1000 {
+		t.Fatalf("got (%d, %s), want (1000, %s)", height, agreedHash, h1000)
+	}
+	for _, h := range pool.ProviderHealthSnapshot() {
+		if !h.Healthy || h.ConsecutiveFailures != 0 {
+			t.Fatalf("provider %s should be healthy after agreeing once normalized: %+v", h.Name, h)
+		}
+	}
+}
+
+func TestLatestFinalized_ProvidersWithinTolerance_ButDisagreeOnceNormalized_HardError(t *testing.T) {
+	pool, a, b := twoNodePool(t, 2)
+
+	blockA := testHeader(1000, hash(9))
+	blockB := testHeader(1000, hash(10)) // same height, different parent -- a genuinely different block
+
+	a.setFinalized(1000, blockA.Hash())
+	b.setBlock(1000, blockB) // B's own view of height 1000 disagrees with A's
+	b.setFinalized(1002, hash(77))
+
+	_, _, err := pool.LatestFinalized(context.Background())
+	if !errors.Is(err, ErrNoAgreement) {
+		t.Fatalf("expected ErrNoAgreement (a real disagreement must survive normalization, not be papered over), got %v", err)
+	}
+}
+
+func TestLatestFinalized_ProviderTooFarBehind_ExcludedLikeAFailure(t *testing.T) {
+	pool, a, b := twoNodePool(t, 2)
+	a.setFinalized(1000, hash(1))
+	b.setFinalized(994, hash(1)) // 6 blocks behind -- past the default 5-block tolerance
+
+	_, _, err := pool.LatestFinalized(context.Background())
+	if !errors.Is(err, ErrNoAgreement) {
+		t.Fatalf("expected ErrNoAgreement (B too far behind to count toward agreement), got %v", err)
+	}
+	snap := healthByName(pool)
+	if snap["B"].ConsecutiveFailures != 1 {
+		t.Fatalf("expected B to be recorded as a failure for being too far behind, got %+v", snap["B"])
+	}
+	if snap["A"].ConsecutiveFailures != 0 {
+		t.Fatalf("A did nothing wrong and should not be penalized just because B lagged: %+v", snap["A"])
+	}
+}
+
 // ---------------------------------------------------------------------
 // Provider health
 // ---------------------------------------------------------------------

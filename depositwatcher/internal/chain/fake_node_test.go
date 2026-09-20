@@ -227,7 +227,22 @@ func (n *fakeNode) handleGetBlockByNumber(w http.ResponseWriter, req rpcRequest)
 		writeRPCResult(w, req.ID, nil) // a real node returns JSON null for a block that doesn't exist yet
 		return
 	}
-	writeRPCResult(w, req.ID, header)
+	// A real eth_getBlockByNumber response includes "hash" as a field the
+	// node computes and returns directly -- it's not part of types.Header
+	// itself (which is why plain json.Marshal(header) below wouldn't have
+	// it), so it's added explicitly here, the same way LatestFinalized's
+	// normalize-by-height path (queryBlockHashAt) expects to find it on
+	// any real node.
+	raw, err := json.Marshal(header)
+	if err != nil {
+		panic(err) // fixture bug, not a test assertion
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		panic(err)
+	}
+	fields["hash"] = header.Hash().Hex()
+	writeRPCResult(w, req.ID, fields)
 }
 
 func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any) {

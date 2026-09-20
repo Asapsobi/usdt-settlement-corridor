@@ -70,6 +70,28 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Address" }
         "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      summary: List every watched address, newest first
+      description: >
+        Includes RETIRED addresses deliberately -- a settled order's own
+        deposit address still holds its real on-chain balance until an
+        operator manually sweeps it (the ops console's own Sweep page).
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 100 }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  addresses:
+                    type: array
+                    items: { $ref: "#/components/schemas/Address" }
 
   /v1/addresses/{order_id}:
     get:
@@ -83,6 +105,27 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Address" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/addresses/{order_id}/balance:
+    get:
+      summary: Current on-chain balance of the watched token at this address
+      description: >
+        Single-provider read, advisory only (see chain.Pool.ERC20BalanceOf's
+        own doc comment) -- the ops console's own Sweep page.
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  address: { type: string }
+                  balance_raw: { type: string, description: "raw token units, as a decimal string" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: No RPC provider pool is configured on this instance. }
 
   /v1/addresses/{order_id}/retire:
     post:
@@ -302,6 +345,7 @@ components:
       type: object
       properties:
         address: { type: string }
+        derivation_index: { type: integer }
         order_id: { type: integer, format: int64 }
         external_id: { type: string }
         customer_id: { type: string }

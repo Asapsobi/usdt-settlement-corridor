@@ -157,7 +157,7 @@ func TestRunIngestionLoop_ScansForwardAndAdvancesCursor(t *testing.T) {
 	hashes := chainOfBlocks(node, 5)
 	pool := twoProviderPoolFor(t, node)
 
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatalf("tick failed: %v", err)
 	}
 
@@ -182,7 +182,7 @@ func TestRunIngestionLoop_ScansForwardAndAdvancesCursor(t *testing.T) {
 
 	// A second tick with nothing new must be a no-op, not an error and
 	// not a re-scan.
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatalf("second (no-op) tick failed: %v", err)
 	}
 	if got := lastScanned(t, database); got != 5 {
@@ -203,7 +203,7 @@ func TestRunIngestionLoop_IsResumable(t *testing.T) {
 	// Simulate the chain having only reached height 4 on the first tick
 	// (e.g., that's all that existed yet), then advancing later.
 	node.setTip(4)
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatal(err)
 	}
 	if got := lastScanned(t, database); got != 4 {
@@ -211,7 +211,7 @@ func TestRunIngestionLoop_IsResumable(t *testing.T) {
 	}
 
 	node.setTip(10)
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatal(err)
 	}
 	if got := lastScanned(t, database); got != 10 {
@@ -221,6 +221,52 @@ func TestRunIngestionLoop_IsResumable(t *testing.T) {
 	if count != 10 || minH != 1 || maxH != 10 {
 		t.Fatalf("seen_blocks: count=%d min=%d max=%d, want count=10 min=1 max=10 -- "+
 			"a gap or a skip means resumption re-derived the wrong starting point", count, minH, maxH)
+	}
+}
+
+// TestRunIngestionLoop_CapsBlocksPerTick is the regression test for the
+// race this cap exists to fix: before it existed, a tick that captured a
+// huge [lastScanned+1, tip] range ran to completion -- often hours on a
+// real backlog -- before ever re-reading last_scanned, silently
+// clobbering any external cursor write (e.g. the ops console's own
+// override, OC.4) made while that tick was in flight. A capped tick
+// must stop at maxBlocksPerTick and let the NEXT tick pick up wherever
+// last_scanned actually is by then, including a value changed
+// externally in between.
+func TestRunIngestionLoop_CapsBlocksPerTick(t *testing.T) {
+	dbURL := testDatabaseURL(t)
+	applyMigrations(t, dbURL)
+	database := testDBPool(t, dbURL)
+	resetIngestionState(t, database)
+
+	node := newFakeNode()
+	const totalBlocks = 100
+	const cap = 10
+	chainOfBlocks(node, totalBlocks)
+	pool := twoProviderPoolFor(t, node)
+
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, cap); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastScanned(t, database); got != cap {
+		t.Fatalf("last_scanned = %d after one tick, want exactly the cap (%d) even though tip is %d",
+			got, cap, totalBlocks)
+	}
+
+	// An external write between ticks (standing in for the console's own
+	// cursor override) must be respected by the NEXT tick, not overrun --
+	// this is the whole reason the cap exists.
+	if _, err := database.Exec(context.Background(),
+		`UPDATE ingestion_cursor SET last_scanned = $1 WHERE id = 1`, int64(50)); err != nil {
+		t.Fatalf("simulating an external cursor override: %v", err)
+	}
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, cap); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastScanned(t, database); got != 60 {
+		t.Fatalf("last_scanned = %d after the next tick, want 60 (the override's 50, plus one capped tick of %d) -- "+
+			"a value here that ignores the override means the tick re-read stale state instead of the external write",
+			got, cap)
 	}
 }
 
@@ -238,7 +284,7 @@ func TestRunIngestionLoop_DetectsParentHashMismatch(t *testing.T) {
 	chainOfBlocks(node, 5)
 	pool := twoProviderPoolFor(t, node)
 
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatal(err)
 	}
 	if got := lastScanned(t, database); got != 5 {
@@ -255,7 +301,7 @@ func TestRunIngestionLoop_DetectsParentHashMismatch(t *testing.T) {
 	node.setTip(6)
 
 	logs := captureSlog(t)
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatalf("tick with a mismatch must not error -- advisory only, loop must continue: %v", err)
 	}
 
@@ -292,7 +338,7 @@ func TestRunIngestionLoop_SeenBlocksNeverGrowsUnbounded(t *testing.T) {
 	// much faster to run repeatedly than an actual wall-clock soak,
 	// while exercising the exact same repeated insert-then-prune path
 	// on every single block, not just a single before/after snapshot.
-	if err := runIngestionTick(context.Background(), pool, database, window); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, window, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,7 +465,7 @@ func TestRunIngestionLoop_KillMidScanAndRestart(t *testing.T) {
 	// quickly.
 	node.setFinalizedDelay(0)
 	pool := twoProviderPoolFor(t, node)
-	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow); err != nil {
+	if err := runIngestionTick(context.Background(), pool, database, DefaultSeenBlocksWindow, DefaultMaxBlocksPerTick); err != nil {
 		t.Fatalf("resumed tick failed: %v", err)
 	}
 

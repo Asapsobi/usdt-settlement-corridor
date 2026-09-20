@@ -6,6 +6,7 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -23,12 +24,13 @@ import (
 // depend on either (GET /system/providers, GET /system/invariants)
 // degrade explicitly rather than panic -- see their own doc comments.
 type Server struct {
-	Pool      *db.Pool
-	ChainPool *chain.Pool
-	Tracker   *finality.Tracker
-	Auth      AuthConfig
-	Metrics   *Metrics
-	BuildInfo func() (version, commit string)
+	Pool            *db.Pool
+	ChainPool       *chain.Pool
+	Tracker         *finality.Tracker
+	ContractAddress common.Address // the watched BEP20 token; zero value if ChainPool is nil
+	Auth            AuthConfig
+	Metrics         *Metrics
+	BuildInfo       func() (version, commit string)
 }
 
 // NewRouter builds the full route table. /healthz, /readyz, and /metrics
@@ -56,7 +58,9 @@ func NewRouter(s *Server) http.Handler {
 		r.Use(authMiddleware(s.Auth))
 
 		r.With(requireIdempotencyKey).Post("/addresses", s.postAddress)
+		r.Get("/addresses", s.getAddresses)
 		r.Get("/addresses/{order_id}", s.getAddress)
+		r.Get("/addresses/{order_id}/balance", s.getAddressBalance)
 		r.With(requireIdempotencyKey).Post("/addresses/{order_id}/retire", s.postRetireAddress)
 
 		r.Get("/orphaned-deposits", s.getOrphanedDeposits)

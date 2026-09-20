@@ -77,6 +77,7 @@ func run() error {
 	if eng != nil {
 		server.ChainPool = eng.chainPool
 		server.Tracker = eng.tracker
+		server.ContractAddress = eng.cfg.ContractAddress
 	}
 	router := httpapi.NewRouter(server)
 

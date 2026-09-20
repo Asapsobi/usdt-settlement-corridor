@@ -596,3 +596,52 @@ func TestPostCursor_ThenGetReflectsIt(t *testing.T) {
 		t.Errorf("last_candidate_scanned = %v, want 400", got["last_candidate_scanned"])
 	}
 }
+
+func TestGetAddresses_IncludesRetired(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	orderID := uniqueOrderID()
+	var assigned addressDTO
+	call(t, srv, http.MethodPost, "/v1/addresses", "list-key-1", postAddressBody(orderID, fmt.Sprintf("list-ext-%d", orderID), "cust-1"), &assigned)
+	call(t, srv, http.MethodPost, fmt.Sprintf("/v1/addresses/%d/retire", orderID), "list-key-2", map[string]any{"reason": "settled"}, &addressDTO{})
+
+	var got struct {
+		Addresses []addressDTO `json:"addresses"`
+	}
+	status := call(t, srv, http.MethodGet, "/v1/addresses", "", nil, &got)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	found := false
+	for _, a := range got.Addresses {
+		if a.OrderID == orderID {
+			found = true
+			if a.Status != "RETIRED" {
+				t.Errorf("status = %q, want RETIRED", a.Status)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("retired address for order %d not present in GET /v1/addresses -- RETIRED must not be filtered out", orderID)
+	}
+}
+
+func TestGetAddressBalance_NotConfigured_Returns503(t *testing.T) {
+	pool := testPool(t)
+	srv := newTestServer(t, pool)
+	defer srv.Close()
+
+	orderID := uniqueOrderID()
+	call(t, srv, http.MethodPost, "/v1/addresses", "bal-key-1", postAddressBody(orderID, fmt.Sprintf("bal-ext-%d", orderID), "cust-1"), &addressDTO{})
+
+	var errBody errorDTO
+	status := call(t, srv, http.MethodGet, fmt.Sprintf("/v1/addresses/%d/balance", orderID), "", nil, &errBody)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if errBody.Error.Code != "system_component_not_ready" {
+		t.Fatalf("error code = %q, want system_component_not_ready", errBody.Error.Code)
+	}
+}

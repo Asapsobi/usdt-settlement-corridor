@@ -22,10 +22,34 @@ const DefaultSeenBlocksWindow = 200
 // blocks when IngestionConfig.Interval is unset.
 const DefaultIngestionInterval = 3 * time.Second
 
+// DefaultMaxBlocksPerTick bounds how many blocks a single ingestion tick
+// processes when IngestionConfig.MaxBlocksPerTick is unset -- see that
+// field's own doc comment for why an unbounded tick is a real problem,
+// not just a large one.
+const DefaultMaxBlocksPerTick = 2000
+
 // IngestionConfig controls RunIngestionLoop's cadence and retention.
 type IngestionConfig struct {
 	Interval time.Duration // zero means DefaultIngestionInterval
 	Window   uint64        // zero means DefaultSeenBlocksWindow
+
+	// MaxBlocksPerTick bounds how many blocks runIngestionTick processes
+	// in one call, regardless of how large [lastScanned+1, tip] is.
+	// Without this, a watcher that's fallen far behind tip (a real outage,
+	// or simply having been off for a while) captures the ENTIRE backlog
+	// as a single tick and runs it to completion -- often hours -- before
+	// ever re-reading last_scanned from the database again. That's not
+	// just slow: an operator using the console's own cursor-override
+	// (OC.4, for exactly the case of skipping a backlog free RPC
+	// providers can no longer serve) has their write silently clobbered
+	// the whole time, since the in-flight tick keeps unconditionally
+	// overwriting last_scanned with its own stale, already-captured
+	// progression until it finally finishes. Capping the range means a
+	// tick that hits a large backlog still returns within one interval,
+	// so an external cursor change takes effect on the very next tick
+	// instead of being invisible for hours. Zero means
+	// DefaultMaxBlocksPerTick.
+	MaxBlocksPerTick uint64
 }
 
 func (c IngestionConfig) withDefaults() IngestionConfig {
@@ -34,6 +58,9 @@ func (c IngestionConfig) withDefaults() IngestionConfig {
 	}
 	if c.Window == 0 {
 		c.Window = DefaultSeenBlocksWindow
+	}
+	if c.MaxBlocksPerTick == 0 {
+		c.MaxBlocksPerTick = DefaultMaxBlocksPerTick
 	}
 	return c
 }
@@ -62,7 +89,7 @@ func RunIngestionLoop(ctx context.Context, rpcPool *Pool, database *db.Pool, cfg
 	// Run once immediately rather than waiting a full interval before the
 	// first tick -- a freshly started watcher shouldn't sit idle for up
 	// to cfg.Interval before doing any work.
-	if err := runIngestionTick(ctx, rpcPool, database, cfg.Window); err != nil {
+	if err := runIngestionTick(ctx, rpcPool, database, cfg.Window, cfg.MaxBlocksPerTick); err != nil {
 		slog.Error("ingestion: initial tick failed", "error", err)
 	}
 
@@ -71,14 +98,14 @@ func RunIngestionLoop(ctx context.Context, rpcPool *Pool, database *db.Pool, cfg
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := runIngestionTick(ctx, rpcPool, database, cfg.Window); err != nil {
+			if err := runIngestionTick(ctx, rpcPool, database, cfg.Window, cfg.MaxBlocksPerTick); err != nil {
 				slog.Error("ingestion: tick failed", "error", err)
 			}
 		}
 	}
 }
 
-func runIngestionTick(ctx context.Context, rpcPool *Pool, database *db.Pool, window uint64) error {
+func runIngestionTick(ctx context.Context, rpcPool *Pool, database *db.Pool, window, maxBlocksPerTick uint64) error {
 	lastScanned, err := getLastScanned(ctx, database)
 	if err != nil {
 		return err
@@ -92,6 +119,9 @@ func runIngestionTick(ctx context.Context, rpcPool *Pool, database *db.Pool, win
 
 	if tip <= lastScanned {
 		return nil // nothing new since the last tick
+	}
+	if tip-lastScanned > maxBlocksPerTick {
+		tip = lastScanned + maxBlocksPerTick
 	}
 
 	for height := lastScanned + 1; height <= tip; height++ {

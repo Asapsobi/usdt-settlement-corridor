@@ -5,25 +5,29 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"depositwatcher/internal/addresses"
 )
 
 type addressResponse struct {
-	Address        string     `json:"address"`
-	OrderID        int64      `json:"order_id"`
-	ExternalID     string     `json:"external_id"`
-	CustomerID     string     `json:"customer_id"`
-	Status         string     `json:"status"`
-	QuotedAt       time.Time  `json:"quoted_at"`
-	QuoteExpiresAt time.Time  `json:"quote_expires_at"`
-	AssignedAt     time.Time  `json:"assigned_at"`
-	RetiredAt      *time.Time `json:"retired_at,omitempty"`
-	RetiredReason  *string    `json:"retired_reason,omitempty"`
+	Address         string     `json:"address"`
+	DerivationIndex uint32     `json:"derivation_index"`
+	OrderID         int64      `json:"order_id"`
+	ExternalID      string     `json:"external_id"`
+	CustomerID      string     `json:"customer_id"`
+	Status          string     `json:"status"`
+	QuotedAt        time.Time  `json:"quoted_at"`
+	QuoteExpiresAt  time.Time  `json:"quote_expires_at"`
+	AssignedAt      time.Time  `json:"assigned_at"`
+	RetiredAt       *time.Time `json:"retired_at,omitempty"`
+	RetiredReason   *string    `json:"retired_reason,omitempty"`
 }
 
 func toAddressResponse(wa addresses.WatchedAddress) addressResponse {
 	return addressResponse{
-		Address: string(wa.Address), OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
+		Address: string(wa.Address), DerivationIndex: wa.DerivationIndex, OrderID: wa.OrderID,
+		ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
 		Status: string(wa.Status), QuotedAt: wa.QuotedAt, QuoteExpiresAt: wa.QuoteExpiresAt,
 		AssignedAt: wa.AssignedAt, RetiredAt: wa.RetiredAt, RetiredReason: wa.RetiredReason,
 	}
@@ -81,6 +85,61 @@ func (s *Server) postAddress(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = addr // already reflected in wa.Address; kept for clarity that Assign's own return value is the source of truth for what was assigned
 	respondJSON(w, http.StatusOK, toAddressResponse(wa))
+}
+
+// getAddresses is GET /v1/addresses -- lists every watched address
+// regardless of status, newest first (ops-console-build-prompts.md's
+// OC.11: the console's own Sweep page needs RETIRED addresses too,
+// since a settled order's deposit address still holds its real on-chain
+// balance until an operator manually sweeps it).
+func (s *Server) getAddresses(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "limit must be a positive integer"))
+			return
+		}
+		limit = parsed
+	}
+	list, err := addresses.ListAll(r.Context(), s.Pool, limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := make([]addressResponse, len(list))
+	for i, wa := range list {
+		out[i] = toAddressResponse(wa)
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"addresses": out})
+}
+
+// getAddressBalance is GET /v1/addresses/{order_id}/balance -- an
+// on-demand, single-provider read (see chain.Pool.ERC20BalanceOf's own
+// doc comment for why this one doesn't need 2-provider agreement) of
+// the watched token's current balance at that address. 503
+// system_component_not_ready if this instance has no ChainPool
+// configured, same posture as getProviders.
+func (s *Server) getAddressBalance(w http.ResponseWriter, r *http.Request) {
+	orderID, ok := orderIDParam(w, r)
+	if !ok {
+		return
+	}
+	if s.ChainPool == nil {
+		writeAPIError(w, errSystemComponentNotReady)
+		return
+	}
+	wa, err := addresses.GetByOrderID(r.Context(), s.Pool, orderID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	balance, err := s.ChainPool.ERC20BalanceOf(r.Context(), s.ContractAddress, common.HexToAddress(string(wa.Address)))
+	if err != nil {
+		writeAPIError(w, newAPIError(http.StatusBadGateway, "upstream_error", "reading on-chain balance: "+err.Error()))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"address": string(wa.Address), "balance_raw": balance.String()})
 }
 
 // getAddress is GET /v1/addresses/{order_id}.

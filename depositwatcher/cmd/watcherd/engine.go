@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,7 +98,16 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		}
 		providers = append(providers, chain.Provider{Name: name, Client: client})
 	}
-	chainPool, err := chain.NewPool(providers, chain.Config{})
+	var finalityTolerance uint64
+	if raw := os.Getenv("WATCHER_FINALITY_TOLERANCE_BLOCKS"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("watcherd: WATCHER_FINALITY_TOLERANCE_BLOCKS: %w", err)
+		}
+		finalityTolerance = parsed
+	}
+
+	chainPool, err := chain.NewPool(providers, chain.Config{FinalityTolerance: finalityTolerance})
 	if err != nil {
 		return nil, fmt.Errorf("watcherd: building RPC provider pool: %w", err)
 	}
