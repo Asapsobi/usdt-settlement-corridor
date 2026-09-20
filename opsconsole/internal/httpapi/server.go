@@ -150,6 +150,14 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/sandbox/orders", s.getSandboxOrders)
 
+		r.Get("/gateway/api-keys", s.getGatewayAPIKeys)
+		r.Post("/gateway/api-keys/{id}/rotate", s.postGatewayAPIKeyRotate)
+		r.Post("/gateway/api-keys/{id}/revoke", s.postGatewayAPIKeyRevoke)
+		r.Get("/gateway/webhooks", s.getGatewayWebhooks)
+		r.Post("/gateway/webhooks/{id}/redrive", s.postGatewayWebhookRedrive)
+		r.Get("/gateway/orders", s.getGatewayOrders)
+		r.Get("/gateway/rate-limits", s.getGatewayRateLimits)
+
 		r.Get("/manual/payout", s.getManualFlow)
 		r.Post("/manual/payout", s.postManualFlow)
 

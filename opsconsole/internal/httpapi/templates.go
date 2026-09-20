@@ -42,6 +42,7 @@ var navItems = []navItem{
 	{"/screening/holds", "Screening", iconScreening},
 	{"/dispatcher/slots", "Dispatcher", iconDispatcher},
 	{"/s1/approvals", "S1", iconKey},
+	{"/gateway/api-keys", "Gateway", iconGateway},
 	{"/sandbox/orders", "Sandbox", iconSandbox},
 	{"/manual/payout", "Manual Flow", iconManual},
 	{"/audit", "Audit", iconAudit},
@@ -141,6 +142,10 @@ func MustLoadTemplates() *Templates {
 		"screening_rescreen":    screeningRescreenContent,
 		"screening_results":     screeningResultsContent,
 		"screening_queue":       screeningQueueContent,
+		"gateway_api_keys":      gatewayAPIKeysContent,
+		"gateway_webhooks":      gatewayWebhooksContent,
+		"gateway_orders":        gatewayOrdersContent,
+		"gateway_rate_limits":   gatewayRateLimitsContent,
 		"audit":                 auditContent,
 	}
 	funcs := template.FuncMap{

@@ -71,8 +71,8 @@ func run() error {
 
 		StuckOrderMinutes: cfg.stuckOrderMinutes,
 	}
-	if cfg.gatewayBaseURL != "" && cfg.gatewaySandboxKey != "" {
-		server.Gateway = opclient.NewGatewayClient(cfg.gatewayBaseURL, cfg.gatewaySandboxKey)
+	if cfg.gatewayBaseURL != "" {
+		server.Gateway = opclient.NewGatewayClient(cfg.gatewayBaseURL, cfg.gatewaySandboxKey, cfg.gatewayAdminToken)
 	}
 	if cfg.proofrunBaseURL != "" {
 		server.Proofrun = opclient.NewProofrunClient(cfg.proofrunBaseURL)
@@ -118,6 +118,7 @@ type config struct {
 	dispatcherBaseURL, dispatcherToken string
 	s1BaseURL, s1C5Token               string
 	gatewayBaseURL, gatewaySandboxKey  string // optional -- see OC_GATEWAY_* below
+	gatewayAdminToken                  string // optional -- see OC_GATEWAY_* below
 	proofrunBaseURL                    string // optional -- see OC_PROOFRUN_BASE_URL below
 	stuckOrderMinutes                  int    // optional -- see OC_STUCK_ORDER_MINUTES below
 }
@@ -157,12 +158,17 @@ func configFromEnv() (config, error) {
 	}
 
 	// Optional, unlike every other service above: the console works
-	// fully without a sandbox demo set to show. Gateway also has no
-	// operator-auth concept of its own (see docs/03-build/
-	// ops-console-build-prompts.md's OC.12) -- OC_GATEWAY_SANDBOX_KEY is
-	// one sandbox customer's own sk_test_ key, never a production one.
+	// fully without a sandbox demo set to show, and without gateway's
+	// own admin surface (OC.19) configured. Two independent, never-
+	// interchangeable credentials -- OC_GATEWAY_SANDBOX_KEY is one
+	// sandbox customer's own sk_test_ key (never production), and
+	// OC_GATEWAY_ADMIN_TOKEN is one of gateway's own
+	// GATEWAY_ADMIN_TOKENS service tokens (never a customer key of
+	// either kind). Either may be left unset if that half of gateway's
+	// surface isn't wanted from this console.
 	cfg.gatewayBaseURL = os.Getenv("OC_GATEWAY_BASE_URL")
 	cfg.gatewaySandboxKey = os.Getenv("OC_GATEWAY_SANDBOX_KEY")
+	cfg.gatewayAdminToken = os.Getenv("OC_GATEWAY_ADMIN_TOKEN")
 
 	// Also optional, same reasoning: the manual-flow page (OC.13) only
 	// wraps proofrun's own driver, which has no auth of its own to
