@@ -95,6 +95,8 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/deposits/watching", s.getDepositsWatching)
 		r.Post("/deposits/{order_id}/confirm", s.postConfirmDeposit)
 
+		r.Get("/aml/exposure", s.getAMLExposure)
+
 		r.Get("/ledger/halt", s.getLedgerHalt)
 		r.Post("/ledger/halt/set", s.postLedgerHaltSet)
 		r.Post("/ledger/halt/clear", s.postLedgerHaltClear)

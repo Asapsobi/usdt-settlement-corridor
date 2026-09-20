@@ -3,6 +3,7 @@ package opclient
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -83,4 +84,28 @@ func (c *ScreeningClient) ReleaseHold(ctx context.Context, id int64, reviewer, n
 func (c *ScreeningClient) RejectHold(ctx context.Context, id int64, reviewer, note string) error {
 	body := map[string]string{"reviewer": reviewer, "note": note}
 	return do(ctx, c.http, "screening", c.token, http.MethodPost, c.baseURL+"/v1/holds/"+strconv.FormatInt(id, 10)+"/reject", body, nil)
+}
+
+// ScreeningResult is C3's own GET /v1/screening-results row shape.
+type ScreeningResult struct {
+	ID            int64     `json:"id"`
+	ProviderName  string    `json:"provider_name"`
+	SenderAddress string    `json:"sender_address"`
+	RiskScore     float64   `json:"risk_score"`
+	Flagged       bool      `json:"flagged"`
+	ReasonCodes   []string  `json:"reason_codes"`
+	CheckedAt     time.Time `json:"checked_at"`
+}
+
+// GetScreeningResults calls C3's own GET /v1/screening-results --
+// senderAddress is REQUIRED on the real route (an audit lookup for one
+// already-known address, not a general browse-everything listing; there
+// is no route to discover flagged addresses other than by already
+// having one, e.g. from a hold's own funding order).
+func (c *ScreeningClient) GetScreeningResults(ctx context.Context, senderAddress string) ([]ScreeningResult, error) {
+	var out struct {
+		ScreeningResults []ScreeningResult `json:"screening_results"`
+	}
+	err := do(ctx, c.http, "screening", c.token, http.MethodGet, c.baseURL+"/v1/screening-results?sender_address="+url.QueryEscape(senderAddress), nil, &out)
+	return out.ScreeningResults, err
 }

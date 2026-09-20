@@ -34,6 +34,7 @@ var navItems = []navItem{
 	{"/alerts", "Alerts", iconAlert},
 	{"/wallets", "Wallets", iconWallet},
 	{"/deposits/watching", "Deposits", iconDeposit},
+	{"/aml/exposure", "AML", iconExposure},
 	{"/ledger/halt", "Ledger", iconLedger},
 	{"/watcher/cursor", "Watcher", iconWatcher},
 	{"/broker/reservations?status=FAILED", "Broker", iconBroker},
@@ -123,6 +124,7 @@ func MustLoadTemplates() *Templates {
 		"wallets":             walletsContent,
 		"sweep_slot":          sweepSlotContent,
 		"deposits_watching":   depositsWatchingContent,
+		"aml_exposure":        amlExposureContent,
 		"audit":               auditContent,
 	}
 	funcs := template.FuncMap{
