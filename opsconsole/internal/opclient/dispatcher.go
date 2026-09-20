@@ -100,3 +100,35 @@ func (c *DispatcherClient) GetDispatch(ctx context.Context, orderID int64) (Disp
 	err := do(ctx, c.http, "dispatcher", c.token, http.MethodGet, c.baseURL+"/v1/dispatch/"+strconv.FormatInt(orderID, 10), nil, &out)
 	return out, err
 }
+
+// SweepResult is C5's own sweepResponse shape (dispatcher/docs/openapi.yaml's
+// SweepResponse) -- status is SIGNED or PENDING.
+type SweepResult struct {
+	Status           string `json:"status"`
+	SigningRequestID int64  `json:"signing_request_id"`
+	UnsignedTxHex    string `json:"unsigned_tx_hex,omitempty"`
+	TronTxID         string `json:"tron_txid,omitempty"`
+	SweptAmount      string `json:"swept_amount"`
+}
+
+// SweepSlot calls C5's own POST /v1/slots/{id}/sweep (OC.11) -- builds a
+// real unsigned transfer for the slot's live balance minus
+// reserveAmount and requests S1 to sign it. do() attaches a fresh
+// random Idempotency-Key automatically, same as every other write this
+// client makes.
+func (c *DispatcherClient) SweepSlot(ctx context.Context, id int, destinationAddress, reserveAmount string) (SweepResult, error) {
+	body := map[string]any{"destination_address": destinationAddress, "reserve_amount": reserveAmount}
+	var out SweepResult
+	err := do(ctx, c.http, "dispatcher", c.token, http.MethodPost, c.baseURL+"/v1/slots/"+strconv.Itoa(id)+"/sweep", body, &out)
+	return out, err
+}
+
+// SweepFinalize calls C5's own POST /v1/slots/sweep/finalize -- completes
+// a PENDING sweep once its signing request has been approved via the
+// existing S1 approval queue (OC.7).
+func (c *DispatcherClient) SweepFinalize(ctx context.Context, signingRequestID int64, unsignedTxHex string) (SweepResult, error) {
+	body := map[string]any{"signing_request_id": signingRequestID, "unsigned_tx_hex": unsignedTxHex}
+	var out SweepResult
+	err := do(ctx, c.http, "dispatcher", c.token, http.MethodPost, c.baseURL+"/v1/slots/sweep/finalize", body, &out)
+	return out, err
+}

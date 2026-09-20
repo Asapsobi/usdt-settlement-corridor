@@ -88,6 +88,9 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/orders/{external_id}", s.getOrderDetail)
 		r.Get("/alerts", s.getAlerts)
 		r.Get("/wallets", s.getWallets)
+		r.Get("/wallets/{id}/sweep", s.getSweepSlot)
+		r.Post("/wallets/{id}/sweep", s.postSweepSlot)
+		r.Post("/wallets/sweep/finalize", s.postSweepFinalize)
 
 		r.Get("/ledger/halt", s.getLedgerHalt)
 		r.Post("/ledger/halt/set", s.postLedgerHaltSet)

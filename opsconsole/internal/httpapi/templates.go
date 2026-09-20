@@ -120,6 +120,7 @@ func MustLoadTemplates() *Templates {
 		"order_detail":        orderDetailContent,
 		"alerts":              alertsContent,
 		"wallets":             walletsContent,
+		"sweep_slot":          sweepSlotContent,
 		"audit":               auditContent,
 	}
 	funcs := template.FuncMap{
