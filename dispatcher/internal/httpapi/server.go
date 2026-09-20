@@ -25,6 +25,7 @@ import (
 	"dispatcher/internal/db"
 	"dispatcher/internal/dispatch"
 	"dispatcher/internal/ledgerclient"
+	"dispatcher/internal/signing"
 	"dispatcher/internal/slots"
 )
 
@@ -38,9 +39,19 @@ type Server struct {
 	// held here too because slot selection needs GetAccountBalance
 	// (slots.BalanceReader), a method dispatch.LedgerClient's own
 	// narrower interface doesn't expose.
-	Ledger    *ledgerclient.Client
-	SlotCaps  slots.Caps
-	Metrics   *Metrics
+	Ledger   *ledgerclient.Client
+	SlotCaps slots.Caps
+	Metrics  *Metrics
+
+	// Signing, Chain, and TronAPIBaseURL back the sweep route (OC.11)
+	// only -- the same real S1 client and TRON gRPC connection the
+	// orchestrate loop already uses for every real payout, not a second,
+	// independently-built pair. May be nil/empty if dispatchd is ever
+	// run without a live engine; the sweep route itself requires them.
+	Signing        *signing.Client
+	Chain          *dispatch.GrpcBroadcastClient
+	TronAPIBaseURL string
+
 	BuildInfo func() (version, commit string)
 }
 
@@ -75,6 +86,8 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/slots", s.getSlots)
 		r.Post("/slots/{id}/retire", s.postRetireSlot)
+		r.Post("/slots/{id}/sweep", s.postSweepSlot)
+		r.Post("/slots/sweep/finalize", s.postSweepFinalize)
 
 		r.Get("/system/invariants", s.getSystemInvariants)
 	})

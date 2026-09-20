@@ -175,7 +175,11 @@ func usdtBalance(ctx context.Context, apiBaseURL, address string) (money.Amount,
 		return 0, fmt.Errorf("decoding TronGrid response: %w", err)
 	}
 	if len(payload.Data) == 0 {
-		return 0, fmt.Errorf("TronGrid returned no account data for %s", address)
+		// A TRON address with no on-chain activity ever has no "account"
+		// from the chain's own perspective -- TronGrid reports this as
+		// success:true, data:[], not an error. Zero balance, confirmed
+		// live against a real never-activated address.
+		return 0, nil
 	}
 	for _, entry := range payload.Data[0].Trc20 {
 		if raw, ok := entry[usdtContractAddress]; ok {

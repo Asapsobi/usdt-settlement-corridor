@@ -86,6 +86,24 @@ func run() error {
 		return err
 	}
 
+	// Built here, not inside orchestratorFromEnv, so the same real
+	// gRPC/HTTP clients the orchestrate loop uses for every real payout
+	// are also available to the sweep route below (OC.11) -- one
+	// connection each, never a second, independently-constructed TRON
+	// client for the same node.
+	tronGRPCAddr := os.Getenv("DISPATCHER_TRON_GRPC_ADDR")
+	if tronGRPCAddr == "" {
+		return fmt.Errorf("dispatchd: DISPATCHER_TRON_GRPC_ADDR is required")
+	}
+	chain, err := dispatch.NewGrpcBroadcastClient(tronGRPCAddr, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("dispatchd: connecting to TRON node %q: %w", tronGRPCAddr, err)
+	}
+	tronAPIBaseURL := os.Getenv("DISPATCHER_TRON_API_BASE_URL")
+	if tronAPIBaseURL == "" {
+		return fmt.Errorf("dispatchd: DISPATCHER_TRON_API_BASE_URL is required")
+	}
+
 	slotsStore := slots.NewStore(pool)
 	dispatcher := dispatch.NewDispatcher(ledgerClient, dispatch.NewStore(pool), dispatch.NewAttemptStore(pool), signingClient)
 	dispatcher.Batches = dispatch.NewBatchStore(pool)
@@ -93,11 +111,12 @@ func run() error {
 	server := &httpapi.Server{
 		Pool: pool, Auth: auth, Dispatcher: dispatcher, Slots: slotsStore,
 		Ledger: ledgerClient, SlotCaps: slotCaps,
+		Signing: signingClient, Chain: chain, TronAPIBaseURL: tronAPIBaseURL,
 		BuildInfo: func() (string, string) { return "dev", "dev" },
 	}
 	router := httpapi.NewRouter(server)
 
-	orchestrator, orchestrateInterval, err := orchestratorFromEnv(ledgerClient, slotsStore, slotCaps, dispatcher)
+	orchestrator, orchestrateInterval, err := orchestratorFromEnv(ledgerClient, slotsStore, slotCaps, dispatcher, chain, tronAPIBaseURL)
 	if err != nil {
 		return err
 	}
@@ -142,7 +161,7 @@ func run() error {
 // and DISPATCHER_ORCHESTRATE_INTERVAL are required, no hardcoded
 // default, same posture as every other real-money threshold in this
 // project.
-func orchestratorFromEnv(ledgerClient *ledgerclient.Client, slotsStore *slots.Store, slotCaps slots.Caps, dispatcher *dispatch.Dispatcher) (*orchestrate.Orchestrator, time.Duration, error) {
+func orchestratorFromEnv(ledgerClient *ledgerclient.Client, slotsStore *slots.Store, slotCaps slots.Caps, dispatcher *dispatch.Dispatcher, chain *dispatch.GrpcBroadcastClient, tronAPIBaseURL string) (*orchestrate.Orchestrator, time.Duration, error) {
 	energyBaseURL := os.Getenv("DISPATCHER_ENERGY_BASE_URL")
 	energyToken := os.Getenv("DISPATCHER_ENERGY_API_TOKEN")
 	if energyBaseURL == "" || energyToken == "" {
@@ -150,19 +169,6 @@ func orchestratorFromEnv(ledgerClient *ledgerclient.Client, slotsStore *slots.St
 	}
 	energyClient := energy.New(energyBaseURL, energyToken)
 
-	tronGRPCAddr := os.Getenv("DISPATCHER_TRON_GRPC_ADDR")
-	if tronGRPCAddr == "" {
-		return nil, 0, fmt.Errorf("dispatchd: DISPATCHER_TRON_GRPC_ADDR is required")
-	}
-	chain, err := dispatch.NewGrpcBroadcastClient(tronGRPCAddr, 15*time.Second)
-	if err != nil {
-		return nil, 0, fmt.Errorf("dispatchd: connecting to TRON node %q: %w", tronGRPCAddr, err)
-	}
-
-	tronAPIBaseURL := os.Getenv("DISPATCHER_TRON_API_BASE_URL")
-	if tronAPIBaseURL == "" {
-		return nil, 0, fmt.Errorf("dispatchd: DISPATCHER_TRON_API_BASE_URL is required")
-	}
 	finality := dispatch.NewHTTPFinalityReader(tronAPIBaseURL)
 
 	energyUnitsRaw := os.Getenv("DISPATCHER_ENERGY_PER_TRANSFER_UNITS")

@@ -133,6 +133,77 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/slots/{id}/sweep:
+    post:
+      summary: Sweep a slot's live on-chain balance (minus a reserve) via S1's signing flow
+      description: >
+        admin-panel-build-prompts.md's OC.11. Builds a real unsigned TRC20
+        transfer for the slot's own live on-chain USDT balance minus
+        reserve_amount, and requests S1 to sign it -- the same
+        construction sequence and the same S1 request/poll contract every
+        real payout already uses. Returns 200 with a tron_txid if S1
+        signed immediately (under its own auto-sign threshold), or 202
+        with signing_request_id and unsigned_tx_hex if the request is
+        PENDING human approval -- resupply both to
+        /v1/slots/sweep/finalize once approved.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostSweepRequest" }
+      responses:
+        "200":
+          description: Signed and broadcast.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SweepResponse" }
+        "202":
+          description: PENDING -- awaiting S1 approval.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SweepResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The slot is not ACTIVE.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/slots/sweep/finalize:
+    post:
+      summary: Complete a PENDING sweep once its signing request has been approved
+      description: >
+        Polls S1's GetSignature once; if now SIGNED, broadcasts using the
+        caller-supplied unsigned_tx_hex (this service holds no table of
+        in-flight sweeps). Still PENDING returns 202 unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostSweepFinalizeRequest" }
+      responses:
+        "200":
+          description: Signed and broadcast.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SweepResponse" }
+        "202":
+          description: Still PENDING.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SweepResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
   /v1/system/invariants:
     get:
       summary: Open dispatching orders, batch queue depth, slot cap headroom
@@ -222,6 +293,37 @@ components:
         immediate:
           type: boolean
           description: Skip RETIRING and mark RETIRED directly.
+
+    PostSweepRequest:
+      type: object
+      required: [destination_address, reserve_amount]
+      properties:
+        destination_address: { type: string }
+        reserve_amount:
+          type: string
+          description: Decimal USDT amount left behind, e.g. "5.000000" -- required, no default.
+
+    PostSweepFinalizeRequest:
+      type: object
+      required: [signing_request_id, unsigned_tx_hex]
+      properties:
+        signing_request_id: { type: integer, format: int64 }
+        unsigned_tx_hex:
+          type: string
+          description: Exactly the unsigned_tx_hex the original sweep call returned.
+
+    SweepResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [SIGNED, PENDING] }
+        signing_request_id: { type: integer, format: int64 }
+        unsigned_tx_hex:
+          type: string
+          description: Present only when status is PENDING -- resupply to /v1/slots/sweep/finalize.
+        tron_txid:
+          type: string
+          description: Present only when status is SIGNED.
+        swept_amount: { type: string, description: "Decimal USDT amount, e.g. \"142.300000\"." }
 
     Invariants:
       type: object
