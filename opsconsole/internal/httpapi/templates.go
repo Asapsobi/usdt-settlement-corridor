@@ -134,6 +134,10 @@ func MustLoadTemplates() *Templates {
 		"ledger_reconciliation": ledgerReconciliationContent,
 		"ledger_reorg":          ledgerReorgContent,
 		"ledger_transition":     ledgerTransitionContent,
+		"watcher_addresses":     watcherAddressesContent,
+		"watcher_retire":        watcherRetireContent,
+		"watcher_orphaned":      watcherOrphanedContent,
+		"watcher_providers":     watcherProvidersContent,
 		"audit":                 auditContent,
 	}
 	funcs := template.FuncMap{

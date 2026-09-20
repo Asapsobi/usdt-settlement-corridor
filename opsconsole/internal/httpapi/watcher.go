@@ -5,12 +5,19 @@ import (
 	"strconv"
 )
 
+const watcherTabs = `
+<div class="tabs">
+  <a class="tab {{ if eq .WatcherTab "cursor" }}active{{ end }}" href="/watcher/cursor">Cursor</a>
+  <a class="tab {{ if eq .WatcherTab "sweep" }}active{{ end }}" href="/watcher/sweep">Sweep</a>
+  <a class="tab {{ if eq .WatcherTab "addresses" }}active{{ end }}" href="/watcher/addresses">Addresses</a>
+  <a class="tab {{ if eq .WatcherTab "orphaned" }}active{{ end }}" href="/watcher/orphaned-deposits">Orphaned deposits</a>
+  <a class="tab {{ if eq .WatcherTab "providers" }}active{{ end }}" href="/watcher/providers">Providers</a>
+</div>
+`
+
 const watcherCursorContent = `
 <div class="page-head"><h1>Watcher cursor</h1></div>
-<div class="tabs">
-  <a class="tab active" href="/watcher/cursor">Cursor</a>
-  <a class="tab" href="/watcher/sweep">Sweep</a>
-</div>
+` + watcherTabs + `
 {{ if .Flash }}<div class="flash {{ if .FlashError }}flash-error{{ else }}flash-ok{{ end }}">{{ if .FlashError }}` + iconAlert + `{{ else }}` + iconCheck + `{{ end }}<span>{{ .Flash }}</span></div>{{ end }}
 <div class="cards" style="margin-bottom:16px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))">
   <div class="card"><div class="fact-label" style="margin-bottom:6px">last_scanned</div><div style="font-size:22px;font-weight:650;font-variant-numeric:tabular-nums">{{ .Cursor.LastScanned }}</div></div>
@@ -40,6 +47,7 @@ type cursorView struct {
 
 type watcherCursorPageData struct {
 	basePageData
+	WatcherTab string
 	Cursor     cursorView
 	Flash      string
 	FlashError bool
@@ -49,7 +57,7 @@ func (s *Server) renderWatcherCursor(w http.ResponseWriter, r *http.Request, fla
 	cur, err := s.Watcher.GetCursor(r.Context())
 	if err != nil {
 		s.Templates.Render(w, "watcher_cursor", watcherCursorPageData{
-			basePageData: s.newBasePageData(r), Flash: "reading cursor: " + err.Error(), FlashError: true,
+			basePageData: s.newBasePageData(r), WatcherTab: "cursor", Flash: "reading cursor: " + err.Error(), FlashError: true,
 		})
 		return
 	}
@@ -61,7 +69,7 @@ func (s *Server) renderWatcherCursor(w http.ResponseWriter, r *http.Request, fla
 		view.UpdatedAt = cur.UpdatedAt.String()
 	}
 	s.Templates.Render(w, "watcher_cursor", watcherCursorPageData{
-		basePageData: s.newBasePageData(r), Cursor: view, Flash: flash, FlashError: flashErr,
+		basePageData: s.newBasePageData(r), WatcherTab: "cursor", Cursor: view, Flash: flash, FlashError: flashErr,
 	})
 }
 
@@ -95,10 +103,7 @@ func (s *Server) postWatcherCursor(w http.ResponseWriter, r *http.Request) {
 
 const watcherSweepContent = `
 <div class="page-head"><h1>Sweep</h1></div>
-<div class="tabs">
-  <a class="tab" href="/watcher/cursor">Cursor</a>
-  <a class="tab active" href="/watcher/sweep">Sweep</a>
-</div>
+` + watcherTabs + `
 <p class="helptext">
   Lists every known deposit address, including already-settled orders --
   a settled order's own BEP20 balance still sits at that address until
@@ -154,6 +159,7 @@ type addressRow struct {
 
 type watcherSweepPageData struct {
 	basePageData
+	WatcherTab          string
 	Addresses           []addressRow
 	Error               string
 	SweepCommandFor     int64
@@ -162,7 +168,7 @@ type watcherSweepPageData struct {
 }
 
 func (s *Server) getWatcherSweep(w http.ResponseWriter, r *http.Request) {
-	data := watcherSweepPageData{basePageData: s.newBasePageData(r)}
+	data := watcherSweepPageData{basePageData: s.newBasePageData(r), WatcherTab: "sweep"}
 	list, err := s.Watcher.ListAddresses(r.Context(), 200)
 	if err != nil {
 		data.Error = err.Error()

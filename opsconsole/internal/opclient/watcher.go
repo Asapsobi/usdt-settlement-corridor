@@ -135,3 +135,84 @@ func (c *WatcherClient) GetAddressBalance(ctx context.Context, orderID int64) (s
 	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, c.baseURL+"/v1/addresses/"+strconv.FormatInt(orderID, 10)+"/balance", nil, &out)
 	return out.BalanceRaw, err
 }
+
+// RetireAddress calls C2's own POST /v1/addresses/{order_id}/retire.
+// Per addresses.Retire's own doc comment (depositwatcher/internal/addresses/store.go):
+// retirement is explicit and permanent -- RETIRED has no legal outgoing
+// transition, so a retired address can never be reassigned or
+// re-watched again (invariant 6: never reuse a derivation index or an
+// address). reason is free text but by convention one of settled,
+// refunded, expired, or superseded -- not enforced by C2 itself.
+func (c *WatcherClient) RetireAddress(ctx context.Context, orderID int64, reason string) (WatchedAddress, error) {
+	body := map[string]string{"reason": reason}
+	var out WatchedAddress
+	err := do(ctx, c.http, "watcher", c.token, http.MethodPost, c.baseURL+"/v1/addresses/"+strconv.FormatInt(orderID, 10)+"/retire", body, &out)
+	return out, err
+}
+
+// OrphanedDeposit is C2's own GET /v1/orphaned-deposits row shape
+// (depositwatcher/internal/httpapi/orphaned_handlers.go's own
+// orphanedDepositResponse).
+type OrphanedDeposit struct {
+	ID                    int64      `json:"id"`
+	OrderID               int64      `json:"order_id"`
+	ExternalID            string     `json:"external_id"`
+	TxHash                string     `json:"tx_hash"`
+	LogIndex              int        `json:"log_index"`
+	Amount                string     `json:"amount"`
+	DetectedAt            time.Time  `json:"detected_at"`
+	OrderStateAtDetection string     `json:"order_state_at_detection"`
+	Resolution            *string    `json:"resolution,omitempty"`
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedBy            *string    `json:"resolved_by,omitempty"`
+}
+
+// ListOrphanedDeposits calls C2's own GET /v1/orphaned-deposits,
+// optionally filtered by resolved (nil lists every one).
+func (c *WatcherClient) ListOrphanedDeposits(ctx context.Context, resolved *bool) ([]OrphanedDeposit, error) {
+	u := c.baseURL + "/v1/orphaned-deposits"
+	if resolved != nil {
+		u += "?resolved=" + strconv.FormatBool(*resolved)
+	}
+	var out struct {
+		Deposits []OrphanedDeposit `json:"deposits"`
+	}
+	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, u, nil, &out)
+	return out.Deposits, err
+}
+
+// ResolveOrphanedDeposit calls C2's own POST
+// /v1/orphaned-deposits/{id}/resolve. resolution is genuine free text --
+// orphaned.Resolve (depositwatcher/internal/orphaned/orphaned.go) enforces
+// no enum, and this system's actor convention means resolved_by always
+// comes from the caller's own bearer token, never a body field. A
+// second resolve on an already-resolved deposit fails with C2's real
+// ErrAlreadyResolved, surfaced unchanged.
+func (c *WatcherClient) ResolveOrphanedDeposit(ctx context.Context, id int64, resolution string) (OrphanedDeposit, error) {
+	body := map[string]string{"resolution": resolution}
+	var out OrphanedDeposit
+	err := do(ctx, c.http, "watcher", c.token, http.MethodPost, c.baseURL+"/v1/orphaned-deposits/"+strconv.FormatInt(id, 10)+"/resolve", body, &out)
+	return out, err
+}
+
+// ProviderHealth is C2's own GET /v1/system/providers row shape
+// (depositwatcher/internal/httpapi/system_handlers.go's own
+// providerHealthResponse).
+type ProviderHealth struct {
+	Name                string `json:"name"`
+	Healthy             bool   `json:"healthy"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	TotalRounds         int    `json:"total_rounds"`
+	TotalFailures       int    `json:"total_failures"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// GetProviders calls C2's own GET /v1/system/providers -- per-provider
+// RPC health from C2's own provider pool.
+func (c *WatcherClient) GetProviders(ctx context.Context) ([]ProviderHealth, error) {
+	var out struct {
+		Providers []ProviderHealth `json:"providers"`
+	}
+	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, c.baseURL+"/v1/system/providers", nil, &out)
+	return out.Providers, err
+}
