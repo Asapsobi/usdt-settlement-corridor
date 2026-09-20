@@ -75,15 +75,26 @@ func ScanRange(ctx context.Context, pool *chain.Pool, database db.Queryer, quote
 
 	blockTimes := make(map[uint64]time.Time)
 	for _, log := range logs {
-		if err := processLog(ctx, pool, database, quotes, tracker, cfg, log, blockTimes); err != nil {
+		if err := ProcessLog(ctx, pool, database, quotes, tracker, cfg, log, blockTimes); err != nil {
 			return fmt.Errorf("candidates: processing log %s:%d: %w", log.TxHash, log.Index, err)
 		}
 	}
 	return nil
 }
 
-func processLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
+// ProcessLog resolves one already-fetched Transfer log into exactly one
+// of ScanRange's own four outcomes (see ScanRange's own doc comment) --
+// exported so a caller that located a specific log some other way (the
+// ops console's manual deposit-confirmation route, C2.12, which finds
+// one Transfer log by tx_hash via a single-block LogsAt call rather
+// than a range scan) reuses this exact function instead of a second,
+// parallel classification path. blockTimes may be nil; ScanRange passes
+// a per-call cache, a single-log caller can just pass nil.
+func ProcessLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
 	tracker *finality.Tracker, cfg Config, log types.Log, blockTimes map[uint64]time.Time) error {
+	if blockTimes == nil {
+		blockTimes = make(map[uint64]time.Time)
+	}
 	from, to, amount, err := chain.ParseTransferLog(log)
 	if err != nil {
 		if errors.Is(err, chain.ErrWrongToken) {

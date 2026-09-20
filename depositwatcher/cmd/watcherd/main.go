@@ -78,6 +78,9 @@ func run() error {
 		server.ChainPool = eng.chainPool
 		server.Tracker = eng.tracker
 		server.ContractAddress = eng.cfg.ContractAddress
+		server.TransferTopic = eng.cfg.TransferTopic
+		server.DustFloor = eng.cfg.DustFloor
+		server.Ledger = eng.ledger
 	}
 	router := httpapi.NewRouter(server)
 

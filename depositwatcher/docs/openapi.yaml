@@ -152,6 +152,65 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
 
+  /v1/addresses/{order_id}/confirm-deposit:
+    post:
+      summary: Manually confirm a specific on-chain transaction as this order's deposit
+      description: >
+        admin-panel-build-prompts.md's OC.12 -- an operator-supplied "look
+        at this specific transaction" trigger, not a manual override that
+        skips verification. Locates the transaction's own block, re-reads
+        that block's Transfer logs under the same 2-provider agreement
+        bar the background scanner's own range-scan uses, and -- only if
+        a matching log paying this order's own deposit address is found
+        -- feeds it through the exact same classification and finality
+        tracking a normally-detected deposit goes through. Idempotent:
+        resubmitting the same tx_hash is a no-op, not a double-credit.
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tx_hash]
+              properties:
+                tx_hash: { type: string, description: "0x-prefixed 32-byte transaction hash." }
+      responses:
+        "200":
+          description: Accepted -- will credit once finality confirms it, same as any other deposit.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id: { type: integer, format: int64 }
+                  tx_hash: { type: string }
+                  block_number: { type: integer }
+                  accepted: { type: boolean }
+        "400":
+          description: Malformed tx_hash, or a well-formed transaction that pays some OTHER address, not this order's own.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No matching Transfer log for this tx_hash was found (wrong hash, or not yet mined).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: The transaction exists but its log isn't a Transfer event at all.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: Locating the transaction or its logs on-chain failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { description: This instance has no live chain-watching engine configured. }
+
   /v1/orphaned-deposits:
     get:
       summary: List orphaned deposits (gap #3's capture-and-surface mechanism)

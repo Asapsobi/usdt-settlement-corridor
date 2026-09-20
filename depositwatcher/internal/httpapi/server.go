@@ -11,9 +11,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"depositwatcher/internal/candidates"
 	"depositwatcher/internal/chain"
 	"depositwatcher/internal/db"
 	"depositwatcher/internal/finality"
+	"depositwatcher/internal/money"
 )
 
 // Server holds everything a handler needs. ChainPool and Tracker may be
@@ -28,9 +30,21 @@ type Server struct {
 	ChainPool       *chain.Pool
 	Tracker         *finality.Tracker
 	ContractAddress common.Address // the watched BEP20 token; zero value if ChainPool is nil
-	Auth            AuthConfig
-	Metrics         *Metrics
-	BuildInfo       func() (version, commit string)
+
+	// TransferTopic, DustFloor, and Ledger back postConfirmDeposit only
+	// (C2.12) -- the exact same cfg values and QuotedAmountFetcher
+	// cmd/watcherd's own engine already built for the background
+	// candidates loop, passed through here rather than reconstructed, so
+	// a manually-confirmed deposit is classified by the identical rule
+	// an automatically-detected one would be. May be nil/zero if this
+	// instance has no live engine; the route itself requires them.
+	TransferTopic common.Hash
+	DustFloor     money.Amount
+	Ledger        candidates.QuotedAmountFetcher
+
+	Auth      AuthConfig
+	Metrics   *Metrics
+	BuildInfo func() (version, commit string)
 }
 
 // NewRouter builds the full route table. /healthz, /readyz, and /metrics
@@ -62,6 +76,7 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/addresses/{order_id}", s.getAddress)
 		r.Get("/addresses/{order_id}/balance", s.getAddressBalance)
 		r.With(requireIdempotencyKey).Post("/addresses/{order_id}/retire", s.postRetireAddress)
+		r.With(requireIdempotencyKey).Post("/addresses/{order_id}/confirm-deposit", s.postConfirmDeposit)
 
 		r.Get("/orphaned-deposits", s.getOrphanedDeposits)
 		r.With(requireIdempotencyKey).Post("/orphaned-deposits/{id}/resolve", s.postResolveOrphanedDeposit)

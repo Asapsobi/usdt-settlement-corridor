@@ -43,17 +43,18 @@ func TestEveryRouteIsInOpenAPISpec(t *testing.T) {
 	spec := loadSpec(t)
 
 	routes := map[string][]string{
-		"/healthz":                           {"get"},
-		"/readyz":                            {"get"},
-		"/metrics":                           {"get"},
-		"/v1/addresses":                      {"post", "get"},
-		"/v1/addresses/{order_id}":           {"get"},
-		"/v1/addresses/{order_id}/balance":   {"get"},
-		"/v1/addresses/{order_id}/retire":    {"post"},
-		"/v1/orphaned-deposits":              {"get"},
-		"/v1/orphaned-deposits/{id}/resolve": {"post"},
-		"/v1/system/providers":               {"get"},
-		"/v1/system/invariants":              {"get"},
+		"/healthz":                         {"get"},
+		"/readyz":                          {"get"},
+		"/metrics":                         {"get"},
+		"/v1/addresses":                    {"post", "get"},
+		"/v1/addresses/{order_id}":         {"get"},
+		"/v1/addresses/{order_id}/balance": {"get"},
+		"/v1/addresses/{order_id}/retire":  {"post"},
+		"/v1/addresses/{order_id}/confirm-deposit": {"post"},
+		"/v1/orphaned-deposits":                    {"get"},
+		"/v1/orphaned-deposits/{id}/resolve":       {"post"},
+		"/v1/system/providers":                     {"get"},
+		"/v1/system/invariants":                    {"get"},
 	}
 
 	for route, methods := range routes {
