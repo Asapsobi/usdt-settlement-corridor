@@ -135,6 +135,11 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/screening/holds", s.getScreeningHolds)
 		r.Post("/screening/holds/{id}/release", s.postScreeningHoldRelease)
 		r.Post("/screening/holds/{id}/reject", s.postScreeningHoldReject)
+		r.Get("/screening/rescreen-flags", s.getScreeningRescreenFlags)
+		r.Post("/screening/rescreen-flags/{id}/resolve", s.postScreeningRescreenFlagResolve)
+		r.Get("/screening/results", s.getScreeningResults)
+		r.Post("/screening/results/{id}/invalidate", s.postScreeningResultInvalidate)
+		r.Get("/screening/queue", s.getScreeningQueue)
 
 		r.Get("/dispatcher/slots", s.getDispatcherSlots)
 		r.Post("/dispatcher/slots/{id}/retire", s.postDispatcherSlotRetire)

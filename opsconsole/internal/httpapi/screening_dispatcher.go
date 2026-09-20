@@ -7,8 +7,18 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+const screeningTabs = `
+<div class="tabs">
+  <a class="tab {{ if eq .ScreeningTab "holds" }}active{{ end }}" href="/screening/holds">Holds</a>
+  <a class="tab {{ if eq .ScreeningTab "rescreen" }}active{{ end }}" href="/screening/rescreen-flags">Rescreen flags</a>
+  <a class="tab {{ if eq .ScreeningTab "results" }}active{{ end }}" href="/screening/results">Results</a>
+  <a class="tab {{ if eq .ScreeningTab "queue" }}active{{ end }}" href="/screening/queue">Queue</a>
+</div>
+`
+
 const screeningHoldsContent = `
 <div class="page-head"><h1>Screening holds</h1></div>
+` + screeningTabs + `
 {{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
 <div class="table-wrap">
 <table>
@@ -79,8 +89,9 @@ type holdRow struct {
 
 type screeningHoldsPageData struct {
 	basePageData
-	Holds []holdRow
-	Error string
+	ScreeningTab string
+	Holds        []holdRow
+	Error        string
 }
 
 func (s *Server) getScreeningHolds(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +99,7 @@ func (s *Server) getScreeningHolds(w http.ResponseWriter, r *http.Request) {
 	if status == "" {
 		status = "OPEN"
 	}
-	data := screeningHoldsPageData{basePageData: s.newBasePageData(r)}
+	data := screeningHoldsPageData{basePageData: s.newBasePageData(r), ScreeningTab: "holds"}
 	holds, err := s.Screening.ListHolds(r.Context(), status)
 	if err != nil {
 		data.Error = err.Error()

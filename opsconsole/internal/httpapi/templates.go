@@ -138,6 +138,9 @@ func MustLoadTemplates() *Templates {
 		"watcher_retire":        watcherRetireContent,
 		"watcher_orphaned":      watcherOrphanedContent,
 		"watcher_providers":     watcherProvidersContent,
+		"screening_rescreen":    screeningRescreenContent,
+		"screening_results":     screeningResultsContent,
+		"screening_queue":       screeningQueueContent,
 		"audit":                 auditContent,
 	}
 	funcs := template.FuncMap{

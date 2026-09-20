@@ -109,3 +109,65 @@ func (c *ScreeningClient) GetScreeningResults(ctx context.Context, senderAddress
 	err := do(ctx, c.http, "screening", c.token, http.MethodGet, c.baseURL+"/v1/screening-results?sender_address="+url.QueryEscape(senderAddress), nil, &out)
 	return out.ScreeningResults, err
 }
+
+// InvalidateScreeningResult calls C3's own POST
+// /v1/screening-results/{id}/invalidate. Per that route's own doc
+// comment (screening/internal/httpapi/screening_results_handlers.go):
+// the path names one row, but the real effect (internal/cache.Invalidate)
+// operates on the whole (provider, sender_address) PAIR that row
+// belongs to -- every cached result for that pair stops being trusted,
+// not just this one row. Nothing is deleted, and this does not itself
+// force a re-screen or touch any order's already-recorded state; it
+// only means the next lookup for that pair will not be served from
+// cache. reason and actor are both required by C3 itself.
+func (c *ScreeningClient) InvalidateScreeningResult(ctx context.Context, id int64, reason, actor string) error {
+	body := map[string]string{"reason": reason, "actor": actor}
+	return do(ctx, c.http, "screening", c.token, http.MethodPost, c.baseURL+"/v1/screening-results/"+strconv.FormatInt(id, 10)+"/invalidate", body, nil)
+}
+
+// RescreenFlag is C3's own GET /v1/rescreen-flags row shape
+// (screening/internal/httpapi/rescreen_flags_handlers.go's own
+// rescreenFlagResponse) -- recorded when a later screening verdict for
+// an address diverges from the verdict an order was originally screened
+// under.
+type RescreenFlag struct {
+	ID                    int64      `json:"id"`
+	OrderID               int64      `json:"order_id"`
+	ExternalID            string     `json:"external_id"`
+	OrderStateAtDetection string     `json:"order_state_at_detection"`
+	PreviousVerdictID     int64      `json:"previous_verdict_id"`
+	NewVerdictID          int64      `json:"new_verdict_id"`
+	DetectedAt            time.Time  `json:"detected_at"`
+	Resolution            *string    `json:"resolution"`
+	ResolvedAt            *time.Time `json:"resolved_at"`
+	ResolvedBy            *string    `json:"resolved_by"`
+}
+
+// ListRescreenFlags calls C3's own GET /v1/rescreen-flags, optionally
+// filtered by resolved (nil lists every flag).
+func (c *ScreeningClient) ListRescreenFlags(ctx context.Context, resolved *bool) ([]RescreenFlag, error) {
+	u := c.baseURL + "/v1/rescreen-flags"
+	if resolved != nil {
+		u += "?resolved=" + strconv.FormatBool(*resolved)
+	}
+	var out struct {
+		RescreenFlags []RescreenFlag `json:"rescreen_flags"`
+	}
+	err := do(ctx, c.http, "screening", c.token, http.MethodGet, u, nil, &out)
+	return out.RescreenFlags, err
+}
+
+// ResolveRescreenFlag calls C3's own POST /v1/rescreen-flags/{id}/resolve
+// -- purely a record of a human decision (that route's own doc comment:
+// "this package never acts on it," mechanism not policy), so unlike
+// reversal/reorg/transition this carries no further side effect to warn
+// about. actor is a genuine request body field on this route (unlike
+// C2's orphaned-deposit resolve, which takes actor from the bearer
+// token only) -- each service's real contract is followed as-is, not
+// assumed uniform.
+func (c *ScreeningClient) ResolveRescreenFlag(ctx context.Context, id int64, resolution, actor string) (RescreenFlag, error) {
+	body := map[string]string{"resolution": resolution, "actor": actor}
+	var out RescreenFlag
+	err := do(ctx, c.http, "screening", c.token, http.MethodPost, c.baseURL+"/v1/rescreen-flags/"+strconv.FormatInt(id, 10)+"/resolve", body, &out)
+	return out, err
+}
