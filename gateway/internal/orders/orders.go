@@ -148,6 +148,34 @@ func (s *Store) ListPendingAddress(ctx context.Context, minAge time.Duration) ([
 	return out, rows.Err()
 }
 
+// ListAll returns gateway_orders rows across every customer, newest
+// first, up to limit -- OC.19's own cross-customer admin list. The
+// customer-facing GET /v1/orders/{external_id} stays scoped to the
+// calling API key by design (C6's own sandbox-isolation discipline);
+// this is a deliberately separate, admin-only read, not a parameter
+// that widens that route's own scope.
+func (s *Store) ListAll(ctx context.Context, limit int) ([]GatewayOrder, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT external_id, customer_id, quote_id, c1_order_id, c1_order_created, c2_address_assigned, deposit_address, address_pending_alerted_at, created_at, updated_at
+		FROM gateway_orders
+		ORDER BY created_at DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("orders: listing all: %w", err)
+	}
+	defer rows.Close()
+
+	var out []GatewayOrder
+	for rows.Next() {
+		o, err := scanOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 type scanRow interface {
 	Scan(dest ...any) error
 }

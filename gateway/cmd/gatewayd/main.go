@@ -57,6 +57,14 @@ func run() error {
 	if watcherBaseURL == "" || watcherToken == "" {
 		return fmt.Errorf("gatewayd: GATEWAY_WATCHER_BASE_URL and GATEWAY_WATCHER_API_TOKEN are required")
 	}
+	// OC.19: gateway's own operator surface -- a completely separate
+	// credential space from every customer sk_live_/sk_test_ key, same
+	// token1:actor1,token2:actor2 convention every sibling service's own
+	// *_API_TOKENS already uses.
+	adminAuth, err := httpapi.AdminAuthConfigFromEnv()
+	if err != nil {
+		return fmt.Errorf("gatewayd: %w", err)
+	}
 
 	ordersStore := orders.NewStore(pool)
 	quotesStore := quotes.NewStore(pool)
@@ -74,6 +82,13 @@ func run() error {
 		}
 	}()
 
+	// C6.6: notices settled/held/refunded and delivers the resulting
+	// webhook -- see "Read this fourth" on why this is a tight, dedicated
+	// poll, not folded into any other loop's own interval. Built before
+	// Server so OC.19's own manual-redrive admin route can reuse this
+	// SAME Deliverer the background loop runs on, not a second instance.
+	webhooksStore := webhooks.NewStore(pool)
+
 	server := &httpapi.Server{
 		Pool:           pool,
 		Customers:      customersStore,
@@ -84,14 +99,12 @@ func run() error {
 		Watcher:        watcher,
 		Sandbox:        sandbox.NewStore(pool),
 		PendingAddress: reconciler,
+		Webhooks:       webhooksStore,
+		AdminAuth:      adminAuth,
 		BuildInfo:      func() (string, string) { return "dev", "dev" },
 	}
 	router := httpapi.NewRouter(server) // fills in server.Metrics if left nil
 
-	// C6.6: notices settled/held/refunded and delivers the resulting
-	// webhook -- see "Read this fourth" on why this is a tight, dedicated
-	// poll, not folded into any other loop's own interval.
-	webhooksStore := webhooks.NewStore(pool)
 	trigger := webhooks.NewTrigger(pool, ledger, webhooksStore, customersStore)
 	go func() {
 		if err := trigger.RunTriggerLoop(ctx, 0); err != nil && !errors.Is(err, context.Canceled) {
@@ -99,6 +112,7 @@ func run() error {
 		}
 	}()
 	deliverer := webhooks.NewDeliverer(webhooksStore, customersStore, nil, server.Metrics)
+	server.Deliverer = deliverer // set after NewRouter: handlers read it per-request, not at route-registration time
 	go func() {
 		if err := deliverer.RunDeliverLoop(ctx, 0); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error("webhook deliver loop exited with error", "error", err)

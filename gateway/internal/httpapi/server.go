@@ -22,6 +22,7 @@ import (
 	"gateway/internal/quotes"
 	"gateway/internal/ratelimit"
 	"gateway/internal/sandbox"
+	"gateway/internal/webhooks"
 )
 
 // DefaultQuoteValidity is decision 5's own "90s price lock" default.
@@ -46,6 +47,16 @@ type Server struct {
 	Metrics        *Metrics      // auto-initialized by NewRouter if left nil
 	QuoteValidity  time.Duration // DefaultQuoteValidity if zero
 	BuildInfo      func() (version, commit string)
+
+	// Webhooks, Deliverer, and AdminAuth back OC.19's own /v1/admin/*
+	// surface -- Deliverer is the SAME *webhooks.Deliverer main.go
+	// already runs the background delivery loop on, reused for manual
+	// redrive rather than a second instance. AdminAuth with a nil
+	// Tokens map means every admin route 401s, same fail-closed posture
+	// an unset AuthConfig gives every sibling service.
+	Webhooks  *webhooks.Store
+	Deliverer *webhooks.Deliverer
+	AdminAuth AdminAuthConfig
 }
 
 func (s *Server) quoteValidity() time.Duration {
@@ -95,6 +106,25 @@ func NewRouter(s *Server) http.Handler {
 		r.With(requireSandboxCustomer).Get("/sandbox/orders", s.getSandboxOrders)
 		r.With(requireSandboxCustomer).Get("/sandbox/orders/{external_id}", s.getSandboxOrderStatus)
 		// C6.8 onward add routes here.
+	})
+
+	// OC.19: a sibling route group, never nested inside the customer
+	// "/v1" group above -- these routes must never be reachable with a
+	// customer's own sk_live_/sk_test_ key, only requireAdminAuth's own
+	// separate service tokens.
+	router.Route("/v1/admin", func(r chi.Router) {
+		r.Use(requireAdminAuth(s.AdminAuth))
+
+		r.Get("/api-keys", s.getAPIKeys)
+		r.Post("/api-keys", s.postAPIKey)
+		r.Post("/api-keys/{id}/revoke", s.postRevokeAPIKey)
+
+		r.Get("/webhooks/deliveries", s.getWebhookDeliveries)
+		r.Post("/webhooks/deliveries/{id}/redrive", s.postRedriveWebhookDelivery)
+
+		r.Get("/orders", s.getAdminOrders)
+
+		r.Get("/rate-limits", s.getRateLimits)
 	})
 
 	return router

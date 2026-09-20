@@ -94,6 +94,61 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time, limit int) ([]Deliv
 	return out, rows.Err()
 }
 
+// Get fetches one delivery row by id.
+func (s *Store) Get(ctx context.Context, id int64) (Delivery, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, customer_id, external_id, event_type, payload, created_at, delivered_at, attempt_count, next_attempt_at, last_error
+		FROM webhook_deliveries WHERE id = $1
+	`, id)
+	d, err := scanDelivery(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Delivery{}, ErrNotFound
+		}
+		return Delivery{}, fmt.Errorf("webhooks: fetching %d: %w", id, err)
+	}
+	return d, nil
+}
+
+// List returns deliveries newest first, up to limit. status selects a
+// subset: "failed" (attempted at least once, not yet delivered --
+// including a row that has exhausted every attempt, since that's
+// exactly the case OC.19's own manual redrive exists for), "pending"
+// (not yet attempted, not yet delivered), "delivered", or "" (every
+// row).
+func (s *Store) List(ctx context.Context, status string, limit int) ([]Delivery, error) {
+	var where string
+	switch status {
+	case "failed":
+		where = "WHERE delivered_at IS NULL AND attempt_count > 0"
+	case "pending":
+		where = "WHERE delivered_at IS NULL AND attempt_count = 0"
+	case "delivered":
+		where = "WHERE delivered_at IS NOT NULL"
+	case "":
+	default:
+		return nil, fmt.Errorf("webhooks: unknown status filter %q", status)
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, customer_id, external_id, event_type, payload, created_at, delivered_at, attempt_count, next_attempt_at, last_error
+		FROM webhook_deliveries `+where+`
+		ORDER BY created_at DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("webhooks: listing (status=%q): %w", status, err)
+	}
+	defer rows.Close()
+	var out []Delivery
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return nil, fmt.Errorf("webhooks: listing (status=%q): %w", status, err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // MarkDelivered records a successful delivery.
 func (s *Store) MarkDelivered(ctx context.Context, id int64) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE webhook_deliveries SET delivered_at = now() WHERE id = $1`, id)

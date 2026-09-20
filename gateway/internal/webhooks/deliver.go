@@ -203,6 +203,31 @@ func (d *Deliverer) attempt(ctx context.Context, delivery Delivery) {
 	}
 }
 
+// ErrAlreadyDelivered means Redeliver was called against a row that has
+// already succeeded -- redriving it would send the customer a duplicate
+// webhook for no reason.
+var ErrAlreadyDelivered = fmt.Errorf("webhooks: delivery already succeeded")
+
+// Redeliver is OC.19's own admin redrive: fetches delivery id and makes
+// exactly one new delivery attempt for it right now, via the same
+// attempt logic Tick uses for every automatic attempt -- bypassing
+// ClaimDue's own not-yet-due and not-yet-exhausted gates, so an
+// operator can force an immediate retry regardless of backoff or
+// exhaustion. Records success or failure with the same UPDATE attempt
+// always uses (never a new row), and returns the delivery's own
+// post-attempt state.
+func (d *Deliverer) Redeliver(ctx context.Context, id int64) (Delivery, error) {
+	delivery, err := d.store.Get(ctx, id)
+	if err != nil {
+		return Delivery{}, err
+	}
+	if delivery.DeliveredAt != nil {
+		return Delivery{}, ErrAlreadyDelivered
+	}
+	d.attempt(ctx, delivery)
+	return d.store.Get(ctx, id)
+}
+
 func deliveryFailureMessage(err error, resp *http.Response) string {
 	if err != nil {
 		return err.Error()

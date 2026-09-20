@@ -202,6 +202,184 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/admin/api-keys:
+    get:
+      summary: List API keys (admin)
+      description: >
+        OC.19's own operator surface -- requires a GATEWAY_ADMIN_TOKENS
+        bearer token, never a customer's own sk_live_/sk_test_ key.
+        customer_id query param omitted lists every customer's own key
+        metadata; given, returns just that one. Never the hash or the
+        raw key itself, only api_key_last4 and creation/rotation
+        metadata.
+      parameters:
+        - name: customer_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/APIKey" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      summary: Issue (rotate) an API key (admin)
+      description: >
+        Real customers rows are one key per row, not a one-to-many
+        table -- "issue" for an existing customer_id means rotating
+        that customer's own key; the prior key stops authenticating
+        immediately. mode must match the target customer's own,
+        permanently-fixed live/sandbox identity (invariant 4) or this
+        rejects with 409. Creates no new customer. Returns the raw key
+        exactly once -- the one response in this whole service that
+        carries a secret on purpose (see AdminAPIKeyIssued's own
+        description).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostAdminAPIKeyRequest" }
+      responses:
+        "201":
+          description: Key rotated; api_key is the new raw value, shown exactly once.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAPIKeyIssued" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: mode_mismatch -- mode does not match the target customer's own permanently-fixed live/sandbox identity.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/admin/api-keys/{id}/revoke:
+    post:
+      summary: Revoke an API key (admin)
+      description: >
+        There is no key identity apart from the customer row it belongs
+        to, so this suspends customer id (customers.Store.Suspend,
+        reused as-is) -- the next real call authenticating with that
+        key's hash fails on authMiddleware's own lookup immediately,
+        not a flag a caller could ignore.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: OK -- the now-suspended customer's own key metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/APIKey" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/admin/webhooks/deliveries:
+    get:
+      summary: List webhook deliveries (admin)
+      description: >
+        status=failed (attempted at least once, not yet delivered --
+        including a row that has exhausted every automatic attempt),
+        pending, delivered, or omitted for every row.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [failed, pending, delivered] }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookDelivery" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/admin/webhooks/deliveries/{id}/redrive:
+    post:
+      summary: Manually redrive one webhook delivery (admin)
+      description: >
+        Makes exactly one new delivery attempt right now via the exact
+        same attempt logic the background delivery loop uses
+        (webhooks.Deliverer.Redeliver) -- outside its normal backoff
+        schedule and regardless of whether it has already exhausted
+        every automatic attempt. Updates the existing row; never
+        inserts a duplicate.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: OK -- the delivery's own post-attempt state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookDelivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: already_delivered -- this delivery already succeeded; redriving it would send a duplicate webhook.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/admin/orders:
+    get:
+      summary: Cross-customer order list (admin)
+      description: >
+        The customer-facing GET /v1/orders/{external_id} is scoped to
+        the calling API key by design (C6's own sandbox-isolation
+        discipline); this is a deliberately separate, admin-scoped
+        route, not a parameter that widens that route's own scope.
+        Lists gateway_orders (this service's own choreography-tracking
+        rows) across every customer_id.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminGatewayOrder" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/admin/rate-limits:
+    get:
+      summary: Current rate-limit bucket state (admin)
+      description: >
+        C6.3's own limiter is a classic in-memory token bucket -- real,
+        current, per-instance state, not a fake aggregate, but also not
+        a historical or cross-instance view; the response's own note
+        field states that plainly.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminRateLimitSnapshot" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -224,6 +402,11 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: The named resource does not exist (or belongs to a different customer -- ownership is checked, not just existence).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: unauthorized -- missing or invalid bearer token.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -317,6 +500,76 @@ components:
         network_fee_units: { type: string }
         recipient_address: { type: string }
         deposit_address: { type: string }
+
+    APIKey:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        is_sandbox: { type: boolean }
+        status: { type: string, enum: [active, suspended] }
+        api_key_last4: { type: string, nullable: true, description: Null for a key issued before this field existed and never since rotated. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PostAdminAPIKeyRequest:
+      type: object
+      required: [customer_id, mode]
+      properties:
+        customer_id: { type: integer, format: int64 }
+        mode: { type: string, enum: [live, test] }
+
+    AdminAPIKeyIssued:
+      description: >
+        The one response shape in this service that carries a raw
+        secret on purpose -- a customer API key is this system's own
+        credential, minted to be handed to that customer, not extracted
+        key material from a signing system whose entire design promises
+        it never leaves KMS (see admin_handlers.go's own doc comment).
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - type: object
+          properties:
+            api_key: { type: string, description: The new raw key. Shown exactly once, here, never again. }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        customer_id: { type: integer, format: int64 }
+        external_id: { type: string }
+        event_type: { type: string }
+        created_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time, nullable: true }
+        attempt_count: { type: integer }
+        next_attempt_at: { type: string, format: date-time }
+        last_error: { type: string, nullable: true }
+
+    AdminGatewayOrder:
+      type: object
+      properties:
+        external_id: { type: string }
+        customer_id: { type: integer, format: int64 }
+        quote_id: { type: integer, format: int64 }
+        c1_order_id: { type: integer, format: int64 }
+        c1_order_created: { type: boolean }
+        c2_address_assigned: { type: boolean }
+        deposit_address: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdminRateLimitSnapshot:
+      type: object
+      properties:
+        buckets:
+          type: array
+          items:
+            type: object
+            properties:
+              customer_id: { type: integer, format: int64 }
+              tokens_remaining: { type: number }
+              per_minute: { type: integer }
+        note: { type: string }
         state: { type: string }
         hold_reason: { type: string, nullable: true }
         webhook_attempts: { type: integer }

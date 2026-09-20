@@ -77,6 +77,32 @@ func (l *Limiter) Allow(customerID int64, perMinute *int) bool {
 	return true
 }
 
+// BucketState is one customer's own current bucket, as of the moment
+// Snapshot was called.
+type BucketState struct {
+	TokensRemaining float64
+	PerMinute       int
+}
+
+// Snapshot returns every customer bucket THIS PROCESS currently holds
+// in memory. OC.19's own admin rate-limit view: real, but narrow --
+// buckets are created lazily on first request and held only in this
+// one running instance's own memory (this package's own doc comment:
+// "no distributed rate-limit store is needed here"), so a customer who
+// hasn't called this instance since it last started simply has no
+// entry yet, and a multi-instance deployment would need this called
+// against each instance separately to see the full picture. Not a
+// historical or cross-instance aggregate.
+func (l *Limiter) Snapshot() map[int64]BucketState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[int64]BucketState, len(l.buckets))
+	for id, b := range l.buckets {
+		out[id] = BucketState{TokensRemaining: b.tokens, PerMinute: b.perMinute}
+	}
+	return out
+}
+
 // RetryAfter reports how long customerID should wait before its next
 // request would likely be allowed -- one token's own refill time at its
 // configured rate, for the Retry-After header C6.1's own acceptance

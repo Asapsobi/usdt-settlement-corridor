@@ -33,6 +33,7 @@ type Customer struct {
 	ID                 int64
 	Name               string
 	APIKeyHash         string
+	APIKeyLast4        *string // OC.19: last 4 chars of the current raw key, for admin display only -- never enough to reconstruct or brute-force the key itself
 	WebhookSecret      string
 	WebhookURL         *string
 	IsSandbox          bool
@@ -137,21 +138,80 @@ func (s *Store) create(ctx context.Context, name string, sandbox bool) (Customer
 		return Customer{}, "", err
 	}
 	hash := HashAPIKey(rawKey)
+	last4 := rawKey[len(rawKey)-4:]
 	webhookSecret, err := generateWebhookSecret()
 	if err != nil {
 		return Customer{}, "", err
 	}
 
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO customers (name, api_key_hash, webhook_secret, is_sandbox, status)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, name, api_key_hash, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
-	`, name, hash, webhookSecret, sandbox, string(StatusActive))
+		INSERT INTO customers (name, api_key_hash, api_key_last4, webhook_secret, is_sandbox, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, name, api_key_hash, api_key_last4, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
+	`, name, hash, last4, webhookSecret, sandbox, string(StatusActive))
 	c, err := scanCustomer(row)
 	if err != nil {
 		return Customer{}, "", fmt.Errorf("customers: creating %q: %w", name, err)
 	}
 	return c, rawKey, nil
+}
+
+// RotateAPIKey generates a fresh raw key for id -- same mode
+// (live/sandbox) the customer already has, since IsSandbox is fixed at
+// creation and never changes (invariant 4) -- overwrites the stored
+// hash and last4, and returns the new raw key exactly once, the same
+// "shown once, never again" convention Create/CreateSandbox use. The
+// OLD key stops authenticating immediately: GetByAPIKey looks up by
+// hash, and the old hash no longer matches any row.
+func (s *Store) RotateAPIKey(ctx context.Context, id int64) (Customer, string, error) {
+	existing, err := s.Get(ctx, id)
+	if err != nil {
+		return Customer{}, "", err
+	}
+	genKey := GenerateAPIKey
+	if existing.IsSandbox {
+		genKey = GenerateSandboxAPIKey
+	}
+	rawKey, err := genKey()
+	if err != nil {
+		return Customer{}, "", err
+	}
+	hash := HashAPIKey(rawKey)
+	last4 := rawKey[len(rawKey)-4:]
+
+	row := s.pool.QueryRow(ctx, `
+		UPDATE customers SET api_key_hash = $1, api_key_last4 = $2, updated_at = now()
+		WHERE id = $3
+		RETURNING id, name, api_key_hash, api_key_last4, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
+	`, hash, last4, id)
+	c, err := scanCustomer(row)
+	if err != nil {
+		return Customer{}, "", fmt.Errorf("customers: rotating key for %d: %w", id, err)
+	}
+	return c, rawKey, nil
+}
+
+// List returns every customer, newest first -- OC.19's own admin key
+// list; there is no per-customer filter at the store level, since a
+// single Get already covers "one customer_id."
+func (s *Store) List(ctx context.Context) ([]Customer, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, api_key_hash, api_key_last4, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
+		FROM customers ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("customers: listing: %w", err)
+	}
+	defer rows.Close()
+	var out []Customer
+	for rows.Next() {
+		c, err := scanCustomer(rows)
+		if err != nil {
+			return nil, fmt.Errorf("customers: listing: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // GetByAPIKey looks up the customer whose stored hash matches rawKey --
@@ -161,7 +221,7 @@ func (s *Store) create(ctx context.Context, name string, sandbox bool) (Customer
 func (s *Store) GetByAPIKey(ctx context.Context, rawKey string) (Customer, error) {
 	hash := HashAPIKey(rawKey)
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, name, api_key_hash, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
+		SELECT id, name, api_key_hash, api_key_last4, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
 		FROM customers WHERE api_key_hash = $1
 	`, hash)
 	c, err := scanCustomer(row)
@@ -177,7 +237,7 @@ func (s *Store) GetByAPIKey(ctx context.Context, rawKey string) (Customer, error
 // Get fetches a customer by id.
 func (s *Store) Get(ctx context.Context, id int64) (Customer, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, name, api_key_hash, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
+		SELECT id, name, api_key_hash, api_key_last4, webhook_secret, webhook_url, is_sandbox, status, rate_limit_per_minute, created_at, updated_at
 		FROM customers WHERE id = $1
 	`, id)
 	c, err := scanCustomer(row)
@@ -266,7 +326,7 @@ type scanRow interface {
 func scanCustomer(row scanRow) (Customer, error) {
 	var c Customer
 	var status string
-	if err := row.Scan(&c.ID, &c.Name, &c.APIKeyHash, &c.WebhookSecret, &c.WebhookURL, &c.IsSandbox, &status, &c.RateLimitPerMinute, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Name, &c.APIKeyHash, &c.APIKeyLast4, &c.WebhookSecret, &c.WebhookURL, &c.IsSandbox, &status, &c.RateLimitPerMinute, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return Customer{}, err
 	}
 	c.Status = Status(status)
