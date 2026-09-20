@@ -105,6 +105,7 @@ func NewRouter(s *Server) http.Handler {
 		r.Post("/watcher/cursor", s.postWatcherCursor)
 		r.Get("/watcher/sweep", s.getWatcherSweep)
 
+		r.Get("/broker/overview", s.getBrokerOverview)
 		r.Get("/broker/reservations", s.getBrokerReservations)
 		r.Get("/broker/reservations/{id}/reconcile", s.getBrokerReconcileForm)
 		r.Post("/broker/reservations/{id}/reconcile", s.postBrokerReconcile)

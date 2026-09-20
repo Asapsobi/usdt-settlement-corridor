@@ -45,6 +45,29 @@ func (c *BrokerClient) GetInvariants(ctx context.Context) (BrokerInvariants, err
 	return out, err
 }
 
+// BufferProviderTotal is one row of C4's own GET /v1/buffer response
+// (energybroker/internal/httpapi/buffer_handlers.go's own
+// providerTotalResponse) -- AVAILABLE/RESERVED energy units currently
+// held in the buffer for one vendor. C4 has no per-provider *target*,
+// only the aggregate BufferTarget on BrokerInvariants above -- there is
+// no route that splits the target by provider, so OC.14's own page
+// shows the aggregate target next to these per-provider totals rather
+// than inventing a per-provider figure C4 doesn't compute.
+type BufferProviderTotal struct {
+	ProviderName string `json:"provider_name"`
+	Available    int64  `json:"available"`
+	Reserved     int64  `json:"reserved"`
+}
+
+// GetBuffer calls C4's own GET /v1/buffer.
+func (c *BrokerClient) GetBuffer(ctx context.Context) ([]BufferProviderTotal, error) {
+	var out struct {
+		Providers []BufferProviderTotal `json:"providers"`
+	}
+	err := do(ctx, c.http, "broker", c.token, http.MethodGet, c.baseURL+"/v1/buffer", nil, &out)
+	return out.Providers, err
+}
+
 // Reservation is C4's own reservationResponse shape
 // (energybroker/internal/httpapi/reservations_handlers.go).
 type Reservation struct {

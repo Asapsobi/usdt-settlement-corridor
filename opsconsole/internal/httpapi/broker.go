@@ -9,9 +9,48 @@ import (
 	"opsconsole/internal/opclient"
 )
 
+const brokerOverviewContent = `
+<div class="page-head"><h1>Broker overview</h1></div>
+<div class="tabs">
+  <a class="tab active" href="/broker/overview">Overview</a>
+  <a class="tab" href="/broker/reservations?status=FAILED">Failed</a>
+  <a class="tab" href="/broker/reservations?status=PENDING">Pending</a>
+  <a class="tab" href="/broker/reservations?status=CONFIRMED">Confirmed</a>
+  <a class="tab" href="/broker/fallback-events">Fallback events</a>
+  <a class="tab" href="/broker/providers">Providers</a>
+</div>
+{{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+
+<div class="card section">
+  <div class="card-head"><h2 style="font-size:14px">Buffer by provider</h2></div>
+  <p class="field-hint" style="margin:0 0 10px">Target is C4's own aggregate <span class="mono">buffer_target</span> invariant ({{ .AggregateTarget }} units) -- C4 has no per-provider target, so this is the whole-buffer figure, not a per-row one.</p>
+  <div class="table-wrap">
+  <table>
+  <tr><th>Provider</th><th>Available</th><th>Reserved</th></tr>
+  {{ range .Providers }}
+  <tr><td style="text-transform:capitalize">{{ .ProviderName }}</td><td class="mono">{{ .Available }}</td><td class="mono">{{ .Reserved }}</td></tr>
+  {{ else }}
+  <tr><td colspan="3"><div class="empty-state">Buffer is empty across every provider.</div></td></tr>
+  {{ end }}
+  </table>
+  </div>
+</div>
+
+<div class="card section">
+  <div class="card-head"><h2 style="font-size:14px">Vendor account balance</h2></div>
+  <p class="field-hint" style="margin:0">not available -- neither C4 nor the three vendor integrations this system actually calls (Tronsell/Netts/CatFee) expose an account-balance figure through any route this console can reach today. Showing a number here would be fabricated.</p>
+</div>
+
+<div class="card section">
+  <div class="card-head"><h2 style="font-size:14px">Rent to a specific wallet / delegate between wallets</h2></div>
+  <p class="field-hint" style="margin:0">not available. C4's real routes today are reservations (order-driven only), the pooled buffer, manual-fallback-events, and system prices/invariants/provider-credentials -- there is no route to buy energy for an arbitrary address outside the order flow, and production has no real vendor HTTP client wired in yet (brokerd currently runs on mock/no-op providers only). Building this for real means a new C4 route plus genuine Tronsell/Netts/CatFee integration -- a deliberate re-architecture, not a small additive route, so per this document's own bar for that distinction it is named here rather than faked. Separately, none of the three vendors' real APIs support retargeting an already-placed delegation, so even once built, "delegate from wallet A" could only ever mean "buy a fresh delegation targeted at wallet B" -- A's own energy would never move.</p>
+</div>
+`
+
 const brokerReservationsContent = `
 <div class="page-head"><h1>Broker reservations</h1></div>
 <div class="tabs">
+  <a class="tab" href="/broker/overview">Overview</a>
   <a class="tab {{ if eq .Status "FAILED" }}active{{ end }}" href="/broker/reservations?status=FAILED">Failed</a>
   <a class="tab {{ if eq .Status "PENDING" }}active{{ end }}" href="/broker/reservations?status=PENDING">Pending</a>
   <a class="tab {{ if eq .Status "CONFIRMED" }}active{{ end }}" href="/broker/reservations?status=CONFIRMED">Confirmed</a>
@@ -63,6 +102,7 @@ const brokerReconcileContent = `
 const brokerFallbackContent = `
 <div class="page-head"><h1>Manual fallback events</h1></div>
 <div class="tabs">
+  <a class="tab" href="/broker/overview">Overview</a>
   <a class="tab" href="/broker/reservations?status=FAILED">Failed</a>
   <a class="tab" href="/broker/reservations?status=PENDING">Pending</a>
   <a class="tab" href="/broker/reservations?status=CONFIRMED">Confirmed</a>
@@ -92,6 +132,33 @@ const brokerFallbackContent = `
 </table>
 </div>
 `
+
+type brokerOverviewPageData struct {
+	basePageData
+	Providers       []opclient.BufferProviderTotal
+	AggregateTarget int64
+	Error           string
+}
+
+// getBrokerOverview builds OC.14's buffer-by-provider view from C4's
+// real GET /v1/buffer plus the aggregate target off GET
+// /v1/system/invariants. Vendor account balance and rent/delegate to
+// an arbitrary wallet are named as unavailable directly in the
+// template rather than built -- see that section's own copy for why.
+func (s *Server) getBrokerOverview(w http.ResponseWriter, r *http.Request) {
+	data := brokerOverviewPageData{basePageData: s.newBasePageData(r)}
+	providers, err := s.Broker.GetBuffer(r.Context())
+	if err != nil {
+		data.Error = "reading C4 buffer: " + err.Error()
+		s.Templates.Render(w, "broker_overview", data)
+		return
+	}
+	data.Providers = providers
+	if inv, err := s.Broker.GetInvariants(r.Context()); err == nil {
+		data.AggregateTarget = inv.BufferTarget
+	}
+	s.Templates.Render(w, "broker_overview", data)
+}
 
 type reservationRow struct {
 	ID, OrderID               int64
@@ -247,6 +314,7 @@ func (s *Server) postBrokerFallbackResolve(w http.ResponseWriter, r *http.Reques
 const brokerProvidersContent = `
 <div class="page-head"><h1>Energy vendors</h1></div>
 <div class="tabs">
+  <a class="tab" href="/broker/overview">Overview</a>
   <a class="tab" href="/broker/reservations?status=FAILED">Failed</a>
   <a class="tab" href="/broker/reservations?status=PENDING">Pending</a>
   <a class="tab" href="/broker/reservations?status=CONFIRMED">Confirmed</a>

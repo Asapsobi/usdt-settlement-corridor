@@ -109,6 +109,7 @@ func MustLoadTemplates() *Templates {
 		"ledger_halt":         ledgerHaltContent,
 		"watcher_cursor":      watcherCursorContent,
 		"watcher_sweep":       watcherSweepContent,
+		"broker_overview":     brokerOverviewContent,
 		"broker_reservations": brokerReservationsContent,
 		"broker_reconcile":    brokerReconcileContent,
 		"broker_fallback":     brokerFallbackContent,
