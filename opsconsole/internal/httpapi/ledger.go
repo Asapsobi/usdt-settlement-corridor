@@ -6,6 +6,7 @@ import (
 
 const ledgerHaltContent = `
 <div class="page-head"><h1>Ledger</h1></div>
+` + ledgerTabs + `
 {{ if .Flash }}<div class="flash {{ if .FlashError }}flash-error{{ else }}flash-ok{{ end }}">{{ if .FlashError }}` + iconAlert + `{{ else }}` + iconCheck + `{{ end }}<span>{{ .Flash }}</span></div>{{ end }}
 <div class="card panel-narrow">
 {{ if .Halt.Halted }}
@@ -28,6 +29,7 @@ const ledgerHaltContent = `
 
 type ledgerHaltPageData struct {
 	basePageData
+	LedgerTab  string
 	Halt       haltView
 	Flash      string
 	FlashError bool
@@ -42,14 +44,14 @@ func (s *Server) renderLedgerHalt(w http.ResponseWriter, r *http.Request, flash 
 	halt, err := s.Ledger.GetHaltState(r.Context())
 	if err != nil {
 		s.Templates.Render(w, "ledger_halt", ledgerHaltPageData{
-			basePageData: s.newBasePageData(r), Flash: "reading halt state: " + err.Error(), FlashError: true,
+			basePageData: s.newBasePageData(r), LedgerTab: "halt", Flash: "reading halt state: " + err.Error(), FlashError: true,
 		})
 		return
 	}
 	s.Templates.Render(w, "ledger_halt", ledgerHaltPageData{
-		basePageData: s.newBasePageData(r),
-		Halt:         haltView{Halted: halt.Halted, Reason: halt.Reason},
-		Flash:        flash, FlashError: flashErr,
+		basePageData: s.newBasePageData(r), LedgerTab: "halt",
+		Halt:  haltView{Halted: halt.Halted, Reason: halt.Reason},
+		Flash: flash, FlashError: flashErr,
 	})
 }
 
