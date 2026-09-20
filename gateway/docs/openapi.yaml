@@ -163,6 +163,24 @@ paths:
               schema: { $ref: "#/components/schemas/SandboxOrder" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      summary: List the authenticated sandbox customer's own orders
+      description: >
+        Newest first. Reads sandbox_orders only, scoped to the
+        authenticated customer -- one sandbox key never sees another
+        customer's fixtures. Sandbox API keys only.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: "#/components/schemas/SandboxOrder" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /v1/sandbox/orders/{external_id}:
     get:

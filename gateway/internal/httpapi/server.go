@@ -92,6 +92,7 @@ func NewRouter(s *Server) http.Handler {
 		// C6.7: a fully separate code path -- sandbox API keys only (never
 		// interchangeable with production ones, invariant 4).
 		r.With(requireSandboxCustomer).Post("/sandbox/orders", s.postSandboxOrder)
+		r.With(requireSandboxCustomer).Get("/sandbox/orders", s.getSandboxOrders)
 		r.With(requireSandboxCustomer).Get("/sandbox/orders/{external_id}", s.getSandboxOrderStatus)
 		// C6.8 onward add routes here.
 	})

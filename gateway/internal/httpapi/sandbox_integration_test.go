@@ -206,3 +206,70 @@ func TestSandbox_UnknownTriggerRejected(t *testing.T) {
 		t.Errorf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func getSandboxOrders(router http.Handler, rawKey string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandbox/orders", nil)
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestGetSandboxOrders_ListsOnlyThisCustomersOwn(t *testing.T) {
+	pool := testPool(t)
+	s, custStore := newSandboxServer(t, pool)
+	router := NewRouter(s)
+
+	_, rawKeyA, err := custStore.CreateSandbox(t.Context(), "sandbox-list-co-a")
+	if err != nil {
+		t.Fatalf("CreateSandbox A: %v", err)
+	}
+	_, rawKeyB, err := custStore.CreateSandbox(t.Context(), "sandbox-list-co-b")
+	if err != nil {
+		t.Fatalf("CreateSandbox B: %v", err)
+	}
+
+	createdA := postSandboxOrder(t, router, rawKeyA, "reorg")
+	if createdA.Code != http.StatusCreated {
+		t.Fatalf("creating order for A: status = %d, body = %s", createdA.Code, createdA.Body.String())
+	}
+	var orderA sandboxOrderResponse
+	if err := json.Unmarshal(createdA.Body.Bytes(), &orderA); err != nil {
+		t.Fatal(err)
+	}
+
+	createdB := postSandboxOrder(t, router, rawKeyB, "retry_storm")
+	if createdB.Code != http.StatusCreated {
+		t.Fatalf("creating order for B: status = %d, body = %s", createdB.Code, createdB.Body.String())
+	}
+
+	listA := getSandboxOrders(router, rawKeyA)
+	if listA.Code != http.StatusOK {
+		t.Fatalf("list A: status = %d, body = %s", listA.Code, listA.Body.String())
+	}
+	var gotA struct {
+		Orders []sandboxOrderResponse `json:"orders"`
+	}
+	if err := json.Unmarshal(listA.Body.Bytes(), &gotA); err != nil {
+		t.Fatal(err)
+	}
+	if len(gotA.Orders) != 1 || gotA.Orders[0].ExternalID != orderA.ExternalID {
+		t.Fatalf("customer A's own list = %+v, want exactly [%s]", gotA.Orders, orderA.ExternalID)
+	}
+}
+
+func TestGetSandboxOrders_ProductionKeyRejected(t *testing.T) {
+	pool := testPool(t)
+	s, custStore := newSandboxServer(t, pool)
+	router := NewRouter(s)
+
+	_, prodRawKey, err := custStore.Create(t.Context(), "sandbox-list-prod-co")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rec := getSandboxOrders(router, prodRawKey)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 (a production key must never list sandbox orders)", rec.Code)
+	}
+}

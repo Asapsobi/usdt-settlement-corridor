@@ -199,6 +199,39 @@ func (s *Store) Get(ctx context.Context, externalID string, customerID int64) (O
 	return o, nil
 }
 
+// List returns customerID's own sandbox orders, newest first, bounded
+// by limit -- the ops console's own Sandbox page (see docs/03-build/
+// ops-console-build-prompts.md's OC.12): presenting the pipeline
+// without real money needs a way to see what was already scripted,
+// not just look one up by an external_id already known in advance.
+// Scoped to customerID like Get, for the same reason: gateway's own
+// auth model is per-customer, and a sandbox customer's key should never
+// reveal another customer's fixtures, sandbox or not.
+func (s *Store) List(ctx context.Context, customerID int64, limit int) ([]Order, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT external_id, customer_id, trigger, tier, amount_in, amount_out, fee_units, network_fee_units,
+			recipient_address, deposit_address, state, hold_reason, webhook_attempts, webhook_exhausted, created_at, updated_at
+		FROM sandbox_orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2
+	`, customerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: listing: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Order
+	for rows.Next() {
+		o, err := scanOrder(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: scanning row: %w", err)
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sandbox: listing: %w", err)
+	}
+	return out, nil
+}
+
 type scanRowIface interface {
 	Scan(dest ...any) error
 }

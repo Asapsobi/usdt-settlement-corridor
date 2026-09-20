@@ -87,6 +87,25 @@ func (s *Server) postSandboxOrder(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, sandboxOrderResponseFrom(o))
 }
 
+// getSandboxOrders is GET /v1/sandbox/orders -- lists the authenticated
+// sandbox customer's own orders, newest first (ops-console-build-
+// prompts.md's OC.12): presenting the pipeline without real money needs
+// a way to browse what's already there, not just look one up by an
+// external_id already known in advance.
+func (s *Server) getSandboxOrders(w http.ResponseWriter, r *http.Request) {
+	customer := customerFromContext(r.Context())
+	orders, err := s.Sandbox.List(r.Context(), customer.ID, 100)
+	if err != nil {
+		writeAPIError(w, errInternal)
+		return
+	}
+	out := make([]sandboxOrderResponse, len(orders))
+	for i, o := range orders {
+		out[i] = sandboxOrderResponseFrom(o)
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"orders": out})
+}
+
 // getSandboxOrderStatus is GET /v1/sandbox/orders/{external_id} --
 // reads sandbox_orders only, never gateway_orders; a sandbox
 // external_id is invisible to the production GET /v1/orders/{id}
