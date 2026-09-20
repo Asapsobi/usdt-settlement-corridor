@@ -101,6 +101,22 @@ func (c *DispatcherClient) GetDispatch(ctx context.Context, orderID int64) (Disp
 	return out, err
 }
 
+// Dispatch calls C5's own POST /v1/dispatch -- the exact same trigger
+// C6 (or C5's own orchestrate loop) calls for a screened order, doing
+// only the synchronous slot-selection/EnterDispatching half (real
+// signing/broadcast happens later, out of band of this request). do()
+// attaches a fresh random Idempotency-Key automatically, matching the
+// same convention every other write in this client uses. Returns the
+// real APIError unchanged on failure -- e.g. a 409 "order is X, not
+// screened" for an order already in a terminal state -- OC.15's own
+// page renders that message rather than inventing one.
+func (c *DispatcherClient) Dispatch(ctx context.Context, externalID string) (Dispatch, error) {
+	body := map[string]string{"external_id": externalID}
+	var out Dispatch
+	err := do(ctx, c.http, "dispatcher", c.token, http.MethodPost, c.baseURL+"/v1/dispatch", body, &out)
+	return out, err
+}
+
 // SweepResult is C5's own sweepResponse shape (dispatcher/docs/openapi.yaml's
 // SweepResponse) -- status is SIGNED or PENDING.
 type SweepResult struct {

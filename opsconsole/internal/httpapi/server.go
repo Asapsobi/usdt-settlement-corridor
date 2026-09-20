@@ -97,6 +97,9 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/aml/exposure", s.getAMLExposure)
 
+		r.Get("/payouts/outstanding", s.getPayoutsOutstanding)
+		r.Post("/payouts/{external_id}/dispatch", s.postPayoutDispatch)
+
 		r.Get("/ledger/halt", s.getLedgerHalt)
 		r.Post("/ledger/halt/set", s.postLedgerHaltSet)
 		r.Post("/ledger/halt/clear", s.postLedgerHaltClear)
