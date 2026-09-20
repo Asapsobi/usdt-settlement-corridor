@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -711,5 +712,84 @@ func TestPostReservationReconcile_MissingFieldsReturns400(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestProviderCredentials_UpsertThenListMasksSecret(t *testing.T) {
+	baseURL, _, _ := testServer(t, nil)
+
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/system/provider-credentials", testToken, map[string]any{
+		"provider_name": "catfee",
+		"api_key":       "test-catfee-api-key-12345",
+		"api_secret":    "test-catfee-secret",
+		"enabled":       true,
+		"updated_by":    "test-operator",
+	})
+	if resp.StatusCode != http.StatusOK {
+		errBody := decodeError(t, resp)
+		t.Fatalf("status = %d, code = %s, message = %s", resp.StatusCode, errBody.Error.Code, errBody.Error.Message)
+	}
+	var posted struct {
+		ProviderName string `json:"provider_name"`
+		APIKeyMasked string `json:"api_key_masked"`
+		HasSecret    bool   `json:"has_secret"`
+	}
+	decodeInto(t, resp, &posted)
+	if posted.ProviderName != "catfee" {
+		t.Fatalf("provider_name = %q, want catfee", posted.ProviderName)
+	}
+	if posted.APIKeyMasked == "test-catfee-api-key-12345" {
+		t.Fatal("api_key_masked returned the raw key -- must never be echoed back in full")
+	}
+	if !posted.HasSecret {
+		t.Fatal("has_secret = false, want true")
+	}
+
+	listResp := doRequest(t, http.MethodGet, baseURL+"/v1/system/provider-credentials", testToken, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", listResp.StatusCode)
+	}
+	var got struct {
+		Providers []struct {
+			ProviderName string `json:"provider_name"`
+			APIKeyMasked string `json:"api_key_masked"`
+		} `json:"providers"`
+	}
+	decodeInto(t, listResp, &got)
+	found := false
+	for _, p := range got.Providers {
+		if p.ProviderName == "catfee" {
+			found = true
+			if strings.Contains(p.APIKeyMasked, "test-catfee-api-key-12345") {
+				t.Fatal("list response leaked the raw api_key")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("catfee not present in provider-credentials list after upsert")
+	}
+}
+
+func TestProviderCredentials_RejectsUnknownProviderName(t *testing.T) {
+	baseURL, _, _ := testServer(t, nil)
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/system/provider-credentials", testToken, map[string]any{
+		"provider_name": "not-a-real-vendor",
+		"api_key":       "x",
+		"updated_by":    "test-operator",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestProviderCredentials_TronsellRequiresBaseURL(t *testing.T) {
+	baseURL, _, _ := testServer(t, nil)
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/system/provider-credentials", testToken, map[string]any{
+		"provider_name": "tronsell",
+		"api_key":       "x",
+		"updated_by":    "test-operator",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (tronsell requires base_url)", resp.StatusCode)
 	}
 }

@@ -235,6 +235,53 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Invariants" }
 
+  /v1/system/provider-credentials:
+    get:
+      summary: List configured vendor credentials (masked)
+      description: >
+        Never returns a raw api_key or api_secret -- api_key_masked shows
+        just enough to recognize which credential is configured, and
+        has_secret is a boolean, never the secret itself.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderCredential" }
+    post:
+      summary: Add or rotate one vendor's own credentials (operator override)
+      description: >
+        Takes effect the next time brokerd starts -- providersFromDB
+        reads this table at startup. Does not hot-swap the live,
+        already-running provider set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_name, api_key, updated_by]
+              properties:
+                provider_name: { type: string, enum: [tronsell, netts, catfee] }
+                base_url: { type: string, description: "required for tronsell" }
+                api_key: { type: string }
+                api_secret: { type: string, description: "required for tronsell/catfee, unused for netts" }
+                real_ip: { type: string, description: "required for netts" }
+                enabled: { type: boolean }
+                updated_by: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderCredential" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -371,3 +418,15 @@ components:
         slow_path_confirmed_count: { type: integer, format: int64 }
         fast_path_ratio: { type: number, nullable: true }
         open_manual_fallback_events: { type: integer, format: int64 }
+
+    ProviderCredential:
+      type: object
+      properties:
+        provider_name: { type: string }
+        base_url: { type: string, nullable: true }
+        api_key_masked: { type: string }
+        has_secret: { type: boolean }
+        real_ip: { type: string, nullable: true }
+        enabled: { type: boolean }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }

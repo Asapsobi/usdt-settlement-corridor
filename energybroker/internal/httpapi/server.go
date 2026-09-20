@@ -78,6 +78,8 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/system/prices", s.getSystemPrices)
 		r.Get("/system/invariants", s.getSystemInvariants)
+		r.Get("/system/provider-credentials", s.getProviderCredentials)
+		r.Post("/system/provider-credentials", s.postProviderCredentials)
 	})
 
 	return router

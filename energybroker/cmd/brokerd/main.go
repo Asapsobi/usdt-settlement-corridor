@@ -34,6 +34,7 @@ import (
 	"energybroker/internal/ledgerclient"
 	"energybroker/internal/pricing"
 	"energybroker/internal/provider"
+	"energybroker/internal/providercreds"
 	"energybroker/internal/reservations"
 	"energybroker/internal/routing"
 )
@@ -67,7 +68,10 @@ func run() error {
 		return err
 	}
 
-	providers, err := providersFromEnv()
+	if err := bootstrapProviderCredsFromEnv(ctx, pool); err != nil {
+		return err
+	}
+	providers, err := providersFromDB(ctx, pool)
 	if err != nil {
 		return err
 	}
@@ -187,43 +191,90 @@ func listenAddr() string {
 	return ":8084"
 }
 
-// providersFromEnv builds the four named provider slots (see
-// internal/provider's own Provider name constants): real HTTP clients
-// for the three primaries, and provider.NoOpProvider{} for
-// justlend_manual, always -- see this file's own doc comment.
-func providersFromEnv() (map[string]provider.EnergyProvider, error) {
-	tronsellBaseURL := os.Getenv("BROKER_TRONSELL_BASE_URL")
-	if tronsellBaseURL == "" {
-		return nil, fmt.Errorf("brokerd: BROKER_TRONSELL_BASE_URL is not set -- %w", provider.ErrTronsellBaseURLNotConfigured)
+// bootstrapProviderCredsFromEnv seeds provider_credentials from whatever
+// BROKER_*_API_KEY-shaped env vars are already set, but ONLY for a
+// provider with no row yet -- see providercreds.BootstrapFromEnv's own
+// doc comment. A fresh deployment with nothing in the table and nothing
+// in the env ends up with zero rows, which providersFromDB below treats
+// as "nothing configured yet," not an error -- an operator adds the
+// first vendor through the ops console instead.
+func bootstrapProviderCredsFromEnv(ctx context.Context, pool *db.Pool) error {
+	var fromEnv []providercreds.Credential
+	if v := os.Getenv("BROKER_TRONSELL_API_KEY"); v != "" {
+		c := providercreds.Credential{ProviderName: provider.Tronsell, APIKey: v}
+		if u := os.Getenv("BROKER_TRONSELL_BASE_URL"); u != "" {
+			c.BaseURL = &u
+		}
+		fromEnv = append(fromEnv, c)
 	}
-	tronsell, err := provider.NewTronsellProvider(provider.TronsellConfig{
-		BaseURL: tronsellBaseURL,
-		APIKey:  os.Getenv("BROKER_TRONSELL_API_KEY"),
-	})
+	if v := os.Getenv("BROKER_NETTS_API_KEY"); v != "" {
+		c := providercreds.Credential{ProviderName: provider.Netts, APIKey: v}
+		if ip := os.Getenv("BROKER_NETTS_REAL_IP"); ip != "" {
+			c.RealIP = &ip
+		}
+		fromEnv = append(fromEnv, c)
+	}
+	if v := os.Getenv("BROKER_CATFEE_API_KEY"); v != "" {
+		c := providercreds.Credential{ProviderName: provider.Catfee, APIKey: v}
+		if s := os.Getenv("BROKER_CATFEE_API_SECRET"); s != "" {
+			c.APISecret = &s
+		}
+		fromEnv = append(fromEnv, c)
+	}
+	if len(fromEnv) == 0 {
+		return nil
+	}
+	return providercreds.BootstrapFromEnv(ctx, pool, fromEnv)
+}
+
+// providersFromDB builds the provider slots from provider_credentials
+// (ops-console-build-prompts.md's OC.10) -- unlike the old
+// providersFromEnv, a vendor with no row or enabled=false is simply
+// omitted from the map rather than failing brokerd's own startup.
+// justlend_manual is always present, per this file's own doc comment.
+// At least one real vendor must be configured and enabled, or nothing
+// in this service could ever actually delegate energy.
+func providersFromDB(ctx context.Context, pool *db.Pool) (map[string]provider.EnergyProvider, error) {
+	creds, err := providercreds.List(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("brokerd: %w", err)
 	}
 
-	nettsRealIP := os.Getenv("BROKER_NETTS_REAL_IP")
-	if nettsRealIP == "" {
-		return nil, errors.New("brokerd: BROKER_NETTS_REAL_IP is not set -- Netts requires this deployment's own whitelisted egress IP")
-	}
-	netts := provider.NewNettsProvider(provider.NettsConfig{
-		APIKey: os.Getenv("BROKER_NETTS_API_KEY"),
-		RealIP: nettsRealIP,
-	})
-
-	catfee := provider.NewCatfeeProvider(provider.CatfeeConfig{
-		APIKey:    os.Getenv("BROKER_CATFEE_API_KEY"),
-		APISecret: os.Getenv("BROKER_CATFEE_API_SECRET"),
-	})
-
-	return map[string]provider.EnergyProvider{
-		provider.Tronsell:       tronsell,
-		provider.Netts:          netts,
-		provider.Catfee:         catfee,
+	providers := map[string]provider.EnergyProvider{
 		provider.JustLendManual: provider.NoOpProvider{},
-	}, nil
+	}
+	for _, c := range creds {
+		if !c.Enabled {
+			continue
+		}
+		switch c.ProviderName {
+		case provider.Tronsell:
+			if c.BaseURL == nil || *c.BaseURL == "" {
+				return nil, fmt.Errorf("brokerd: tronsell is enabled but has no base_url configured -- %w", provider.ErrTronsellBaseURLNotConfigured)
+			}
+			tronsell, err := provider.NewTronsellProvider(provider.TronsellConfig{BaseURL: *c.BaseURL, APIKey: c.APIKey})
+			if err != nil {
+				return nil, fmt.Errorf("brokerd: %w", err)
+			}
+			providers[provider.Tronsell] = tronsell
+		case provider.Netts:
+			if c.RealIP == nil || *c.RealIP == "" {
+				return nil, errors.New("brokerd: netts is enabled but has no real_ip configured -- Netts requires this deployment's own whitelisted egress IP")
+			}
+			providers[provider.Netts] = provider.NewNettsProvider(provider.NettsConfig{APIKey: c.APIKey, RealIP: *c.RealIP})
+		case provider.Catfee:
+			secret := ""
+			if c.APISecret != nil {
+				secret = *c.APISecret
+			}
+			providers[provider.Catfee] = provider.NewCatfeeProvider(provider.CatfeeConfig{APIKey: c.APIKey, APISecret: secret})
+		}
+	}
+
+	if len(providers) <= 1 { // only justlend_manual, which can never actually delegate
+		return nil, errors.New("brokerd: no vendor is configured and enabled in provider_credentials -- add at least one through the ops console (or bootstrap via env vars) before starting")
+	}
+	return providers, nil
 }
 
 // slotAddressesFromEnv reads BROKER_PAYOUT_SLOT_ADDRESSES, a

@@ -55,6 +55,7 @@ func TestEveryRouteIsInOpenAPISpec(t *testing.T) {
 		"/v1/manual-fallback-events/{id}/resolve": {"post"},
 		"/v1/system/prices":                       {"get"},
 		"/v1/system/invariants":                   {"get"},
+		"/v1/system/provider-credentials":         {"get", "post"},
 	}
 
 	for route, methods := range routes {
