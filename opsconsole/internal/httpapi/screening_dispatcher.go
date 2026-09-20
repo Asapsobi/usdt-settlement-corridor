@@ -8,46 +8,65 @@ import (
 )
 
 const screeningHoldsContent = `
-<h1>Screening holds</h1>
-{{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
+<div class="page-head"><h1>Screening holds</h1></div>
+{{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+<div class="table-wrap">
 <table>
 <tr><th>ID</th><th>Order</th><th>External ID</th><th>Reason</th><th>Opened</th><th>Status</th><th></th></tr>
 {{ range .Holds }}
 <tr>
-  <td>{{ .ID }}</td><td>{{ .OrderID }}</td><td>{{ .ExternalID }}</td><td>{{ .ReasonCode }}</td>
-  <td>{{ .OpenedAt }}</td><td>{{ .Status }}</td>
+  <td class="mono">{{ .ID }}</td><td>{{ .OrderID }}</td><td>{{ .ExternalID }}</td><td><span class="badge badge-neutral">{{ .ReasonCode }}</span></td>
+  <td class="mono">{{ .OpenedAt }}</td>
+  <td><span class="badge {{ if eq .Status "OPEN" }}badge-warning{{ else }}badge-success{{ end }}">{{ .Status }}</span></td>
   <td>{{ if eq .Status "OPEN" }}
+    <div class="actions">
     <form class="inline" method="post" action="/screening/holds/{{ .ID }}/release">
-      <input type="text" name="note" placeholder="note (optional)">
-      <button type="submit">Release</button>
+      <div class="actions">
+        <input type="text" name="note" placeholder="note (optional)" style="width:140px">
+        <button class="btn btn-sm" type="submit">Release</button>
+      </div>
     </form>
     <form class="inline" method="post" action="/screening/holds/{{ .ID }}/reject">
-      <input type="text" name="note" placeholder="note (optional)">
-      <button class="danger" type="submit">Reject</button>
+      <div class="actions">
+        <input type="text" name="note" placeholder="note (optional)" style="width:140px">
+        <button class="btn btn-sm btn-danger" type="submit">Reject</button>
+      </div>
     </form>
+    </div>
   {{ end }}</td>
 </tr>
+{{ else }}
+<tr><td colspan="7"><div class="empty-state">No holds right now.</div></td></tr>
 {{ end }}
 </table>
+</div>
 `
 
 const dispatcherSlotsContent = `
-<h1>Dispatcher slots</h1>
-{{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
+<div class="page-head"><h1>Dispatcher slots</h1></div>
+{{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+<div class="table-wrap">
 <table>
 <tr><th>ID</th><th>Address</th><th>Status</th><th>Balance</th><th>Tx count</th><th></th></tr>
 {{ range .Slots }}
 <tr>
-  <td>{{ .ID }}</td><td>{{ .TronAddress }}</td><td>{{ .Status }}</td><td>{{ .Balance }}</td><td>{{ .TxCount }}</td>
+  <td>{{ .ID }}</td><td class="mono">{{ .TronAddress }}</td>
+  <td><span class="badge {{ if eq .Status "ACTIVE" }}badge-success{{ else if eq .Status "RETIRED" }}badge-neutral{{ else }}badge-warning{{ end }}">{{ .Status }}</span></td>
+  <td>{{ .Balance }}</td><td>{{ .TxCount }}</td>
   <td>{{ if eq .Status "ACTIVE" }}
     <form class="inline" method="post" action="/dispatcher/slots/{{ .ID }}/retire" onsubmit="return confirm('This is a manual override of the normal cap-triggered rotation. Retire this slot?');">
-      <label><input type="checkbox" name="immediate" value="true"> immediate (skip RETIRING)</label>
-      <button class="danger" type="submit">Retire</button>
+      <div class="actions">
+        <label style="display:inline;margin:0;font-weight:400;color:var(--text-muted)"><input type="checkbox" name="immediate" value="true" style="width:auto;vertical-align:middle"> immediate</label>
+        <button class="btn btn-sm btn-danger" type="submit">Retire</button>
+      </div>
     </form>
   {{ end }}</td>
 </tr>
+{{ else }}
+<tr><td colspan="6"><div class="empty-state">No slots registered.</div></td></tr>
 {{ end }}
 </table>
+</div>
 `
 
 type holdRow struct {

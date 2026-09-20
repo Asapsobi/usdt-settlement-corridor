@@ -130,3 +130,48 @@ func (c *BrokerClient) ResolveFallbackEvent(ctx context.Context, id int64, resol
 	body := map[string]string{"resolution": resolution, "actor": actor}
 	return do(ctx, c.http, "broker", c.token, http.MethodPost, c.baseURL+"/v1/manual-fallback-events/"+strconv.FormatInt(id, 10)+"/resolve", body, nil)
 }
+
+// ProviderCredential is C4's own GET /v1/system/provider-credentials row
+// shape (energybroker/internal/httpapi/provider_credentials_handlers.go's
+// own providerCredentialResponse) -- added by this same build (OC.10).
+// The raw api_key/api_secret never appear here; that's the whole point.
+type ProviderCredential struct {
+	ProviderName string  `json:"provider_name"`
+	BaseURL      *string `json:"base_url,omitempty"`
+	APIKeyMasked string  `json:"api_key_masked"`
+	HasSecret    bool    `json:"has_secret"`
+	RealIP       *string `json:"real_ip,omitempty"`
+	Enabled      bool    `json:"enabled"`
+	UpdatedAt    string  `json:"updated_at"`
+	UpdatedBy    string  `json:"updated_by"`
+}
+
+// ListProviderCredentials calls C4's own GET /v1/system/provider-credentials.
+func (c *BrokerClient) ListProviderCredentials(ctx context.Context) ([]ProviderCredential, error) {
+	var out struct {
+		Providers []ProviderCredential `json:"providers"`
+	}
+	err := do(ctx, c.http, "broker", c.token, http.MethodGet, c.baseURL+"/v1/system/provider-credentials", nil, &out)
+	return out.Providers, err
+}
+
+// UpsertProviderCredentialRequest is the body OC.10's "add/rotate
+// vendor" form submits.
+type UpsertProviderCredentialRequest struct {
+	ProviderName string `json:"provider_name"`
+	BaseURL      string `json:"base_url,omitempty"`
+	APIKey       string `json:"api_key"`
+	APISecret    string `json:"api_secret,omitempty"`
+	RealIP       string `json:"real_ip,omitempty"`
+	Enabled      bool   `json:"enabled"`
+	UpdatedBy    string `json:"updated_by"`
+}
+
+// UpsertProviderCredential calls C4's own POST
+// /v1/system/provider-credentials -- takes effect the next time brokerd
+// restarts, not immediately (see that route's own doc comment for why).
+func (c *BrokerClient) UpsertProviderCredential(ctx context.Context, req UpsertProviderCredentialRequest) (ProviderCredential, error) {
+	var out ProviderCredential
+	err := do(ctx, c.http, "broker", c.token, http.MethodPost, c.baseURL+"/v1/system/provider-credentials", req, &out)
+	return out, err
+}

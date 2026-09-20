@@ -7,14 +7,19 @@ import (
 )
 
 const auditContent = `
-<h1>Audit log</h1>
-{{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
+<div class="page-head"><h1>Audit log</h1></div>
+<p class="helptext">Every write action this console makes, logged before the downstream call -- an operator convenience view, bounded to the last 500 lines, not a queryable log store.</p>
+{{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+<div class="table-wrap">
 <table>
 <tr><th>Time</th><th>Operator</th><th>Action</th><th>Target</th><th>Detail</th></tr>
 {{ range .Entries }}
-<tr><td>{{ .Time }}</td><td>{{ .Operator }}</td><td>{{ .Action }}</td><td>{{ .Target }}</td><td>{{ .Detail }}</td></tr>
+<tr><td class="mono">{{ .Time }}</td><td>{{ .Operator }}</td><td><span class="badge badge-neutral">{{ .Action }}</span></td><td class="mono">{{ .Target }}</td><td class="mono" style="max-width:360px;overflow-wrap:anywhere">{{ .Detail }}</td></tr>
+{{ else }}
+<tr><td colspan="5"><div class="empty-state">No audit entries yet.</div></td></tr>
 {{ end }}
 </table>
+</div>
 `
 
 type auditPageData struct {

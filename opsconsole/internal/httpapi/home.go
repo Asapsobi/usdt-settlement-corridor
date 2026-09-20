@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"html/template"
 	"net/http"
 	"strconv"
 	"sync"
@@ -9,13 +10,22 @@ import (
 )
 
 const homeContent = `
-<h1>Home</h1>
-<div class="cards">
+<div class="page-head">
+  <div>
+    <h1 style="margin-bottom:2px">Home</h1>
+    <div class="helptext" style="margin-bottom:0">Live status across every backend service, refreshed every 10s.</div>
+  </div>
+</div>
+<div class="cards" id="oc-service-cards">
 {{ range .Services }}
   <div class="card">
-    <div><span class="dot {{ if .Healthy }}dot-green{{ else }}dot-red{{ end }}"></span><strong>{{ .Name }}</strong></div>
-    {{ if .Error }}<div class="err">{{ .Error }}</div>{{ end }}
-    {{ range .Facts }}<div>{{ .Label }}: {{ .Value }}</div>{{ end }}
+    <div class="card-head">
+      {{ .Icon }}
+      <h2>{{ .Name }}</h2>
+      <span class="badge {{ if .Healthy }}badge-success{{ else }}badge-danger{{ end }}" style="margin-left:auto"><span class="dot {{ if .Healthy }}dot-green{{ else }}dot-red{{ end }}"></span>{{ if .Healthy }}Healthy{{ else }}Down{{ end }}</span>
+    </div>
+    {{ if .Error }}<div class="flash flash-error" style="margin:8px 0 0">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+    {{ range .Facts }}<div class="fact"><span class="fact-label">{{ .Label }}</span><span class="fact-value">{{ .Value }}</span></div>{{ end }}
   </div>
 {{ end }}
 </div>
@@ -27,6 +37,7 @@ type serviceFact struct {
 
 type serviceCard struct {
 	Name    string
+	Icon    template.HTML
 	Healthy bool
 	Error   string
 	Facts   []serviceFact
@@ -41,11 +52,11 @@ type homePageData struct {
 // concurrently with every other service, each bounded by its own
 // timeout -- invariant 4: one slow/dead service degrades only its own
 // card, never the whole page.
-func checkService(ctx context.Context, name string, healthz func(context.Context) error, facts func(context.Context) ([]serviceFact, error)) serviceCard {
+func checkService(ctx context.Context, name string, icon template.HTML, healthz func(context.Context) error, facts func(context.Context) ([]serviceFact, error)) serviceCard {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	card := serviceCard{Name: name}
+	card := serviceCard{Name: name, Icon: icon}
 	if err := healthz(ctx); err != nil {
 		card.Error = err.Error()
 		return card
@@ -62,11 +73,12 @@ func checkService(ctx context.Context, name string, healthz func(context.Context
 func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 	type job struct {
 		name    string
+		icon    template.HTML
 		healthz func(context.Context) error
 		facts   func(context.Context) ([]serviceFact, error)
 	}
 	jobs := []job{
-		{"ledger", s.Ledger.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "ledger", icon: iconLedger, healthz: s.Ledger.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			inv, err := s.Ledger.GetInvariants(ctx)
 			if err != nil {
 				return nil, err
@@ -77,7 +89,7 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 				{"cache ok", boolStr(inv.CacheOK)},
 			}, nil
 		}},
-		{"watcher", s.Watcher.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "watcher", icon: iconWatcher, healthz: s.Watcher.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			inv, err := s.Watcher.GetInvariants(ctx)
 			if err != nil {
 				return nil, err
@@ -91,7 +103,7 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 			}
 			return facts, nil
 		}},
-		{"screening", s.Screening.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "screening", icon: iconScreening, healthz: s.Screening.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			q, err := s.Screening.GetQueue(ctx)
 			if err != nil {
 				return nil, err
@@ -102,7 +114,7 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 			}
 			return facts, nil
 		}},
-		{"broker", s.Broker.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "broker", icon: iconBroker, healthz: s.Broker.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			inv, err := s.Broker.GetInvariants(ctx)
 			if err != nil {
 				return nil, err
@@ -112,7 +124,7 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 				{"open fallback events", int64Str(inv.OpenManualFallbackEvents)},
 			}, nil
 		}},
-		{"dispatcher", s.Dispatcher.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "dispatcher", icon: iconDispatcher, healthz: s.Dispatcher.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			inv, err := s.Dispatcher.GetInvariants(ctx)
 			if err != nil {
 				return nil, err
@@ -122,13 +134,27 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 				{"stuck pending reconciliation", intStr(inv.StuckPendingReconciliation)},
 			}, nil
 		}},
-		{"s1", s.S1.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+		{name: "s1", icon: iconKey, healthz: s.S1.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
 			pending, err := s.S1.ListPendingApprovals(ctx)
 			if err != nil {
 				return nil, err
 			}
 			return []serviceFact{{"pending approvals", intStr(len(pending))}}, nil
 		}},
+	}
+	if s.Gateway != nil {
+		jobs = append(jobs, job{name: "gateway", icon: iconSandbox, healthz: s.Gateway.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
+			orders, err := s.Gateway.ListSandboxOrders(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return []serviceFact{{"sandbox orders", intStr(len(orders))}}, nil
+		}})
+	}
+	if s.Proofrun != nil {
+		jobs = append(jobs, job{name: "proofrun", icon: iconManual, healthz: s.Proofrun.Healthz, facts: func(ctx context.Context) ([]serviceFact, error) {
+			return []serviceFact{{"manual flow", "ready"}}, nil
+		}})
 	}
 
 	cards := make([]serviceCard, len(jobs))
@@ -137,7 +163,7 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 		wg.Add(1)
 		go func(i int, j job) {
 			defer wg.Done()
-			cards[i] = checkService(r.Context(), j.name, j.healthz, j.facts)
+			cards[i] = checkService(r.Context(), j.name, j.icon, j.healthz, j.facts)
 		}(i, j)
 	}
 	wg.Wait()

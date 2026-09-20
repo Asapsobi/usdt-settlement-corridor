@@ -8,27 +8,33 @@ import (
 )
 
 const s1ApprovalsContent = `
-<h1>S1 pending approvals</h1>
-{{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
+<div class="page-head"><h1>S1 pending approvals</h1></div>
+{{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
 {{ if not .HasApproverToken }}
-  <div class="flash flash-error">You logged in without an S1 approver token, so you can't approve or reject anything here -- that token is checked at login, never held by the console itself, so a decision always attributes to you, not to the console (see the invariant this page enforces). Log out and back in with your own approver token to act.</div>
+  <div class="flash flash-error">` + iconAlert + `<span>You logged in without an S1 approver token, so you can't approve or reject anything here -- that token is checked at login, never held by the console itself, so a decision always attributes to you, not to the console. Log out and back in with your own approver token to act.</span></div>
 {{ end }}
+<div class="table-wrap">
 <table>
 <tr><th>ID</th><th>Slot</th><th>Estimated USD</th><th>Created</th><th></th></tr>
 {{ range .Requests }}
 <tr>
-  <td>{{ .ID }}</td><td>{{ .SlotID }}</td><td>{{ .EstimatedUSD }}</td><td>{{ .CreatedAt }}</td>
+  <td class="mono">{{ .ID }}</td><td>{{ .SlotID }}</td><td>${{ .EstimatedUSD }}</td><td class="mono">{{ .CreatedAt }}</td>
   <td>
+    <div class="actions">
     <form class="inline" method="post" action="/s1/approvals/{{ .ID }}/approve">
-      <button type="submit" {{ if not $.HasApproverToken }}disabled title="log in with your own S1 approver token to approve"{{ end }}>Approve</button>
+      <button class="btn btn-sm btn-primary" type="submit" {{ if not $.HasApproverToken }}disabled title="log in with your own S1 approver token to approve"{{ end }}>Approve</button>
     </form>
     <form class="inline" method="post" action="/s1/approvals/{{ .ID }}/reject">
-      <button class="danger" type="submit" {{ if not $.HasApproverToken }}disabled title="log in with your own S1 approver token to reject"{{ end }}>Reject</button>
+      <button class="btn btn-sm btn-danger" type="submit" {{ if not $.HasApproverToken }}disabled title="log in with your own S1 approver token to reject"{{ end }}>Reject</button>
     </form>
+    </div>
   </td>
 </tr>
+{{ else }}
+<tr><td colspan="5"><div class="empty-state">No pending approvals.</div></td></tr>
 {{ end }}
 </table>
+</div>
 `
 
 type pendingApprovalRow struct {

@@ -3,6 +3,7 @@ package opclient
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -64,4 +65,44 @@ func (c *WatcherClient) SetCursor(ctx context.Context, lastScanned, lastCandidat
 	var out Cursor
 	err := do(ctx, c.http, "watcher", c.token, http.MethodPost, c.baseURL+"/v1/system/cursor", body, &out)
 	return out, err
+}
+
+// WatchedAddress is C2's own GET /v1/addresses row shape
+// (depositwatcher/internal/httpapi/addresses_handlers.go's own
+// addressResponse, extended with derivation_index and the new list
+// route -- see OC.11).
+type WatchedAddress struct {
+	Address         string     `json:"address"`
+	DerivationIndex uint32     `json:"derivation_index"`
+	OrderID         int64      `json:"order_id"`
+	ExternalID      string     `json:"external_id"`
+	CustomerID      string     `json:"customer_id"`
+	Status          string     `json:"status"`
+	AssignedAt      time.Time  `json:"assigned_at"`
+	RetiredAt       *time.Time `json:"retired_at,omitempty"`
+	RetiredReason   *string    `json:"retired_reason,omitempty"`
+}
+
+// ListAddresses calls C2's own GET /v1/addresses, added by this same
+// build (OC.11) -- includes RETIRED addresses, since a settled order's
+// deposit address still holds its real on-chain balance until swept.
+func (c *WatcherClient) ListAddresses(ctx context.Context, limit int) ([]WatchedAddress, error) {
+	var out struct {
+		Addresses []WatchedAddress `json:"addresses"`
+	}
+	u := c.baseURL + "/v1/addresses"
+	if limit > 0 {
+		u += "?limit=" + strconv.Itoa(limit)
+	}
+	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, u, nil, &out)
+	return out.Addresses, err
+}
+
+// GetAddressBalance calls C2's own GET /v1/addresses/{order_id}/balance.
+func (c *WatcherClient) GetAddressBalance(ctx context.Context, orderID int64) (string, error) {
+	var out struct {
+		BalanceRaw string `json:"balance_raw"`
+	}
+	err := do(ctx, c.http, "watcher", c.token, http.MethodGet, c.baseURL+"/v1/addresses/"+strconv.FormatInt(orderID, 10)+"/balance", nil, &out)
+	return out.BalanceRaw, err
 }

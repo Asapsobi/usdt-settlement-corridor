@@ -68,6 +68,12 @@ func run() error {
 		AuditPath:  cfg.auditLogPath,
 		BuildInfo:  buildInfo,
 	}
+	if cfg.gatewayBaseURL != "" && cfg.gatewaySandboxKey != "" {
+		server.Gateway = opclient.NewGatewayClient(cfg.gatewayBaseURL, cfg.gatewaySandboxKey)
+	}
+	if cfg.proofrunBaseURL != "" {
+		server.Proofrun = opclient.NewProofrunClient(cfg.proofrunBaseURL)
+	}
 	router := httpapi.NewRouter(server)
 
 	httpServer := &http.Server{Addr: cfg.listenAddr, Handler: router}
@@ -108,6 +114,8 @@ type config struct {
 	brokerBaseURL, brokerToken         string
 	dispatcherBaseURL, dispatcherToken string
 	s1BaseURL, s1C5Token               string
+	gatewayBaseURL, gatewaySandboxKey  string // optional -- see OC_GATEWAY_* below
+	proofrunBaseURL                    string // optional -- see OC_PROOFRUN_BASE_URL below
 }
 
 // configFromEnv reads every OC_* config value -- required, no default,
@@ -143,6 +151,20 @@ func configFromEnv() (config, error) {
 	if v := os.Getenv("OC_LISTEN_ADDR"); v != "" {
 		cfg.listenAddr = v
 	}
+
+	// Optional, unlike every other service above: the console works
+	// fully without a sandbox demo set to show. Gateway also has no
+	// operator-auth concept of its own (see docs/03-build/
+	// ops-console-build-prompts.md's OC.12) -- OC_GATEWAY_SANDBOX_KEY is
+	// one sandbox customer's own sk_test_ key, never a production one.
+	cfg.gatewayBaseURL = os.Getenv("OC_GATEWAY_BASE_URL")
+	cfg.gatewaySandboxKey = os.Getenv("OC_GATEWAY_SANDBOX_KEY")
+
+	// Also optional, same reasoning: the manual-flow page (OC.13) only
+	// wraps proofrun's own driver, which has no auth of its own to
+	// configure -- see opclient.ProofrunClient's own doc comment.
+	cfg.proofrunBaseURL = os.Getenv("OC_PROOFRUN_BASE_URL")
+
 	return cfg, nil
 }
 

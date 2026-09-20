@@ -4,58 +4,92 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 )
 
 // Templates holds every parsed page template. Server-rendered HTML via
 // html/template only -- no frontend build step, matching this
 // project's convention of introducing no new tooling for one
-// operator-facing dashboard (see §0's own STACK note).
+// operator-facing dashboard (see §0's own STACK note). The design
+// system below (tokens.css, layout.css, components.css -- all inlined,
+// no build step) is a from-scratch visual pass over the original
+// functional-but-plain version; every route, form, and data flow is
+// unchanged.
 type Templates struct {
 	pages map[string]*template.Template
 }
 
+// navItem is one sidebar entry. Icon is trusted, author-written inline
+// SVG (never user input), so it's template.HTML rather than a plain
+// string -- otherwise html/template would escape the markup into
+// visible tag text.
+type navItem struct {
+	Href, Label string
+	Icon        template.HTML
+}
+
+var navItems = []navItem{
+	{"/", "Home", iconHome},
+	{"/ledger/halt", "Ledger", iconLedger},
+	{"/watcher/cursor", "Watcher", iconWatcher},
+	{"/broker/reservations?status=FAILED", "Broker", iconBroker},
+	{"/screening/holds", "Screening", iconScreening},
+	{"/dispatcher/slots", "Dispatcher", iconDispatcher},
+	{"/s1/approvals", "S1", iconKey},
+	{"/sandbox/orders", "Sandbox", iconSandbox},
+	{"/manual/payout", "Manual Flow", iconManual},
+	{"/audit", "Audit", iconAudit},
+}
+
 const layout = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ops Console</title>
-<style>
-  body { font-family: -apple-system, sans-serif; margin: 0; background: #f7f7f8; color: #1a1a1a; }
-  header { background: #1a1a1a; color: #fff; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
-  header a { color: #fff; text-decoration: none; margin-right: 16px; }
-  header a:hover { text-decoration: underline; }
-  .halt-banner { background: #b00020; color: #fff; padding: 10px 20px; font-weight: bold; }
-  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
-  table { border-collapse: collapse; width: 100%; background: #fff; }
-  th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; font-size: 14px; }
-  th { background: #eee; }
-  .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 14px; margin-bottom: 12px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
-  .dot-green { background: #2e7d32; }
-  .dot-red { background: #c62828; }
-  .err { color: #b00020; }
-  form.inline { display: inline; }
-  button, input[type=submit] { cursor: pointer; padding: 6px 12px; border-radius: 4px; border: 1px solid #ccc; background: #fff; }
-  button.danger { background: #b00020; color: #fff; border-color: #b00020; }
-  input[type=text], input[type=password], input[type=number], textarea { padding: 6px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; }
-  label { display: block; margin: 10px 0 4px; font-weight: bold; font-size: 13px; }
-  .flash { padding: 10px; margin-bottom: 12px; border-radius: 4px; }
-  .flash-error { background: #fde7e9; color: #b00020; }
-  .flash-ok { background: #e6f4ea; color: #1e4620; }
-</style>
+<style>` + designSystemCSS + `</style>
 </head>
 <body>
 {{ if .Session }}
-<header>
-  <div><a href="/">Home</a><a href="/ledger/halt">Ledger</a><a href="/watcher/cursor">Watcher</a><a href="/broker/reservations?status=FAILED">Broker</a><a href="/screening/holds">Screening</a><a href="/dispatcher/slots">Dispatcher</a><a href="/s1/approvals">S1</a><a href="/audit">Audit</a></div>
-  <div>{{ .Session.DisplayName }} &middot; <form class="inline" method="post" action="/logout"><button>Log out</button></form></div>
-</header>
-{{ if .Halted }}<div class="halt-banner">LEDGER HALTED: {{ .HaltReason }} -- <a href="/ledger/halt" style="color:#fff">manage</a></div>{{ end }}
-{{ end }}
-<main>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">OC</span>
+      <span class="brand-name">Ops Console</span>
+    </div>
+    <nav class="nav">
+      {{ $path := .Path }}
+      {{ range nav }}
+      <a href="{{ .Href }}" class="nav-item {{ if isActive $path .Href }}active{{ end }}">{{ .Icon }}<span>{{ .Label }}</span></a>
+      {{ end }}
+    </nav>
+    <div class="sidebar-footer">
+      <button type="button" class="theme-toggle" onclick="ocToggleTheme()" title="Toggle color theme" aria-label="Toggle color theme">` + iconTheme + `</button>
+      <div class="operator">
+        <div class="operator-name">{{ .Session.DisplayName }}</div>
+        <form method="post" action="/logout"><button class="link-button" type="submit">Log out</button></form>
+      </div>
+    </div>
+  </aside>
+  <div class="main-col">
+    {{ if .Halted }}
+    <div class="halt-banner">
+      ` + iconAlert + `
+      <span><strong>Ledger halted:</strong> {{ .HaltReason }}</span>
+      <a href="/ledger/halt">Manage</a>
+    </div>
+    {{ end }}
+    <main>
+    {{ template "content" . }}
+    </main>
+  </div>
+</div>
+{{ else }}
+<main class="auth-shell">
 {{ template "content" . }}
 </main>
+{{ end }}
+<script>` + themeScriptJS + `</script>
 </body>
 </html>`
 
@@ -69,17 +103,28 @@ func MustLoadTemplates() *Templates {
 		"home":                homeContent,
 		"ledger_halt":         ledgerHaltContent,
 		"watcher_cursor":      watcherCursorContent,
+		"watcher_sweep":       watcherSweepContent,
 		"broker_reservations": brokerReservationsContent,
 		"broker_reconcile":    brokerReconcileContent,
 		"broker_fallback":     brokerFallbackContent,
+		"broker_providers":    brokerProvidersContent,
 		"screening_holds":     screeningHoldsContent,
 		"dispatcher_slots":    dispatcherSlotsContent,
 		"s1_approvals":        s1ApprovalsContent,
+		"sandbox_orders":      sandboxOrdersContent,
+		"manual_flow":         manualFlowContent,
 		"audit":               auditContent,
+	}
+	funcs := template.FuncMap{
+		"nav": func() []navItem { return navItems },
+		"isActive": func(currentPath, href string) bool {
+			hrefPath, _, _ := strings.Cut(href, "?")
+			return currentPath == hrefPath
+		},
 	}
 	t := &Templates{pages: make(map[string]*template.Template, len(pages))}
 	for name, content := range pages {
-		tmpl := template.New(name)
+		tmpl := template.New(name).Funcs(funcs)
 		tmpl = template.Must(tmpl.Parse(layout))
 		tmpl = template.Must(tmpl.Parse(`{{ define "content" }}` + content + `{{ end }}`))
 		t.pages[name] = tmpl

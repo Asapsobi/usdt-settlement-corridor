@@ -70,17 +70,22 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 }
 
 const loginContent = `
-<h1>Ops Console</h1>
-{{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
-<form method="post" action="/login">
-  <label>Username</label>
-  <input type="text" name="username" required autofocus>
-  <label>Password</label>
-  <input type="password" name="password" required>
-  <label>S1 approver token (optional -- only needed to approve/reject signing requests)</label>
-  <input type="password" name="s1_approver_token">
-  <p><input type="submit" value="Log in"></p>
-</form>
+<div class="auth-card">
+  <div class="auth-brand">
+    <span class="brand-mark">OC</span>
+    <span class="auth-brand-name">Ops Console</span>
+  </div>
+  {{ if .Error }}<div class="flash flash-error">` + iconAlert + `<span>{{ .Error }}</span></div>{{ end }}
+  <form method="post" action="/login">
+    <label>Username</label>
+    <input type="text" name="username" required autofocus>
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <label>S1 approver token <span style="font-weight:400">(optional -- only for approving signing requests)</span></label>
+    <input type="password" name="s1_approver_token">
+    <p style="margin-top:20px"><button class="btn btn-primary" type="submit" style="width:100%;justify-content:center">Log in</button></p>
+  </form>
+</div>
 `
 
 type loginPageData struct {

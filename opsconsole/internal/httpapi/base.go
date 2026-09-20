@@ -15,6 +15,7 @@ type basePageData struct {
 	Session    *session.Session
 	Halted     bool
 	HaltReason string
+	Path       string // r.URL.Path, for the sidebar's own active-link highlight
 }
 
 // newBasePageData reads the caller's session from context and, best-
@@ -25,7 +26,7 @@ type basePageData struct {
 // degrades that one panel, never the whole page" posture applied here to
 // a banner instead of a card.
 func (s *Server) newBasePageData(r *http.Request) basePageData {
-	data := basePageData{}
+	data := basePageData{Path: r.URL.Path}
 	if sess, ok := sessionFromContext(r.Context()); ok {
 		data.Session = &sess
 	}

@@ -5,25 +5,25 @@ import (
 )
 
 const ledgerHaltContent = `
-<h1>Ledger halt</h1>
-{{ if .Flash }}<div class="flash {{ if .FlashError }}flash-error{{ else }}flash-ok{{ end }}">{{ .Flash }}</div>{{ end }}
+<div class="page-head"><h1>Ledger</h1></div>
+{{ if .Flash }}<div class="flash {{ if .FlashError }}flash-error{{ else }}flash-ok{{ end }}">{{ if .FlashError }}` + iconAlert + `{{ else }}` + iconCheck + `{{ end }}<span>{{ .Flash }}</span></div>{{ end }}
+<div class="card panel-narrow">
 {{ if .Halt.Halted }}
-  <div class="card">
-    <p><strong>Halted.</strong> Reason: {{ .Halt.Reason }}</p>
-    <form method="post" action="/ledger/halt/clear">
-      <p><input type="submit" value="Clear halt"></p>
-    </form>
-  </div>
+  <div class="card-head"><span class="badge badge-danger"><span class="dot dot-red"></span>Halted</span></div>
+  <p style="color:var(--text-muted)">Reason: <strong style="color:var(--text)">{{ .Halt.Reason }}</strong></p>
+  <form method="post" action="/ledger/halt/clear">
+    <button class="btn btn-primary" type="submit">Clear halt</button>
+  </form>
 {{ else }}
-  <div class="card">
-    <p>Not halted.</p>
-    <form method="post" action="/ledger/halt/set">
-      <label>Reason</label>
-      <input type="text" name="reason" required>
-      <p><button class="danger" type="submit">Set halt</button></p>
-    </form>
-  </div>
+  <div class="card-head"><span class="badge badge-success"><span class="dot dot-green"></span>Not halted</span></div>
+  <p class="field-hint" style="margin:0 0 4px">Setting a halt stops the ledger from accepting new writes -- visible as a banner on every page until cleared.</p>
+  <form method="post" action="/ledger/halt/set">
+    <label>Reason</label>
+    <input type="text" name="reason" required>
+    <p style="margin-top:16px"><button class="btn btn-danger" type="submit">Set halt</button></p>
+  </form>
 {{ end }}
+</div>
 `
 
 type ledgerHaltPageData struct {

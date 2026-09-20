@@ -32,6 +32,8 @@ type Server struct {
 	Broker     *opclient.BrokerClient
 	Dispatcher *opclient.DispatcherClient
 	S1         *opclient.S1Client
+	Gateway    *opclient.GatewayClient  // may be nil -- OC_GATEWAY_* is optional, unlike every other service
+	Proofrun   *opclient.ProofrunClient // may be nil -- OC_PROOFRUN_BASE_URL is optional, same reasoning
 
 	Operators []Operator
 	Sessions  *session.Signer
@@ -82,12 +84,15 @@ func NewRouter(s *Server) http.Handler {
 
 		r.Get("/watcher/cursor", s.getWatcherCursor)
 		r.Post("/watcher/cursor", s.postWatcherCursor)
+		r.Get("/watcher/sweep", s.getWatcherSweep)
 
 		r.Get("/broker/reservations", s.getBrokerReservations)
 		r.Get("/broker/reservations/{id}/reconcile", s.getBrokerReconcileForm)
 		r.Post("/broker/reservations/{id}/reconcile", s.postBrokerReconcile)
 		r.Get("/broker/fallback-events", s.getBrokerFallbackEvents)
 		r.Post("/broker/fallback-events/{id}/resolve", s.postBrokerFallbackResolve)
+		r.Get("/broker/providers", s.getBrokerProviders)
+		r.Post("/broker/providers", s.postBrokerProviders)
 
 		r.Get("/screening/holds", s.getScreeningHolds)
 		r.Post("/screening/holds/{id}/release", s.postScreeningHoldRelease)
@@ -99,6 +104,11 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/s1/approvals", s.getS1Approvals)
 		r.Post("/s1/approvals/{id}/approve", s.postS1Approve)
 		r.Post("/s1/approvals/{id}/reject", s.postS1Reject)
+
+		r.Get("/sandbox/orders", s.getSandboxOrders)
+
+		r.Get("/manual/payout", s.getManualFlow)
+		r.Post("/manual/payout", s.postManualFlow)
 
 		r.Get("/audit", s.getAudit)
 	})
